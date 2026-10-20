@@ -1,0 +1,2002 @@
+// 与 Rust 端 DTO 对齐的类型定义。注意：Tauri 命令参数默认使用 snake_case，
+// 嵌套对象（CheckinOpts / LogsOpts / Settings）的字段必须保持 snake_case。
+
+export type ViewKey =
+  | 'dashboard'
+  | 'accounts'
+  | 'checkin'
+  | 'credits'
+  | 'logs'
+  | 'api-service'
+  | 'settings'
+  // 豆包应用页面（侧边栏应用切换 Tab → 豆包）
+  | 'doubao-overview'
+  | 'doubao-accounts'
+  | 'doubao-settings'
+  // Buddy 应用页面（侧边栏应用切换 Tab → Buddy，批次1）
+  | 'buddy-overview'
+  | 'buddy-accounts'
+  | 'buddy-checkin'
+  | 'buddy-credits'
+  | 'buddy-api-service'
+  | 'buddy-settings'
+  // Qoder 应用页面（F-80：IDE / Work / CLI 三端，单一 Tab 承载）
+  | 'qoder-overview'
+  | 'qoder-accounts'
+  | 'qoder-checkin'
+  | 'qoder-credits'
+  | 'qoder-api-service'
+  | 'qoder-settings'
+  // 全局页面（不随应用 Tab 切换；三项目合并新增）
+  | 'agent-hub'
+  | 'hub-center';
+
+/** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy / Qoder（F-80）/ 豆包 */
+export type AppKey = 'trae' | 'buddy' | 'qoder' | 'doubao';
+
+/** 各应用的默认落地页 */
+export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
+  trae: 'dashboard',
+  buddy: 'buddy-overview',
+  qoder: 'qoder-overview',
+  doubao: 'doubao-overview',
+};
+
+
+export interface EnvStatus {
+  installed: boolean;
+  running: boolean;
+  version: string | null;
+  path: string | null;
+}
+
+export interface ProxyStatus {
+  running: boolean;
+  port: number;
+  captured: number;
+  started_at: number | null;
+}
+
+export interface AccountView {
+  user_id: string;
+  name: string;
+  group_id: string | null;
+  /** 共享标签 tag id 列表（account_tags 表联表填充；老后端缺省 undefined） */
+  tags?: string[];
+  jwt: string;
+  jwt_exp_hours: number | null;
+  jwt_exp_timestamp: number | null;
+  checked_today: boolean | null;
+  credits: number | null;
+  remaining_credits: number | null;
+  device_id_masked: string | null;
+  cooldown_type: string | null;
+  cooldown_until: number | null;
+  cooldown_reason: string | null;
+  has_refresh_token: boolean;
+  jwt_auto_refresh: boolean;
+  credits_expire_at: number | null;
+  /** 通用积分（product_id != 209）剩余 */
+  general_credits: number | null;
+  /** Work 积分（product_id == 209）剩余 */
+  work_credits: number | null;
+  /** 本周期积分包总额度（credits_limit 合计；到期日历「剩余 X / 总 Y」口径） */
+  total_credits?: number | null;
+  /** 套餐身份（Free / Lite / Pro ...，来自 ide_user_pay_status 缓存） */
+  pay_identity?: string | null;
+  /** 会员套餐到期时间（Unix 秒，来自 ent_usage 会员包） */
+  membership_expire?: number | null;
+  /** 会员套餐下次自动续费时间（Unix 秒，无自动续费为空） */
+  membership_next_billing?: number | null;
+  /** refresh_token 过期时间（Unix 秒；上游未下发为 null） */
+  refresh_token_expires_at?: number | null;
+  /** refresh_token 连续刷新失败次数（成功清零） */
+  refresh_token_fails?: number;
+  /** refresh_token 是否已判定失效（连续 3 次失败或服务端明确拒绝，需重新 OAuth 登录） */
+  refresh_token_invalid?: boolean;
+  /** 凭证最近一次落盘时间（OAuth 登录/导入/刷新成功时更新，F-78 批次 3 收尾） */
+  auth_saved_at?: string | null;
+  /** JWT data.id 与 user_id 归属不一致（issue #55：扫描「已入池」可能经该账号 JWT 命中其他 uid） */
+  jwt_uid_mismatch?: boolean;
+  /** JWT 解析出的 data.id（mismatch 时展示用） */
+  jwt_uid?: string | null;
+  /** 积分包明细（剩余 > 0 且未过期，按到期时间升序；来自 remaining_credits 缓存）：
+   *  到期日历与「7 天内到期」KPI 按包口径展示/计算；刷新过积分即有值（可为空数组），
+   *  缺省 undefined = 老缓存未刷新过 → 前端回退账号级汇总口径 */
+  credit_packs?: CreditPackDetail[];
+}
+
+// ---- 积分消耗历史（Trae query_user_usage_group_by_session，按本地日聚合 + 增量拉取） ----
+export interface UsageDayStat {
+  /** 本地自然日 YYYY-MM-DD */
+  date: string;
+  credits: number;
+  sessions: number;
+  /** 模型 → 当日消耗积分 */
+  models: Record<string, number>;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+}
+
+export interface UsageHistoryAccount {
+  user_id: string;
+  name: string;
+  ok: boolean;
+  /** 本次增量拉取失败但已沿用缓存时的说明；ok=false 时为失败/未拉取原因 */
+  error: string | null;
+  /** 按日期升序（缓存中全部历史） */
+  daily: UsageDayStat[];
+}
+
+export interface UsageHistoryResult {
+  fetched_at: number;
+  /** true = 纯缓存读取（未发起网络请求） */
+  cached: boolean;
+  accounts: UsageHistoryAccount[];
+}
+
+// ---- Trae 逐包到期（issue #82 T5.1：expired_ents 实时查询，含已过期包；credit_packs 只含未过期可用包） ----
+export interface TraeExpiredEnt {
+  /** 包名（与 AccountView.credit_packs[].source 同源口径，前端按「包名+到期时间」去重） */
+  name: string;
+  /** 包总额度（credits_limit） */
+  credits_limit: number;
+  /** 过期时间（Unix 毫秒，上游原值） */
+  expire_time_ms: number;
+}
+
+export interface TraeExpiredEntsAccount {
+  user_id: string;
+  name: string;
+  ok: boolean;
+  /** 单账号查询失败原因（其余账号不受影响） */
+  error: string | null;
+  expired: TraeExpiredEnt[];
+}
+
+export interface TraeExpiredEntsResult {
+  fetched_at: number;
+  accounts: TraeExpiredEntsAccount[];
+}
+
+// ---- 会话明细（Trae query_user_usage_group_by_session 会话级行，issue #82 会话明细 Tab） ----
+export interface UsageSessionView {
+  user_id: string;
+  account_name: string;
+  session_id: string;
+  /** usage_time（Unix 秒） */
+  ts: number;
+  /** 本地自然日 YYYY-MM-DD */
+  date: string;
+  model: string;
+  /** 会话模式（agent/chat 等；上游缺失为空串） */
+  mode: string;
+  /** 消耗积分（credits_float，兜底 amount_float） */
+  credits: number;
+  /** 消耗金额（cost_money_float；上游缺失为 0） */
+  cost_money: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  /** 会话说明（user_input_preview，后端已截断 200 字符） */
+  preview: string;
+  /** 轮键（Qoder 展开明细行返回 chat_record_id；会话级行与 Trae/Buddy 为空） */
+  record_id?: string;
+}
+
+export interface UsageSessionsResult {
+  /** 缓存拉取时间（Unix 秒；0 = 从未成功拉取。Trae/Buddy 两来源已统一为秒） */
+  fetched_at: number;
+  /** 过滤后总行数（分页前） */
+  total: number;
+  /** 过滤后区间总积分（分页前） */
+  credits_total: number;
+  page: number;
+  page_size: number;
+  rows: UsageSessionView[];
+  /** 区间内出现过的模型清单（筛选下拉用） */
+  models: string[];
+}
+
+// ---- F-08 双应用账号自动发现 ----
+/** 账号导入结果报告 */
+export interface ImportReport {
+  /** 文件中的账号总数 */
+  total: number;
+  /** 实际新增数量 */
+  added: number;
+  /** 跳过（重复）数量 */
+  skipped: number;
+  /** 跳过的账号标识（uid 或名称） */
+  skipped_names: string[];
+  /** 新增分组数量 */
+  groups_added: number;
+  /** 恢复的标签绑定条数（仅本机已存在的 tag id；老后端缺省 0） */
+  tags_restored?: number;
+  /** 导入文件中本机不存在的 tag id 数量（忽略不自动创建） */
+  tags_ignored?: number;
+}
+
+// ---- F-46 导入预览（按索引导入）----
+/** 导入预览条目；index 为文件中 accounts 数组下标 */
+export interface ImportPreviewAccount {
+  index: number;
+  user_id: string | null;
+  /** 展示名：name 字段 > uid > "(无 ID)" */
+  name: string;
+  has_jwt: boolean;
+  group_id: string | null;
+  /** uid 已存在于账号池（默认不勾选） */
+  exists: boolean;
+}
+
+/** 导入预览报告 */
+export interface ImportPreview {
+  total: number;
+  accounts: ImportPreviewAccount[];
+  /** 将新增的分组 */
+  new_groups: { id: string; name: string; color: string; order: number }[];
+}
+
+// ---- F-01 安装位置自动识别（跨应用通用三级探测）----
+export interface AppLocate {
+  app: string;
+  exe: string | null;
+  user_data_dir: string;
+  version: string | null;
+  /** settings | registry | default | process | not_found */
+  source: string;
+}
+
+
+export interface DiscoveredAccount {
+  user_id: string;
+  /** 账户中心（dc）uid —— 与账号池 Cloud-IDE id 体系不同，仅诊断展示 */
+  dc_uid?: string | null;
+  /** Cloud-IDE uid 是否经本机使用证据确认（false 时 user_id 实为 dc uid，不可入池） */
+  uid_confident: boolean;
+  /** 恒 "Trae"（TraeWork 已并入 Trae，双应用收敛见 docs/completed/Trae双应用合并适配调整方案.md） */
+  app: string;
+  app_label: string;
+  in_pool: boolean;
+  /** 已入池时匹配到的账号名（user_id 直配优先，issue #55 透明化） */
+  matched_account_name?: string | null;
+  /** true = 仅经某账号 JWT 的 data.id 命中（该账号 user_id 与本 uid 不一致） */
+  matched_via_jwt?: boolean;
+  storage_path: string;
+}
+
+// ---- Trae 会员/套餐信息 ----
+export interface AppEntitlement {
+  app: string;
+  app_label: string;
+  /** 当前登录账号的 Cloud-IDE uid（本机使用证据推导；未登录/推导失败为 null） */
+  uid?: string | null;
+  /** 账号池中匹配的展示名（未入池/未匹配为 null） */
+  account_name?: string | null;
+  identity_str: string | null;
+  identity: number | null;
+  last_sync_time: number | null;
+}
+
+/** TraeWork 合并迁移升级引导报告（后端迁移完成后落 kv，首启弹窗展示；关闭后不再弹） */
+export interface TraeWorkMigrationReport {
+  finished_at_ms: number;
+  /** 迁移明细条目（settings 键退役/承接 + 快照池搬迁摘要，用户可读文案） */
+  notes: string[];
+  /** settings 步处置结果（结构化字段，新版报告才有；null/缺失 = 无 trae_path 存量） */
+  settings_note?: string | null;
+  /** 整组迁入 profiles_trae 的组数 */
+  moved_groups: number;
+  /** 同名冲突整组保留至 profiles_trae_work_legacy 的组数 */
+  legacy_groups: number;
+}
+
+/** 积分明细条目（仅剩余 > 0 且未过期的积分包） */
+export interface CreditPackDetail {
+  /** '通用' | 'Work' */
+  kind: string;
+  /** 来源名称（如「每日签到」「每月登录积分」） */
+  source: string;
+  remaining: number;
+  /** 本周期总额度（credits_limit；到期日历「剩余 X / 总 Y」口径，对齐 Buddy） */
+  total: number;
+  /** 过期时间（Unix 秒） */
+  expire_time: number;
+}
+
+/** 单账号积分明细 */
+export interface CreditDetail {
+  general: number;
+  work: number;
+  total: number;
+  packs: CreditPackDetail[];
+}
+
+export interface GroupView {
+  id: string;
+  name: string;
+  color: string;
+  order: number;
+  count: number;
+  /** 组内账号 uid 列表（账号池分组筛选实时预览用，T10） */
+  uids: string[];
+}
+
+/** 共享标签视图（跨池一张表；uids = 绑定该标签的账号 uid） */
+export interface TagView {
+  id: string;
+  name: string;
+  color: string;
+  order: number;
+  count: number;
+  uids: string[];
+}
+
+export type JwtStatus = 'ok' | 'warn' | 'expired' | 'unknown';
+
+export interface JwtParseResult {
+  user_id: string | null;
+  exp_hours: number | null;
+  exp_timestamp: number | null;
+  status: JwtStatus;
+}
+
+export interface LogLine {
+  time: string;
+  log_type: string;
+  message: string;
+}
+
+// snake_case 必须与 Rust Settings 完全一致
+export interface Settings {
+  proxy_port: number;
+  theme: string;
+  launch_minimized: boolean;
+  /** 启动静默签到：启动 60s 后对未签到账号自动执行一轮签到（T11） */
+  silent_checkin: boolean;
+  auto_start_proxy: boolean;
+  /** 启动时自动开启 API 网关（7864） */
+  auto_start_api: boolean;
+  tray: boolean;
+  language: string;
+  checkin_skip_checked: boolean;
+  checkin_skip_expired: boolean;
+  retry: number;
+  notify: string;
+  trae_cn_path: string | null;
+  doubao_path: string | null;
+  /** 豆包会话续期保活端点（null = 用 doubao.com 首页滑动续期） */
+  doubao_renew_url: string | null;
+  /** 豆包会员额度接口（抓包固化后填入；null = 额度查询不可用） */
+  doubao_quota_url: string | null;
+  /** 豆包快照可选纳入 Default/IndexedDB（对话历史等完整状态随账号迁移；体积代价大） */
+  doubao_snapshot_include_idb: boolean;
+  /** WorkBuddy 桌面版 exe 手动路径（环境配置页） */
+  workbuddy_path: string | null;
+  /** CodeBuddy 桌面版 exe 手动路径（环境配置页） */
+  codebuddy_path: string | null;
+  /** WorkBuddy auth 文件人工路径（默认 %LOCALAPPDATA%\CodeBuddyExtension\...\workbuddy-desktop.info） */
+  wb_auth_file_path: string | null;
+  data_dir: string | null;
+  log_retention_days: number;
+  proxy_domains: string;
+  proxy_log_path: string | null;
+  api_port: number;
+  api_default_model: string;
+  /** F-74：WorkBuddy/CodeBuddy 切换账号时自动把当前账号会话迁移到目标账号（默认关） */
+  buddy_switch_migrate_chats: boolean;
+  /** issue #82 T6.1：会话明细显示首条消息概述（默认开；关闭仅隐藏 UI 展示，不删存量缓存） */
+  sessions_preview_enabled: boolean;
+  /** Qoder CN IDE 桌面版 exe 手动路径（环境配置页；默认 %LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe） */
+  qoder_ide_path: string | null;
+  /** QoderWork 桌面版 exe 手动路径（R-1 布局裁决后接入；M1 仅持久化预留） */
+  qoderwork_path: string | null;
+  /** Qoder 每日签到调度触发时刻 HH:MM（默认 10:15：单次覆盖 0 点签到与 10:00 登录奖励双活动） */
+  qoder_checkin_hhmm: string;
+  /** Qoder 积分数据同步触发时刻 HH:MM（daily 模式生效，默认 23:40） */
+  qoder_credits_sync_hhmm: string;
+  /** Qoder 积分数据同步旧开关（保留兼容；调度已改按 qoder_credits_sync_mode 判定） */
+  qoder_credits_sync_enabled: boolean;
+  /** Qoder 积分数据同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）| every_hours（每N小时，默认） */
+  qoder_credits_sync_mode: string;
+  /** Qoder 积分数据同步间隔小时数（every_hours 模式生效，默认 2，1..24） */
+  qoder_credits_sync_hours: string;
+  /** Qoder Token 定时续期开关（默认开：qoder-refresh 每 6 小时兜底刷新全部账号凭证） */
+  qoder_token_renew_enabled: boolean;
+  /** Qoder 会话流水定时合并开关（默认开：qoder-sessions-compact 每 6 小时将早于保留窗的流水按会话合并为单行） */
+  qoder_sessions_compact_enabled: boolean;
+  /** Qoder 会话流水合并保留窗天数（默认 3，1..=90：近 N 天保留请求级明细，更早的合并） */
+  qoder_sessions_compact_days: string;
+  /** Qoder 会话流水合并触发时刻 HH:MM（保留兼容字段；调度已改每 6 小时档，不参与判定） */
+  qoder_sessions_compact_hhmm: string;
+  /** Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；Windows 计划任务注册时间复用该值） */
+  trae_checkin_hhmm: string;
+  /** Trae 签到多账号间隔秒（默认 3s，环境配置页可改，0=关闭；防上游频控） */
+  trae_checkin_gap_secs: number | null;
+  /** WorkBuddy 签到/成长多账号间隔秒（默认 3s，任务配置页可改，0=关闭；两轮共用） */
+  wb_checkin_gap_secs: number | null;
+  /** Qoder 签到多账号间隔秒（默认 3s，任务配置页可改，0=关闭） */
+  qoder_checkin_gap_secs: number | null;
+  /** Trae JWT 定时调度续期开关（issue #27，默认开：每日兜底续期临期账号） */
+  jwt_renew_enabled: boolean;
+  /** Trae JWT 续期调度触发时刻 HH:MM（默认 09:00，环境配置页可改） */
+  jwt_renew_hhmm: string;
+  /** WorkBuddy 每日成长任务开关（任务配置页，默认开：应用内调度器每日执行成长轮） */
+  wb_growth_enabled: boolean;
+  /** WorkBuddy 成长任务调度触发时刻 HH:MM（默认 09:00，任务配置页可改） */
+  wb_growth_hhmm: string;
+  /** WorkBuddy 每日签到调度触发时刻 HH:MM（默认 09:10，任务配置页可改） */
+  wb_checkin_hhmm: string;
+  /** Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）| every_hours（每N小时，默认） */
+  wb_credits_sync_mode: string;
+  /** Buddy 积分与 Token 同步触发时刻 HH:MM（daily 模式生效，默认 23:30 对齐原快照时刻） */
+  wb_credits_sync_hhmm: string;
+  /** Buddy 积分与 Token 同步间隔小时数（every_hours 模式生效，默认 2，1..24） */
+  wb_credits_sync_hours: string;
+  /** Trae 积分数据同步模式：off | hourly | daily | every_hours（每N小时，默认） */
+  trae_credits_sync_mode: string;
+  /** Trae 积分同步触发时刻 HH:MM（daily 模式生效，默认 23:40 对齐原快照时刻） */
+  trae_credits_sync_hhmm: string;
+  /** Trae 积分同步间隔小时数（every_hours 模式生效，默认 2，1..24） */
+  trae_credits_sync_hours: string;
+  /** Buddy 上游模型目录每日同步开关（资源调度页，默认开；无账号时调度静默跳过） */
+  wb_catalog_sync_enabled: boolean;
+  /** Buddy 模型目录同步触发时刻 HH:MM（默认 05:45） */
+  wb_catalog_sync_hhmm: string;
+  /** Qoder 上游模型目录每日同步开关（资源调度页，默认开；无账号时调度静默跳过） */
+  qoder_catalog_sync_enabled: boolean;
+  /** Qoder 模型目录同步触发时刻 HH:MM（默认 05:50） */
+  qoder_catalog_sync_hhmm: string;
+  /** Qoder 默认区域（方案 C）：裸模型名归属，"" / "cn" = 国内版，"intl" = 国际版 */
+  qoder_default_realm?: string;
+  /** Qoder 国际版池开关（方案 C，默认开）：关闭时国际版池不参与选号 */
+  qoder_intl_enabled?: boolean;
+  /** Trae 官网模型列表每日同步开关（API 服务页，默认开；无账号时调度静默跳过） */
+  trae_models_sync_enabled: boolean;
+  /** Trae 模型列表同步触发时刻 HH:MM（默认 05:40） */
+  trae_models_sync_hhmm: string;
+  // ── 通知渠道（F-19；Trae/Buddy 全平台共用，系统设置页通知渠道面板维护） ──
+  /** 通知总开关（默认开；关闭后所有事件渠道静默） */
+  notify_enabled: boolean;
+  /** 签到完成时推送（默认开） */
+  notify_on_checkin: boolean;
+  /** 调度任务失败时推送（默认开） */
+  notify_on_task_fail: boolean;
+  /** Bark 推送地址（https://api.day.app/<key>；空 = 关闭该渠道） */
+  notify_bark_url: string | null;
+  /** 通用 Webhook 地址（POST JSON，兼容企业微信群机器人等自建端；空 = 关闭） */
+  notify_webhook_url: string | null;
+  /** Server酱 SendKey（空 = 关闭） */
+  notify_serverchan_sendkey: string | null;
+  // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──
+  /** 固定应用 key：始终显示在侧边栏且不可隐藏（单选，默认 'trae'） */
+  pinned_app: AppKey;
+  /** 侧边栏隐藏的应用 key 列表（空 = 全部显示；固定应用即使列入也强制显示） */
+  hidden_apps: AppKey[];
+  /** 侧边栏应用自定义图标（应用 key → 图标名，lib/appIcons.ts 候选表；缺失/非法回退内置默认图标） */
+  app_icons: Partial<Record<AppKey, string>>;
+}
+
+/** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */
+export type BuddyChatApp = 'WorkBuddy' | 'CodeBuddy';
+
+export interface CheckinOpts {
+  scope: string;
+  user_ids?: string[];
+  skip_checked_in: boolean;
+  skip_expired: boolean;
+}
+
+export type CheckinAccountStatus = 'pending' | 'already' | 'success' | 'fail' | 'skip';
+/** 跳过原因（status=skip 时）：checked_in=已签 / expired=JWT 过期 / cooldown=冷却中 /
+ *  no_jwt=账号是「无登录态占位」（本机自动发现，待代理捕获或 OAuth 登录） */
+export type CheckinSkipReason = 'checked_in' | 'expired' | 'cooldown' | 'no_jwt';
+
+export interface CheckinAccountResult {
+  index: number;
+  user_id: string;
+  name: string;
+  status: CheckinAccountStatus;
+  /** 本账号被跳过的原因（仅 status=skip） */
+  skip_reason?: CheckinSkipReason | null;
+  credits?: number;
+  delta?: number;
+  elapsed?: number;
+  code?: number;
+  message?: string;
+  error_type?: string | null;
+  cooldown_until?: number | null;
+}
+
+export interface CheckinDone {
+  ok: number;
+  already: number;
+  failed: number;
+  total?: number;
+}
+
+/** 单日签到结果趋势点（Dashboard 堆叠图，T8） */
+export interface CheckinTrendPoint {
+  date: string;
+  ok: number;
+  already: number;
+  failed: number;
+}
+
+/** 设备冲突账号（issue #110 签到前预警）：与同组其他账号共用同一 device_id */
+export interface DeviceConflictAccount {
+  user_id: string;
+  name: string;
+}
+
+/** 设备冲突组：同一 device_id 绑定 ≥2 个账号，服务端每日仅先签账号可领积分 */
+export interface DeviceConflictGroup {
+  device_id: string;
+  accounts: DeviceConflictAccount[];
+}
+
+export interface CreditRecord {
+  date: string;
+  user_id: string;
+  credits: number;
+  delta: number;
+}
+
+export interface CreditsDailySnapshot {
+  date: string;
+  total: number;
+  earned: number;
+  consumed: number;
+  /** 逐账号 earned 维度（uid → 当日获得积分；issue #82 问题4-1）；
+   * 缺失/空 = 老快照行无账号明细（账号筛选时该日不计入过滤后合计） */
+  accounts?: Record<string, number>;
+}
+
+export interface ProxyLogEntry {
+  id: string;
+  timestamp: string;
+  method: string;
+  host: string;
+  path: string;
+  status: string;
+  size: number;
+  sse_model?: string;
+  sse_tokens?: string;
+}
+
+export interface ProxyLogListResult {
+  entries: ProxyLogEntry[];
+  total: number;
+}
+
+export interface ApiServiceStatus {
+  running: boolean;
+  port: number;
+  total_requests: number;
+  active_uid: string | null;
+  last_error: string | null;
+  started_at: number | null;
+  /** 当前并发数（统一网关 §4.5；可选：后端 Tauri 状态命令补齐前缺省 0） */
+  inflight?: number;
+}
+
+// ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
+/** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
+export interface UnifiedModelSource {
+  pool: 'trae' | 'buddy' | 'qoder' | 'custom';
+  rate: number | null;
+  enabled: boolean;
+}
+
+/** 统一模型目录条目（api_unified_models 返回，实时聚合派生视图） */
+export interface UnifiedModel {
+  id: string;
+  display: string;
+  /** 供应商：自定义模型用户填写值优先，否则按模型名系列推断（空串 = 未知） */
+  vendor: string;
+  /** 地区归属（Qoder 双区特有 cn|global；非 Qoder 源缺省，展示 —） */
+  region?: string | null;
+  /** 实际生效倍率 = 当前调度策略命中的来源侧 */
+  rate: number | null;
+  /** 思考档位（双语义合并展示，仅 Buddy 池作为请求参数下发） */
+  efforts: string[];
+  /** Max Mode 支持（Trae 池 1M 上下文；Buddy/自定义单源恒 false） */
+  max_mode: boolean;
+  context_length: number | null;
+  max_tokens: number | null;
+  supports_image: boolean | null;
+  /** L1 人工维护标记 */
+  manual: boolean;
+  sources: UnifiedModelSource[];
+}
+
+/** 池间调度策略（data/dispatch_policy.json；dispatch_policy_get/set） */
+export interface DispatchPolicy {
+  /** smart = 智能调度（默认：到期→倍率/免费→积分多）；priority = 固定优先级 */
+  strategy: 'smart' | 'priority';
+  /** 池优先级（priority 模式或 smart 并列时生效；取值 trae/buddy） */
+  priority: string[];
+  /** 模型级覆盖（键 canonical_id；显式覆盖不做智能重排） */
+  per_model: Record<string, string[]>;
+  /** 双源首选池不可用时按序回退 */
+  fallback: boolean;
+  /** /v1/models 为多源同名模型附带池前缀别名条目（trae/xxx 等，issue #90 修复③a）；默认关 */
+  model_source_labels: boolean;
+  /** 账号保留剩余积分（issue #91）：剩余 ≤ 该值的账号暂停调度（0 = 关闭），默认 50 */
+  reserve_credits: number;
+  updated_at: number;
+}
+
+/** 网关设置（kv api_gateway_settings；gateway_settings_get/set） */
+export interface GatewaySettings {
+  port: number;
+  /** 监听地址：默认 127.0.0.1 仅本机可访问；局域网访问设 0.0.0.0（须同时启用 API Key） */
+  host: string;
+  default_model: string;
+  updated_at: number;
+}
+
+/** 局域网网卡地址（issue #34：lan_iface_ips 命令；已过滤回环/链路本地/
+ *  Docker/虚拟化/代理虚拟网卡，多物理网卡多 IP，按 IP 去重保序） */
+export interface LanIfaceIp {
+  /** 接口名（如「以太网」「WLAN」） */
+  name: string;
+  /** IPv4 地址 */
+  ip: string;
+}
+
+/** 自定义模型条目（data/custom_models.json；custom_models_list/save/remove）。
+ *  OpenAI 兼容上游直通：请求模型名 canonical 命中 enabled 条目即直达该上游 */
+export interface CustomModel {
+  /** 稳定 id（cm-<12hex>，保存时为空则新增） */
+  id: string;
+  /** 请求模型名（路由键） */
+  name: string;
+  /** OpenAI 兼容 API 地址（如 https://api.openai.com 或含 /v1 前缀） */
+  base_url: string;
+  /** API Key（Bearer） */
+  api_key: string;
+  /** 供应商（展示用，如 OpenAI / DeepSeek / 智谱） */
+  vendor: string;
+  enabled: boolean;
+  context_length: number;
+  max_tokens: number;
+  supports_image: boolean;
+  /** 展示倍率（0 = 免费；支持两位小数，如 0.01） */
+  rate: number;
+  note: string;
+  updated_at: number;
+}
+
+/** Trae 模型元数据 L1 覆盖层（data/trae_model_meta.json；trae_model_meta_set/clear，§6.1）
+ *  嵌套字段保持 snake_case；null = 未设置，交由下层自动来源兜底（官网同步 > 内置参考 > 名称推断） */
+export interface TraeModelMeta {
+  label?: string | null;
+  rate?: number | null;
+  efforts?: string[] | null;
+  context_length?: number | null;
+  max_tokens?: number | null;
+  supports_image?: boolean | null;
+}
+
+/** 模型选项：id = 上游 config_name，label = 官方展示名 */
+export interface ModelOption {
+  id: string;
+  label: string;
+}
+
+export interface PoolStatus {
+  uid: string;
+  name: string;
+  credits: number | null;
+  credits_expire_at: number | null;
+  cooling: boolean;
+  cooldown_until: number | null;
+  cooldown_reason: string | null;
+  /** 积分耗尽硬冷却中（次日 04:00 自动恢复探测；cooling 仅覆盖软冷却，旧后端未返回时为 undefined） */
+  hard_credit?: boolean;
+  disabled: boolean;
+  err_count: number;
+  /** 账号实时在途并发数（F-77⑤ 可观测；旧后端未返回时为 undefined） */
+  inflight?: number;
+  /** refresh_token 是否已判定失效（F-78 批次 3：展示「Token 失效」徽标，需重新 OAuth 登录） */
+  refresh_invalid?: boolean;
+}
+
+export interface ApiPoolFile {
+  /** Trae 池参与调度开关（默认开）：关闭后 Trae 目录模型不路由 Trae 池 */
+  trae_enabled?: boolean;
+  enabled_uids: string[];
+  /** 调度策略：expire_first（默认）/ credit_first / random（T10） */
+  strategy?: string;
+  /** Buddy 池调度策略（取值同 strategy）；空 = 跟随 Trae 池（两池同策略） */
+  wb_strategy?: string;
+  /** 参与调度的分组 id 列表；空 = 不限分组（T10） */
+  group_ids?: string[];
+  /** WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池 */
+  wb_enabled?: boolean;
+  /** 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high */
+  wb_default_thinking?: boolean;
+  /** 工具代执行（T5.5/F-64）：客户端声明 web_search 类工具时代理侧代执行 */
+  wb_tool_exec?: boolean;
+  /** 后台任务降级（T5.6③/F-65）：标题/摘要类短请求路由到目录最低倍率模型 */
+  wb_bg_downgrade?: boolean;
+  /** 长上下文降档（F-76④）：后台任务类 + 超长输入（粗估 ≥100k token）自动换 flash 档模型 */
+  wb_longctx_downgrade?: boolean;
+  /** 慢请求竞速对冲阈值毫秒（F-76③）：流式首字节超阈值时向第二账号发对冲请求；0 = 关闭 */
+  wb_hedge_threshold_ms?: number;
+  /** Buddy 池入池白名单（wb- 前缀账号 id）；空/缺省 = 全部含凭证账号自动入池 */
+  wb_enabled_uids?: string[];
+  /** Buddy 池分组筛选（wb_group_ids）：非空 = 仅所选分组的 WB 账号参与调度；空 = 不限分组 */
+  wb_group_ids?: string[];
+  /** Trae 池账号并发上限（F-77，per-pool 三参数之一）：单账号在途请求数达到上限视为 busy；0 = 不限。旧三池共用字段已退役，Trae 池按默认值 1 落地 */
+  trae_account_concurrency_limit?: number;
+  /** Trae 池粘性 TTL 秒（F-76②，per-pool 三参数之一）：TTL 内同会话落同一池同账号（KV cache 复用；默认 300） */
+  trae_pool_sticky_ttl_secs?: number;
+  /** Trae 池显式会话粘性 TTL 秒（per-pool 三参数之一）：显式 conversationId 绑定账号的有效期（默认 1800） */
+  trae_sticky_ttl_secs?: number;
+  /** Trae 池慢请求竞速对冲阈值毫秒：流式首字节超阈值时向第二账号发对冲请求，先出首字者胜；0 = 关闭（默认 8000） */
+  trae_hedge_threshold_ms?: number;
+  /** Buddy 池显式会话粘性 TTL 秒（F-76②，per-pool 三参数之一） */
+  wb_sticky_ttl_secs?: number;
+  /** Buddy 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
+  wb_account_concurrency_limit?: number;
+  /** Buddy 池粘性 TTL 秒（per-pool 三参数之一，默认 300） */
+  wb_pool_sticky_ttl_secs?: number;
+  /** Qoder 上游开关（p3-3）：开启后 Qoder 目录模型路由到 Qoder 账号池（默认关） */
+  qoder_enabled?: boolean;
+  /** Qoder 竞速对冲阈值毫秒（F-80-余 v2）：首字节超阈值向第二账号发对冲请求；0 = 关闭 */
+  qoder_hedge_threshold_ms?: number;
+  /** Qoder 会话粘性开关（F-80-余 v2）：同会话 TTL 内绑定同一 Qoder 账号（默认关） */
+  qoder_sticky_enabled?: boolean;
+  /** Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：目录倍率按 0 处理 + 取号豁免零积分过滤 */
+  qoder_flash_free_rate?: boolean;
+  /** Qoder 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
+  qoder_account_concurrency_limit?: number;
+  /** Qoder 池粘性 TTL 秒（per-pool 三参数之一，默认 300） */
+  qoder_pool_sticky_ttl_secs?: number;
+  /** Qoder 池显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800；仅会话粘性开启时生效） */
+  qoder_sticky_ttl_secs?: number;
+  /** Qoder 池内调度策略；空 = 跟随 Trae 池（同 wb_strategy 语义） */
+  qoder_strategy?: string;
+  /** Qoder 池入池白名单（qd- 账号 id）；空 = fail-open 全部含凭证账号入池 */
+  qoder_enabled_uids?: string[];
+  /** Qoder 池分组筛选（共享分组 id）；空 = 不限分组 */
+  qoder_group_ids?: string[];
+  /** Trae 池标签筛选（共享标签 id）；空 = 不限。与分组筛选取交集（D5） */
+  trae_tag_ids?: string[];
+  /** Buddy 池标签筛选；空 = 不限 */
+  wb_tag_ids?: string[];
+  /** Qoder 池标签筛选；空 = 不限 */
+  qoder_tag_ids?: string[];
+}
+
+/** CC Switch 协同状态（T5.7/F-43） */
+export interface CcSwitchStatus {
+  installed: boolean;
+  dbPath: string;
+  claudeRegistered: boolean;
+  codexRegistered: boolean;
+  /** WB 侧条目（aiwork-wb-gateway-*）注册状态，与 Trae 侧互不覆盖 */
+  wbClaudeRegistered: boolean;
+  wbCodexRegistered: boolean;
+}
+
+/** 用量统计计数（按模型/账号/Key 维度，T1） */
+export interface UsageCounterView {
+  name: string;
+  requests: number;
+  ok: number;
+  errors: number;
+  /** 网关测量的累计消耗积分（issue #82 T2.4：仅 Qoder 桶 models 非零） */
+  credits: number;
+}
+
+/** 按 Key 的 token 用量 */
+export interface UsageKeyTokenView {
+  name: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+/** 单日用量统计（api_usage_stats 返回，按日期升序） */
+export interface UsageDayView {
+  date: string;
+  total_requests: number;
+  ok: number;
+  errors: number;
+  stream_requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  /** 网关测量的累计消耗积分（issue #82 T2：仅 Qoder 桶非零；上游未下发 usage 的请求不计入） */
+  credits: number;
+  /** 上游计费原值（original_credits，峰谷折扣前），用于对账 */
+  original_credits: number;
+  avg_duration_ms: number;
+  /** 总耗时 P50/P95/最大值（F-76；样本不足时缺省） */
+  p50_duration_ms?: number;
+  p95_duration_ms?: number;
+  max_duration_ms?: number;
+  /** 首字延迟 TTFT（F-76①；仅流式成功请求有样本） */
+  avg_ttfb_ms?: number;
+  p95_ttfb_ms?: number;
+  ttfb_samples?: number;
+  models: UsageCounterView[];
+  accounts: UsageCounterView[];
+  keys: UsageCounterView[];
+  key_tokens: UsageKeyTokenView[];
+  /** 按模型的延迟分位（F-76①，按请求数降序） */
+  model_latency?: UsageModelLatencyView[];
+}
+
+/** 按模型的延迟分位视图（F-76①：P50/P95/最大值 + TTFT 分桶） */
+export interface UsageModelLatencyView {
+  model: string;
+  samples: number;
+  p50_duration_ms?: number;
+  p95_duration_ms?: number;
+  max_duration_ms?: number;
+  avg_ttfb_ms?: number;
+  p95_ttfb_ms?: number;
+}
+
+/** API Key 条目（data/api_keys.json；daily_limit=0 表示不限，T2；F-35 子 Key 体系批次3） */
+export interface ApiKeyEntry {
+  id: string;
+  name: string;
+  key: string;
+  enabled: boolean;
+  daily_limit: number;
+  created_at: number;
+  used_date: string;
+  used_today: number;
+  /**
+   * 限定上游账号白名单（空 = 不限）。bind_pool=""（跟随全局调度）时条目可带
+   * 池前缀 `trae:`/`buddy:`（issue #30 混合白名单，按前缀分池限定）；绑定池时
+   * 为对应池裸 uid；旧数据全裸 uid = 仅限定 Buddy 池
+   */
+  allowed_accounts: string[];
+  /** 调度模式：expire_first（默认，临期优先）| dedicated（专一） */
+  schedule_mode: string;
+  /**
+   * 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）；跟随全局调度时
+   * 可带 `trae:`/`buddy:` 池前缀（专一锁定其归属池）
+   */
+  dedicated_account: string;
+  /** 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy" | "qoder" */
+  bind_pool: string;
+  /** 共享分组 id 白名单（shg_ 前缀）；空 = 不通过该维度限制。运行时实时展开并入
+   * 白名单，与 allowed_tags 同时勾选时取交集（D5） */
+  allowed_groups?: string[];
+  /** 共享标签 id 白名单（tag_ 前缀）；空 = 不通过该维度限制 */
+  allowed_tags?: string[];
+  /** 按日请求统计（升序，保留最近 90 天） */
+  daily_stats: ApiKeyDailyStat[];
+}
+
+/** 子 Key 按日统计项（F-35） */
+export interface ApiKeyDailyStat {
+  date: string;
+  requests: number;
+}
+
+// ---- 登录态快照 ----
+export interface ProfileInfo {
+  slot: string;
+  size_bytes: number;
+  file_count: number;
+  last_modified: string;
+}
+
+// ---- 豆包账号池（P2：快照槽 + 别名元数据合并视图，对应 Rust doubao.rs DoubaoAccountView）----
+export interface DoubaoAccountView {
+  user_id: string;
+  name: string;
+  note: string;
+  has_snapshot: boolean;
+  size_bytes: number;
+  file_count: number;
+  last_modified: string;
+  is_current: boolean;
+  added_at: string | null;
+  /** 会话状态（P3）：ok=有效 / expired=已过期 / unknown=未探活 / none=无 sessionid */
+  session_state: 'ok' | 'expired' | 'unknown' | 'none';
+  /** 明文 sessionid（编辑弹框回填用，仅本地） */
+  session_id: string | null;
+  /** sid_guard 原文（编辑弹框回填用） */
+  sid_guard: string | null;
+  /** ttwid 设备 Cookie（对话导出 API 必需；代理抓包或手动录入） */
+  ttwid: string | null;
+  /** 会员等级（null = 免费或未识别；quota_checked_at 非空表示已查询过） */
+  quota_level: string | null;
+  /** 会员到期时间（免费账号为 null） */
+  quota_expire_at: string | null;
+  /** 额度状态一句话（如 "图片 80/100 · 视频 3/10"） */
+  quota_summary: string | null;
+  /** 最近一次额度查询时间 */
+  quota_checked_at: string | null;
+  session_expire_at: string | null;
+  cookies_synced_at: string | null;
+  last_renew_at: string | null;
+  session_source: string | null;
+  /** 池级：最近一次 KeepAlive 保活时间（所有行同值） */
+  last_keepalive_at: string | null;
+}
+
+/** 续期巡检摘要 JSON（Rust tasks/doubao_session.rs，原 doubao_renew.py） */
+export interface DoubaoRenewSummary {
+  mode: 'full' | 'diagnose';
+  finished_at: string;
+  renew_url?: string;
+  sync: { synced: number; sources: { source: string; decryptable: boolean; cookies?: string[]; ascii_values?: number; note?: string; detail?: string }[] };
+  renew?: { ok: number; expired: number; error: number; skipped: number };
+  accounts?: { user_id: string; status: string; detail?: string; renewed?: boolean }[];
+  logs?: string[];
+}
+
+/** 豆包切换/保存的目标应用参数（与 switch_account / save_current_login 的 target_app 对齐） */
+export type DoubaoTargetApp = 'Doubao';
+
+/** 代理自动抓到的豆包会话凭证（代理 MITM 层写 doubao_captured_credentials.json，Rust doubao.rs 透传） */
+export interface DoubaoCapturedCredential {
+  session_id: string;
+  sid_guard: string;
+  host: string;
+  captured_at: string;
+  /** ttwid 设备 Cookie（对话导出 API 必需） */
+  ttwid: string;
+}
+
+/** D1：对话数据备份/恢复结果（doubao_chatdata_backup / doubao_chatdata_restore） */
+export interface DoubaoChatdataResult {
+  ok: boolean;
+  files: number;
+  /** 备份目录（仅 backup 返回） */
+  path?: string;
+}
+
+/** D1：对话数据备份状态（doubao_chatdata_info） */
+export interface DoubaoChatdataInfo {
+  backed: boolean;
+  files?: number;
+  size_bytes?: number;
+  backed_at?: string | null;
+}
+
+/** D2：对话记录导出结果（Rust tasks/doubao_chats.rs，原 doubao_chats.py stdout 末行 JSON） */
+export interface DoubaoExportResult {
+  ok: boolean;
+  conversations: number;
+  messages: number;
+  md_path: string;
+  json_path: string;
+}
+
+/** 会员额度查询摘要 JSON（字段由宽容解析尽力得到，均可为 null） */
+export interface DoubaoQuotaResult {
+  ok: boolean;
+  http_status: number;
+  url: string;
+  user_id: string;
+  parsed: {
+    level: string | number | null;
+    expire_at: string | null;
+    is_gift?: boolean | null;
+    has_subscription?: boolean | null;
+    /** 订阅记录（对齐客户端「订阅记录」页；免费账号为 null） */
+    subscription: {
+      name: string | null;
+      period_days: number | null;
+      start_at: string | null;
+      expire_at: string | null;
+      is_gift: boolean | null;
+      active: boolean;
+    } | null;
+    items: (
+      | { name: string; total: string | number; left: string | number | null; used: string | number | null }
+      | { name: string; used_percent: number; exhausted: boolean; reset_at: string | null }
+    )[];
+  };
+  finished_at?: string;
+}
+
+/** 豆包运维历史事件（keepalive/renew/quota；doubao_health_history.json） */
+export interface DoubaoHistoryEvent {
+  ts: string;
+  kind: 'keepalive' | 'renew' | 'quota';
+  ok: boolean;
+  uid?: string;
+  level?: string | null;
+  summary?: string | null;
+  windows?: { name: string; used_percent: number; reset_at: string }[];
+  source?: string;
+}
+
+/** 豆包快照版本元数据（C3：snapshot_meta.json + Last Version；schema_version 0 = 旧版快照无元数据） */
+export interface DoubaoSnapshotMeta {
+  schema_version: number;
+  created_at: string;
+  chromium_version: string;
+  include_idb: boolean;
+}
+
+// ---- OAuth 登录 ----
+export interface OAuthLoginUrl {
+  url: string;
+  state: string;
+  redirect_uri: string;
+}
+
+export interface OAuthCallbackInfo {
+  refresh_token: string;
+  access_token: string | null;
+  user_id: string | null;
+  user_name: string | null;
+  avatar: string | null;
+}
+
+export interface OAuthLoginResult {
+  user_id: string;
+  name: string;
+  jwt: string;
+  refresh_token: string;
+  has_refresh_token: boolean;
+  /** 本次登录是否与已有账号同 uid（合并更新而非新增） */
+  merged: boolean;
+  /** 合并时被更新的已有账号名（merged=false 时为 null） */
+  existing_name: string | null;
+}
+
+/** 本机回环监听器落库完成事件（oauth-login-done）负载 */
+export interface OAuthLoginDoneEvent {
+  ok: boolean;
+  message: string;
+  /** 登录成功时的账号备注名（合并场景为实际被更新的已有账号名） */
+  account: string | null;
+  /** 登录成功时的 user_id */
+  user_id: string | null;
+  /** 登录成功时标记是否与已有账号同 uid（合并更新而非新增）；失败时为 null */
+  merged?: boolean | null;
+}
+
+// ---- 应用自更新 ----
+export interface UpdateCheckResult {
+  has_update: boolean;
+  current_version: string;
+  latest_version: string;
+  asset_name: string;
+  download_url: string;
+  size: number;
+  release_page: string;
+  // 发布方提供的安装包 SHA256（release 正文约定行；旧版本无此行时缺省，跳过校验）
+  sha256?: string | null;
+}
+
+// API Key 数据文件视图（api_keys_list 返回：列表 + 鉴权开关）
+export interface ApiKeysFileView {
+  keys: ApiKeyEntry[];
+  // 显式关闭鉴权：仅当无启用 Key 时生效（true=放行，默认 false=拒绝）
+  auth_disabled: boolean;
+}
+
+export interface UpdateDownloadProgress {
+  received: number;
+  total: number;
+  percent: number;
+}
+
+// ---- 指纹清洗规则表（wb_template_map KV；合并语义：内置默认表始终生效，自定义表增量覆盖/追加）----
+// 规则：from → to 子串改写（contains + replace，无正则；from 必填唯一）
+// to=null 停用该规则（从生效表移除，原句透传）；to="" 剥离（改写为空串，删除指纹原文）
+export interface SanitizeRule {
+  from: string;
+  to: string | null;
+}
+
+// wb_template_map_get 返回：builtin=true 表示当前生效内置默认规则、尚无自定义副本
+export interface SanitizeMapView {
+  templates: SanitizeRule[];
+  updated_at: number | null;
+  builtin?: boolean;
+}
+
+// 下载完成后的安装包信息（update_download 返回，供「确认安装」使用）
+export interface UpdateDownloaded {
+  file_path: string;
+  asset_name: string;
+  size: number;
+  version: string;
+}
+
+// ---- WorkBuddy 账号池（批次1；对应 Rust workbuddy.rs WorkBuddyAccountView）----
+export interface WorkBuddyAccountView {
+  id: string;
+  uid: string;
+  nickname: string;
+  phone_masked: string;
+  edition_type: string;
+  /** 区域：intl（国际区 www.workbuddy.ai）| cn（国区 www.codebuddy.cn）；
+   *  国际区与国区是两套独立账号体系，各算一个账号（存量账号空值按 cn 展示） */
+  realm?: string;
+  access_token_expires_at: number | null;
+  refresh_token_expires_at: number | null;
+  auth_saved_at: number | null;
+  needs_relogin: boolean;
+  relogin_reason: string;
+  group_id: string;
+  note: string;
+  credits_balance: number | null;
+  credits_fetched_at: string | null;
+  /** 共享标签 tag id 列表（老后端缺省 undefined） */
+  tags?: string[];
+  /** 在线 = 本机 auth 文件当前生效账号 */
+  is_current: boolean;
+  has_credential: boolean;
+  has_snapshot: boolean;
+  /** 已录 CodeBuddy 快照（profiles_codebuddy/<id>/）——双端登录态分端展示 */
+  has_snapshot_codebuddy: boolean;
+  /** WorkBuddy 端当前账号（桥按端写入的 current_account.txt 标记） */
+  is_current_workbuddy: boolean;
+  /** CodeBuddy 端当前账号（桥按端写入的 current_account.txt 标记） */
+  is_current_codebuddy: boolean;
+}
+
+export interface WorkBuddyEnvCheck {
+  installed: boolean;
+  running: boolean;
+  version: string | null;
+  exe: string | null;
+  /** 实际读取的 auth 文件路径（人工覆盖优先） */
+  auth_file_path: string;
+  auth_file_exists: boolean;
+  data_dir_exists: boolean;
+  snapshot_uid: string | null;
+  snapshot_nickname: string | null;
+  snapshot_edition: string | null;
+}
+
+/** CodeBuddy 桌面环境检测（Buddy 双应用）：exe/进程走 app_locate codebuddy 档案，
+ *  uid/昵称解析自与 WorkBuddy 共享的 auth 文件，解析失败/未登录为 null */
+export interface CodeBuddyEnvCheck {
+  installed: boolean;
+  running: boolean;
+  exe: string | null;
+  version: string | null;
+  uid: string | null;
+  nickname: string | null;
+}
+
+export interface WorkBuddyScanResult {
+  id: string;
+  uid: string;
+  nickname: string;
+  edition_type: string;
+  has_access_token: boolean;
+  has_refresh_token: boolean;
+  access_token_expires_at: number | null;
+  exists: boolean;
+  /** 已在账号池中（再次导入 = 更新凭证而非新增；accounts.rs 导入按此 upsert） */
+  already_in_pool?: boolean;
+  /** 实际读取的凭据文件（多份 .info 时说明「从哪份导入」） */
+  file_path?: string;
+  /** 区域：intl（workbuddy-desktop-ai.info）| cn（workbuddy-desktop.info） */
+  realm?: string;
+  /** 该文件的 accessToken 是否以 at-rest 信封存放（本次已尝试解密） */
+  encrypted?: boolean;
+  /** at-rest 信封是否已在本次扫描中成功解开 */
+  at_rest_decrypted?: boolean;
+  /** 本条目是否可导入（false 时 reason 说明原因与修复指引） */
+  ok?: boolean;
+  /** 不可导入原因（可执行指引：启动客户端后重试 / 手工放密钥等） */
+  reason?: string;
+}
+
+export interface WorkBuddySettings {
+  auto_checkin: boolean;
+  keepalive_days: number;
+  lazy_refresh_hours: number;
+  growth_travel: boolean;
+  growth_lottery: boolean;
+  growth_tasks: boolean;
+  /** CLI 五重防护自动轮换（F-59） */
+  cli_rotate_enabled: boolean;
+  cli_rotate_interval_minutes: number;
+  cli_cooldown_minutes: number;
+  cli_min_gap_hours: number;
+  cli_min_urgency_hours: number;
+  cli_active_guard_minutes: number;
+  cli_min_remaining_credits: number;
+  // 失败通知渠道（F-19）已迁移至 Settings（通知渠道面板，Trae/Buddy 全平台共用）
+  /** UI 坐标点击签到兜底（F-18）：仅手动触发，默认关闭 */
+  ui_click_enabled: boolean;
+  ui_click_x: number;
+  ui_click_y: number;
+}
+
+/** 账号库导入结果（F-46 扩展；与后端 accounts.rs 导入返回对齐） */
+export interface WbPoolImportResult {
+  added: number;
+  skipped: number;
+  with_credentials: number;
+  /** 已在池中且凭证被更新的条数 */
+  updated?: number;
+  /** 被拒绝的条目（id + 原因），非空时前端需提示 */
+  rejected?: { id: string; reason: string }[];
+}
+
+// ---- CodeBuddy CLI 切号桥（F-06/F-59，批次3；Rust workbuddy_cli.rs + commands）----
+export interface WbCliStatus {
+  settings_present: boolean;
+  env_token_present: boolean;
+  /** 进程环境变量 CODEBUDDY_AUTH_TOKEN 存在（会覆盖 settings.json，需删除） */
+  environment_override: boolean;
+  active_account_id: string | null;
+  active_account_name: string | null;
+  /** CLI 最近会话写入时间（Unix 毫秒；活跃保护数据源） */
+  recent_activity_ms: number | null;
+  last_switch_at_ms: number | null;
+  config: Pick<
+    WorkBuddySettings,
+    | 'cli_rotate_enabled'
+    | 'cli_rotate_interval_minutes'
+    | 'cli_cooldown_minutes'
+    | 'cli_min_gap_hours'
+    | 'cli_min_urgency_hours'
+    | 'cli_active_guard_minutes'
+    | 'cli_min_remaining_credits'
+  >;
+}
+
+export interface WbCliRotateResult {
+  status: 'switched' | 'skipped' | 'error';
+  reason?: string;
+  error?: string;
+  to?: { id: string; name: string };
+}
+
+export interface WbCliRotateLog {
+  ts: number;
+  action: 'noop' | 'skipped' | 'switched' | 'error' | 'manual';
+  reason: string | null;
+  from: string | null;
+  to: { id: string; name: string } | null;
+  detail?: { name: string; remaining: number; soonest_expire_at: number | null; valid: boolean; error: string | null }[];
+}
+
+// ---- OAuth 扫码 + 环境重置（F-50/F-14，批次3）----
+/** OAuth 流程进度事件（wb-oauth-progress） */
+export interface WbOauthProgress {
+  stage: 'init' | 'browser' | 'polling' | 'success' | 'error';
+  message: string;
+  auth_url?: string | null;
+}
+
+/** OAuth 流程结果事件（wb-oauth-done） */
+export interface WbOauthDone {
+  ok: boolean;
+  id?: string;
+  nickname?: string;
+  message: string;
+}
+
+/** 环境重置清单项（F-14：16 项认证残留清理） */
+export interface WbResetItem {
+  id: string;
+  label: string;
+  detail: string;
+  exists: boolean;
+}
+
+/** 环境重置单项执行结果 */
+export interface WbResetResult {
+  id: string;
+  ok: boolean;
+  detail: string;
+}
+
+// ---- 本地 Token 统计 + 官方用量（F-25/26/57/58，批次3）----
+/** 聚合数字组（本地统计各组通用，snake_case 对齐 Rust 输出） */
+export interface WbTokenAgg {
+  total: number;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  uncached_input: number;
+  calls: number;
+  cache_hit_rate?: number | null;
+  date?: string;
+  key?: string;
+}
+
+/** 本地 Token 统计（F-26：JSONL 解析合并双源，365 天窗口） */
+export interface WbTokenStats {
+  source: string;
+  summary: WbTokenAgg;
+  models: WbTokenAgg[];
+  projects: WbTokenAgg[];
+  daily: WbTokenAgg[];
+  daily_by_model: Record<string, WbTokenAgg[]>;
+  files_scanned: number;
+  parse_errors: number;
+  coverage_start_at: number | null;
+  coverage_end_at: number | null;
+  generated_at: number;
+  window_days: number;
+}
+
+/** 官方按模型用量点（get-user-request-usage） */
+export interface WbUsageModelPoint {
+  model: string;
+  request_count: number;
+  credit: number;
+}
+
+/** 全账号官方用量聚合（Buddy 积分看板近 7 日消耗主数据源；31 天零填充） */
+export interface WbUsageOfficialAll {
+  status: 'complete';
+  source: 'official_all';
+  accounts_total: number;
+  accounts_ok: number;
+  range_start: string;
+  range_end: string;
+  fetched_at_ms: number;
+  request_count_total: number;
+  /** F-59 同款 stale-on-error：全部账号拉取失败时回退的过期聚合缓存 */
+  stale?: boolean;
+  stale_reason?: string;
+  summary: { usage_today: number; usage_7days: number; usage_this_month: number };
+  daily: { date: string; usage: number }[];
+  /** 按模型汇总（31 天全窗口、跨账号合并；stale 旧缓存可能缺省） */
+  models?: WbUsageModelPoint[];
+}
+
+/** 活动信息三端点聚合（F-51）：banner（公开）+ 付费类型 + 用量提醒 */
+export interface WbActivityInfo {
+  account_id: string | null;
+  payment_type: string | null;
+  dosage_notify: Record<string, unknown> | null;
+  banners: { title: string; content: string; url: string; start_time: string; end_time: string }[];
+  errors: string[];
+  fetched_at_ms: number;
+}
+
+/** 积分用量快照回退（F-27）：官方用量不可用时的本地推导数据源 */
+export interface WbUsageFallback {
+  status: 'snapshot';
+  snapshot_days: number;
+  summary: { usage_today: number; usage_7days: number; usage_this_month: number };
+  daily: { date: string; usage: number }[];
+  note: string;
+  fetched_at_ms: number;
+}
+
+/** 积分包（tasks/wb_credits.rs 宽容解析输出） */
+export interface WbCreditPackage {
+  name: string;
+  remaining: number;
+  total: number;
+  used: number;
+  end_time: string | null;
+  expire_ts: number | null;
+  expire_soon?: boolean;
+}
+
+export interface WbCreditAccount {
+  user_id: string;
+  name: string;
+  ok: boolean;
+  message?: string;
+  balance: number | null;
+  packages: WbCreditPackage[];
+  source: string;
+  fetched_at?: string;
+}
+
+export interface WbCreditsResult {
+  ok: boolean;
+  cached?: boolean;
+  /** F-59 stale-on-error：全部账号刷新失败时回退的历史缓存 */
+  stale?: boolean;
+  /**
+   * stale-while-revalidate（2026-10-08）：本次返回的是过期缓存，后端已转入后台刷新；
+   * 前端稍后重取一次即可拿到新值（见 BuddyOverview 的重取逻辑）。
+   */
+  refreshing?: boolean;
+  accounts: WbCreditAccount[];
+  total_balance?: number;
+}
+
+/** WB 每日积分快照行（wb_credits_history；credits-dashboard-plan.md §2.2 方案 B 含 earned） */
+export interface WbCreditsSnapshot {
+  date: string;
+  ts: number;
+  total_balance: number;
+  /** 当日新增积分（余额差分 + 签到 reward 归并）；null/缺省 = 未统计（v2 老快照行/首日） */
+  earned?: number | null;
+  accounts: { user_id: string; balance: number | null }[];
+}
+
+/** WorkBuddy 签到日志（90 天存储） */
+export interface WbCheckinRecord {
+  date: string;
+  time: string;
+  user_id: string;
+  name: string;
+  status: string;
+  message: string;
+  /** 签到获得积分（接口返回或前后余额差值兜底） */
+  reward?: number;
+}
+
+/** WB 上游模型目录条目（Rust wb_catalog::WbModel，snake_case 对齐） */
+export interface WbModelInfo {
+  id: string;
+  display: string;
+  context_length: number;
+  max_tokens: number;
+  supports_image: boolean;
+  supported_efforts: string[];
+  effort_override: string | null;
+  rate: number;
+}
+
+// ---- Qoder（F-80；Rust commands/qoder；字段名严格 snake_case）----
+export interface QoderEnvCheck {
+  ide_installed: boolean;
+  ide_running: boolean;
+  ide_exe: string | null;
+  /** IDE exe ProductVersion（顶栏 hover 展示，对齐 Trae/Buddy） */
+  ide_version: string | null;
+  ide_data_dir: string | null;
+  ide_data_dir_exists: boolean;
+  cli_dir: string;
+  cli_dir_exists: boolean;
+  /** QoderWork CN（Launcher 形态：%LOCALAPPDATA%\Qoder CN\Qoder CN Launcher）；数据目录布局待 R-1 */
+  qoderwork_installed: boolean;
+  qoderwork_running: boolean;
+  qoderwork_exe: string | null;
+  qoderwork_version: string | null;
+}
+
+/** 每账号稳定设备指纹（§5.10 多账号并发；machine_id 32 位 hex，入池生成永不轮换） */
+export interface QoderDeviceProfile {
+  machine_id: string;
+  device_id: string;
+  umid: string;
+}
+
+export interface QoderAccountView {
+  id: string;
+  uid: string;
+  nickname: string;
+  phone_masked: string;
+  /** free | pro | pro+ | teams（userinfo 未提供时为空） */
+  plan: string;
+  /** 凭证来源：pat | ide_store | qoderwork_store | mitm | cli */
+  credential_source: string;
+  token_expires_at: number | null;
+  needs_relogin: boolean;
+  relogin_reason: string;
+  group_id: string;
+  note: string;
+  credits_balance: number | null;
+  credits_fetched_at: string | null;
+  has_credential: boolean;
+  /** 共享标签 tag id 列表（老后端缺省 undefined） */
+  tags?: string[];
+  /** token 种类徽标：pat | client | unknown（脱敏） */
+  token_kind: string;
+  /** 设备指纹徽标（machine_id 前 8 位；null = 尚未回填） */
+  fingerprint: string | null;
+  /** 完整设备指纹（指纹查看弹框数据源） */
+  device_profile: QoderDeviceProfile | null;
+  /** 区域（方案 C）：cn | intl（老后端缺省 undefined，按国内版展示） */
+  realm?: string;
+}
+
+export interface QoderSettings {
+  /** 启动自动补签 + 应用内调度器启用判定（默认开） */
+  auto_checkin: boolean;
+}
+
+/** 账号池导出文件（M4：aiwork-qoder-pool；include_credentials=true 时 accounts[].credential 附带凭证副本，导出文件等同密码） */
+export interface QoderPoolExport {
+  kind: 'aiwork-qoder-pool';
+  version: number;
+  exported_at: string;
+  include_credentials: boolean;
+  accounts: Record<string, unknown>[];
+}
+
+/** 账号池导入结果（M4，与 WbPoolImportResult 同构） */
+export interface QoderPoolImportResult {
+  added: number;
+  updated: number;
+  skipped: number;
+  with_credentials: number;
+  /** 被拒绝的条目（id + 原因），非空时前端需提示 */
+  rejected?: { id: string; reason: string }[];
+  /** F-80-余 v2 迁移提示：true = 历史明文含凭证文件，建议重新以加密格式导出归档 */
+  plaintext_credentials?: boolean;
+}
+
+/** 环境重置清单项（M4：8 项语义块，与 WbResetItem 同构） */
+export interface QoderResetItem {
+  id: string;
+  label: string;
+  detail: string;
+  exists: boolean;
+}
+
+/** 环境重置单项执行结果 */
+export interface QoderResetResult {
+  id: string;
+  ok: boolean;
+  detail: string;
+}
+
+/** OAuth 设备流进度事件（qoder-oauth-progress，对齐 WbOauthProgress）：
+ *  后端仅发 init/browser/polling 三个 stage，终态（成功/失败）走 qoder-oauth-done 事件 */
+export interface QoderOauthProgress {
+  stage: 'init' | 'browser' | 'polling';
+  message: string;
+  auth_url?: string | null;
+}
+
+/** OAuth 设备流结果事件（qoder-oauth-done，对齐 WbOauthDone） */
+export interface QoderOauthDone {
+  ok: boolean;
+  id?: string;
+  nickname?: string;
+  message: string;
+}
+
+/** IDE 存储账号发现/导入结果（qoder_ide_scan；脱敏不含 token） */
+export interface QoderIdeScanEntry {
+  account_id: string;
+  uid: string;
+  nickname: string;
+  /** cn | intl */
+  realm: string;
+  /** auth_v1 | vscdb */
+  channel: string;
+  /** 命中的数据目录 */
+  dir: string;
+  imported: boolean;
+  updated: boolean;
+  /** 本条告警（凭证落库失败等；空 = 正常） */
+  reason: string;
+}
+
+export interface QoderIdeScanResult {
+  found: boolean;
+  imported: boolean;
+  updated: boolean;
+  account_id: string | null;
+  nickname: string | null;
+  reason: string;
+  /** 本次探测过的数据目录（新版 com.qodercn.app.stable / 旧 QoderCN 等） */
+  paths?: string[];
+  /** 命中的读取通道：auth_v1（auth.v1.dat）| vscdb（state.vscdb） */
+  channel?: string;
+  /** 命中的区域：cn | intl */
+  realm?: string;
+  /** 本次识别到的全部账号（国际区 + 国内区一次扫全；两区是两个账号） */
+  accounts?: QoderIdeScanEntry[];
+}
+
+/** Qoder CLI 登录状态（M4 status 只读桥；R-3 裁决无独立 CLI 凭证通道） */
+export interface QoderCliStatus {
+  available: boolean;
+  logged_in?: boolean;
+  name?: string;
+  avatar_url?: string;
+  version?: string;
+  product?: string;
+  snapshot_at?: string;
+  writer?: string;
+  reason?: string;
+}
+
+/** 两个 Qoder 客户端当前实际登录的账号 id（池反查；解密失败/未登录 → null） */
+export interface QoderLiveLogins {
+  /** Qoder IDE（state.vscdb 真源） */
+  ide: string | null;
+  /** Qoder Work（auth.v1.dat 真源） */
+  work: string | null;
+}
+
+export interface QoderCheckinRecord {
+  date: string;
+  time: string;
+  user_id: string;
+  name: string;
+  status: string;
+  message: string;
+  reward?: number;
+  /** 逐活动明细（F-80-余 v2 档期日历；历史记录无此字段） */
+  campaigns?: { id?: string; name?: string; kind?: string; reward?: number | null }[];
+}
+
+/** qoder-checkin-progress NDJSON 单行：逐账号结果（index 为本轮序号，1 起） */
+export interface QoderCheckinLine {
+  index: number;
+  user_id: string;
+  name: string;
+  status: 'success' | 'already' | 'fail' | 'skip';
+  message?: string;
+  reward?: number;
+}
+
+/** 签到完成汇总（done 事件归约产物） */
+export interface QoderCheckinDone {
+  ok: number;
+  already: number;
+  failed: number;
+  /** failed 中「活动未开始/不可用」的非用户可操作失败数（口径对齐 Rust 侧） */
+  empty: number;
+}
+
+export interface QoderCreditPackage {
+  amount: number | null;
+  /** 包总量（R-11 逐包明细 limit_value；旧聚合口径无此值） */
+  total?: number | null;
+  expire_at: string;
+  /** 包来源：plan = 订阅配额（随订阅周期重置）；bonus = 个人资源包（R-11 逐包明细）；
+   *  dedicated = 专属/组织资源包（sash usage 逐包，自有到期时间）；
+   *  addon = 旧聚合口径（addOnQuota 总额，随订阅周期展示） */
+  source: string;
+  /** 包名（dedicated 专属/组织包原生携带；其余来源无此值） */
+  name?: string | null;
+}
+
+export interface QoderCreditAccount {
+  user_id: string;
+  name: string;
+  ok: boolean;
+  message?: string;
+  plan_credits: number | null;
+  addon_credits: number | null;
+  /** 订阅周期内已消耗（userQuota.used，看板「订阅版本的资源」进度数据源） */
+  plan_used?: number | null;
+  addon_used?: number | null;
+  /** 订阅周期到期日（qoderUsage.expiresAt → YYYY-MM-DD） */
+  plan_expires_at?: string;
+  total: number | null;
+  packages: QoderCreditPackage[];
+  /** 数据源徽标：pat | client_token | fetch_failed | none */
+  source: string;
+  fetched_at: string;
+}
+
+export interface QoderCreditsResult {
+  ok: boolean;
+  cached?: boolean;
+  /** F-59 stale-on-error：全部账号刷新失败时回退的历史缓存 */
+  stale?: boolean;
+  stale_reason?: string;
+  accounts: QoderCreditAccount[];
+  total_balance?: number;
+  message?: string;
+}
+
+export interface QoderCreditsSnapshot {
+  date: string;
+  ts: number;
+  total_balance: number;
+  /** 当日消耗（快照差分：前日余额 − 当日余额 + 当日签到奖励，负值记 0；首日 null） */
+  consumed?: number | null;
+  /** 当日获得（签到奖励合计；无签到数据 null） */
+  earned?: number | null;
+  accounts: { user_id: string; total: number | null }[];
+}
+
+// ============================================================
+// 智能体接入（三项目合并强制能力）
+// 后端：src-tauri/src/commands/agent_import.rs
+// 字段一律 snake_case（与 Rust DTO 零转换对齐；见本文件头部约定）
+// ============================================================
+
+/** 统一 MCP server 条目 */
+export interface AgentMcpServer {
+  name: string;
+  agent: string;
+  command: string;
+  args: string[];
+  url: string;
+  /** stdio | http | sse */
+  transport: string;
+  source: string;
+}
+
+/** 从某个智能体配置里解析出的可导入上游 */
+export interface AgentProvider {
+  /** 稳定 id：`<agent>::<来源定位>` */
+  id: string;
+  agent: string;
+  agent_name: string;
+  label: string;
+  base_url: string;
+  /** 完整 Key 仅在后端流转，前端不要展示 */
+  api_key: string;
+  key_masked: string;
+  model: string;
+  models: string[];
+  /** openai | anthropic */
+  protocol: string;
+  source: string;
+  importable: boolean;
+  note: string;
+}
+
+/** 单个智能体的探测结果 */
+export interface AgentProbe {
+  key: string;
+  name: string;
+  vendor: string;
+  protocol: string;
+  homepage: string;
+  installed: boolean;
+  /** 是否支持「一键接入本网关」自动落盘 */
+  connect_supported: boolean;
+  config_paths: string[];
+  providers: AgentProvider[];
+  mcp_servers: AgentMcpServer[];
+  warnings: string[];
+  scanned_at: number;
+}
+
+export interface AgentScanResult {
+  probes: AgentProbe[];
+  /** 额外目录识别出的兄弟网关 / 外部智能体 */
+  extras: AgentProbe[];
+  scanned_at: number;
+  warnings: string[];
+}
+
+export interface PlannedModel {
+  provider_id: string;
+  name: string;
+  base_url: string;
+  vendor: string;
+  key_masked: string;
+  enabled: boolean;
+  /** 非空 = 同名模型已存在（导入时按 overwrite 决定跳过或覆盖） */
+  conflict: string;
+}
+
+export interface PlannedKey {
+  name: string;
+  existing: boolean;
+}
+
+export interface PlannedMcp {
+  name: string;
+  agent: string;
+  already: boolean;
+}
+
+export interface PlanSkip {
+  provider_id: string;
+  agent_name: string;
+  label: string;
+  reason: string;
+}
+
+export interface AgentImportPlan {
+  models: PlannedModel[];
+  keys: PlannedKey[];
+  mcp: PlannedMcp[];
+  skipped: PlanSkip[];
+  warnings: string[];
+}
+
+export interface AgentImportOptions {
+  create_models: boolean;
+  create_keys: boolean;
+  enable_models: boolean;
+  overwrite: boolean;
+  register_mcp: boolean;
+}
+
+export interface AgentImportReport {
+  models_added: number;
+  models_skipped: number;
+  keys_added: number;
+  keys_reused: number;
+  mcp_added: number;
+  details: string[];
+  warnings: string[];
+  imported_at: number;
+}
+
+export interface AgentImportRecord {
+  at: number;
+  provider_ids: string[];
+  models_added: number;
+  models_skipped: number;
+  keys_added: number;
+  mcp_added: number;
+}
+
+export interface AgentConnectOptions {
+  base_url?: string | null;
+  model?: string | null;
+  api_key?: string | null;
+}
+
+export interface AgentConnectReport {
+  target: string;
+  target_name: string;
+  written: string[];
+  backups: string[];
+  /** 无法自动落盘时给用户复制的配置片段 */
+  snippet: string;
+  notes: string[];
+}
+
+export interface AgentGatewayInfo {
+  base_url: string;
+  base_url_v1: string;
+  host: string;
+  port: number;
+  default_model: string;
+  key_name: string;
+  provider_id: string;
+}
+
+// ============================================================
+// 枢纽增强包（上游组 / 成本 / 活动 / 出口 / 目录 / 信封）
+// 后端：src-tauri/src/commands/hub.rs
+// ============================================================
+
+export interface UpstreamEndpointInput {
+  id: string;
+  label: string;
+  base_url: string;
+  api_key: string;
+  weight: number;
+  enabled: boolean;
+  note: string;
+}
+
+export interface UpstreamGroupInput {
+  model: string;
+  /** swrr（平滑加权，默认）| priority（按顺序取首个健康） */
+  strategy: string;
+  endpoints: UpstreamEndpointInput[];
+  updated_at: number;
+}
+
+export interface EndpointHealth {
+  id: string;
+  label: string;
+  base_url: string;
+  enabled: boolean;
+  weight: number;
+  healthy: boolean;
+  cooling_until: number;
+  cooling_reason: string;
+  fails: number;
+  breaker_until: number;
+  soft_until: number;
+  degrade_until: number;
+  balance_until: number;
+  last_error: string;
+}
+
+export interface UpstreamGroupView {
+  model: string;
+  strategy: string;
+  endpoints: EndpointHealth[];
+  healthy_count: number;
+  updated_at: number;
+}
+
+export interface CostBand {
+  /** 输入 token 上限；0 = 无上限（必须放最后） */
+  upto_input: number;
+  price_in: number;
+  price_out: number;
+}
+
+export interface CostPolicy {
+  id: string;
+  model: string;
+  currency: string;
+  flat_in: number;
+  flat_out: number;
+  bands: CostBand[];
+  usd_cny: number;
+  note: string;
+  created_at: number;
+}
+
+export interface CostRecord {
+  at: number;
+  model: string;
+  policy_id: string;
+  in_tokens: number;
+  out_tokens: number;
+  cost: number;
+  key_id: string;
+}
+
+export interface CostDaily {
+  date: string;
+  model: string;
+  requests: number;
+  in_tokens: number;
+  out_tokens: number;
+  cost: number;
+}
+
+export interface CostSummary {
+  total_cost: number;
+  total_requests: number;
+  total_in_tokens: number;
+  total_out_tokens: number;
+  currency: string;
+  days: CostDaily[];
+  unpriced: string[];
+  policy_count: number;
+}
+
+export interface ActivityEvent {
+  at: number;
+  kind: string;
+  actor: string;
+  summary: string;
+  fields: Record<string, unknown>;
+}
+
+export interface EgressInfo {
+  ok: boolean;
+  ip: string;
+  region: string;
+  isp: string;
+  latency_ms: number;
+  source_url: string;
+  probed_at: number;
+  error: string;
+}
+
+export interface ProbeOutcome {
+  ok: boolean;
+  status: number | null;
+  latency_ms: number;
+  detail: string;
+  base_url: string;
+}
+
+export interface CatalogStatus {
+  entries: number;
+  synced_at: number;
+  fresh: boolean;
+  remote_url: string;
+  ttl_secs: number;
+}
+
+export interface ModelCapability {
+  model: string;
+  context_length: number;
+  max_output: number | null;
+  /** remote | family | local | default */
+  source: string;
+}
+
+export interface SealedEnvelope {
+  v: number;
+  alg: string;
+  kdf: string;
+  key_id: string;
+  code: string;
+  nonce: string;
+  ct: string;
+  hint: string;
+}
+

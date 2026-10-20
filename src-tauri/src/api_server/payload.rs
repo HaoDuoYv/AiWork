@@ -1,0 +1,765 @@
+use serde_json::{json, Value};
+
+/// 模型显示名 → (canonical config_name, 内部 model_name) 映射
+/// 大小写不敏感：客户端可传入 "doubao-seed-2.1-turbo" 或 "Doubao-Seed-2.1-Turbo"
+/// 与上游 batch_get_detail_param（solo_work_lite，2026-09 实测）同步。
+/// 未收录模型返回 None（官方新上架等，调用侧原样透传）
+fn model_config(model: &str) -> Option<(&'static str, &'static str)> {
+    let pair = match model.to_lowercase().as_str() {
+        "doubao-seed-evolving" => ("Doubao-Seed-Evolving", "Doubao-Seed-Evolving__dev"),
+        "doubao-seed-2.1-pro" | "seed-code-pro-0430" => ("Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev"),
+        "doubao-seed-2.1-turbo" => ("Doubao-Seed-2.1-Turbo", "Doubao-Seed-2.1-Turbo__dev"),
+        "doubao-seed-code" => ("Doubao-Seed-Code", "Doubao-Seed-Code__dev"),
+        "glm-5.3-flash" => ("glm-5.3-flash", "glm-5.3-flash__dev"),
+        "qwen3.8-flash" => ("qwen3.8-flash", "qwen3.8-flash__dev"),
+        "glm-5.2" => ("glm-5.2", "glm-5.2__dev"),
+        "glm-5.3" => ("glm-5.3", "glm-5.3__dev"),
+        "glm-5" => ("glm-5", "glm-5__dev"),
+        "glm-5-turbo" => ("glm-5-turbo", "glm-5-turbo__dev"),
+        // deepseek-v4.1-flash 仅在 solo_agent 视图可用（solo_work_lite 下报 4001），
+        // 且 solo_agent 位内部名为点号风格（下划线变体报 4023 model unknown，2026-09-22 实测）
+        "deepseek-v4.1-flash" => ("deepseek-v4.1-flash", "deepseek-v4.1-flash__dev"),
+        "deepseek-v4-flash" => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
+        "deepseek-v4-flash-official" => ("DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash-Official__dev"),
+        "deepseek-v4-pro" => ("DeepSeek-V4-Pro", "deepseek_v4_pro__dev"),
+        "deepseek-v4-pro-official" => ("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro-Official__dev"),
+        "kimi-k2.6" => ("kimi-k2.6", "kimi-k2.6__dev"),
+        "kimi-k2.7-code" => ("kimi-k2.7-code", "kimi-k2.7-code__dev"),
+        "kimi-k2.8-preview" => ("kimi-k2.8-preview", "kimi-k2.8-preview__dev"),
+        "kimi-k3" => ("kimi-k3", "kimi-k3__dev"),
+        "minimax-m3" => ("minimax-m3", "minimax-m3__dev"),
+        "qwen3.8-max" => ("qwen3.8-max", "qwen3.8-max__dev"),
+        "qwen-3.7-plus" => ("qwen-3.7-plus", "qwen-3.7-plus__dev"),
+        // 未收录模型返回 None → 调用侧按实证规律原样透传（见 prepare_llm_chat_body）；
+        // 旧兜底 DeepSeek-V4-Flash 会把官方新上架模型静默路由到错误模型，比报 4023 更糟
+        _ => return None,
+    };
+    Some(pair)
+}
+
+/// 生成类似 UUID 的十六进制字符串
+fn gen_uuid_like() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let nanos = now.as_nanos();
+    let seed = (nanos as u64).wrapping_mul(0x517cc1b727220a95);
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&seed.to_le_bytes());
+    buf[8..16].copy_from_slice(&(seed.wrapping_add(0x9e3779b97f4a7c15)).to_le_bytes());
+    let hex: String = buf.iter().map(|b| format!("{:02x}", b)).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// 文本指纹清洗（issue #57）：strip_cc + 模板映射（与 WB 管线同一套规则表）
+fn sanitize_text(s: &str, templates: &[(String, String)]) -> String {
+    let washed = super::wb_payload::strip_cc_fingerprints(s);
+    super::wb_payload::apply_template_map(&washed, templates)
+}
+
+/// content 块数组/裸字符串的文本清洗
+fn sanitize_content(content: &mut Value, templates: &[(String, String)]) {
+    match content {
+        Value::Array(blocks) => {
+            for b in blocks.iter_mut() {
+                if let Some(Value::String(t)) = b.get_mut("text") {
+                    *t = sanitize_text(t, templates);
+                }
+            }
+        }
+        Value::String(s) => {
+            *s = sanitize_text(s, templates);
+        }
+        _ => {}
+    }
+}
+
+/// OpenAI 请求体 → llm_utils_chat 请求体改写
+/// llm_utils_chat 消耗通用积分(product_id 208)
+/// `models` 为同步落库的模型目录（查表定 function，热路径有缓存）
+/// `sanitize`：指纹清洗开关（沿用全局 wb_sanitize，issue #57——Trae 池此前
+/// 从不清洗，客户端 harness 身份句原样透传上游，进入风控名单即全量 11128）
+/// `templates`：热更新的指纹改写规则表（load_templates）
+pub fn prepare_llm_chat_body(
+    src: &[u8],
+    default_model: &str,
+    uid: &str,
+    device_id: &str,
+    machine_id: &str,
+    models: &[super::models_sync::ModelOption],
+    sanitize: bool,
+    templates: &[(String, String)],
+) -> Vec<u8> {
+    let mut obj: Value = match serde_json::from_slice(src) {
+        Ok(v) => v,
+        Err(_) => return src.to_vec(),
+    };
+    let obj_mut = match obj.as_object_mut() {
+        Some(m) => m,
+        None => return src.to_vec(),
+    };
+
+    // messages content string → [{type:text, text:...}]
+    if let Some(msgs) = obj_mut.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for mi in msgs.iter_mut() {
+            if let Some(m) = mi.as_object_mut() {
+                let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
+
+                // assistant tool_calls: function → function_call
+                if role == "assistant" {
+                    if let Some(tcs) = m.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+                        // 指纹清洗：function arguments 为 JSON 字符串，仅模板映射
+                        //（此时尚未改名 function → function_call，先清洗再改名）
+                        if sanitize {
+                            for tc in tcs.iter_mut() {
+                                if let Some(Value::String(args)) =
+                                    tc.pointer_mut("/function/arguments")
+                                {
+                                    *args =
+                                        super::wb_payload::apply_template_map(args, templates);
+                                }
+                            }
+                        }
+                        let kept: Vec<Value> = tcs
+                            .iter_mut()
+                            .filter_map(|tc| {
+                                let tcm = tc.as_object_mut()?;
+                                if let Some(fn_val) = tcm.remove("function") {
+                                    tcm.insert("function_call".into(), fn_val);
+                                }
+                                let has_name = tcm
+                                    .get("function_call")
+                                    .and_then(|fc| fc.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    .map(|s| !s.trim().is_empty())
+                                    .unwrap_or(false);
+                                if has_name { Some(tc.clone()) } else { None }
+                            })
+                            .collect();
+                        if kept.is_empty() {
+                            m.remove("tool_calls");
+                        } else {
+                            *tcs = kept;
+                        }
+                    }
+                }
+
+                // content string → array
+                if let Some(content) = m.get("content") {
+                    if let Some(s) = content.as_str() {
+                        m.insert(
+                            "content".into(),
+                            json!([{ "type": "text", "text": s }]),
+                        );
+                    }
+                }
+                // 指纹清洗：文本块 strip_cc + 模板映射
+                if sanitize {
+                    if let Some(content) = m.get_mut("content") {
+                        sanitize_content(content, templates);
+                    }
+                }
+            }
+        }
+    }
+
+    // model → config_name + model_name (大小写不敏感，规范化为 Trae 客户端使用的标准名称)
+    let model = obj_mut
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_model.to_string());
+    let (config_name, model_name): (std::borrow::Cow<str>, std::borrow::Cow<str>) =
+        match model_config(&model) {
+            Some((c, m)) => (c.into(), m.into()),
+            None => {
+                // 未收录模型（官方新上架等）原样透传：实证规律
+                // model_name = config_name__dev（solo_agent/solo_work_lite 位均成立，
+                // 仅 deepseek-v4.1-flash 例外且已有显式映射）
+                let c = model.trim();
+                (c.into(), format!("{c}__dev").into())
+            }
+        };
+
+    // normalize tool_choice and tools (reuse existing logic)
+    normalize_tool_choice(obj_mut);
+    normalize_tools(obj_mut);
+
+    // 指纹清洗：工具描述仅模板映射（客户端 harness 常在工具描述注入身份痕迹）
+    if sanitize {
+        if let Some(tools) = obj_mut.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            for tool in tools.iter_mut() {
+                if let Some(Value::String(desc)) =
+                    tool.pointer_mut("/function/description")
+                {
+                    *desc = super::wb_payload::apply_template_map(desc, templates);
+                }
+            }
+        }
+    }
+
+    // 添加 llm_utils_chat 必需字段
+    obj_mut.insert("config_name".into(), json!(config_name));
+    obj_mut.insert("model_name".into(), json!(model_name));
+    obj_mut.insert("stream".into(), json!(true));
+    // 部分客户端内置模型仅在 solo_agent 下可用（实测），按模型分发 function：
+    // 同步落库的来源视图优先（官方新上架免改代码），表内无视图时回退硬编码
+    let function = super::models_sync::function_for_model_in(models, &model.to_lowercase());
+    obj_mut.insert("function".into(), json!(function));
+    // max_tokens：尊重客户端显式值（含 Anthropic max_tokens 透传，P2 修复），
+    // 缺省兜底 4096（上游必需字段）
+    let max_tokens = obj_mut
+        .get("max_tokens")
+        .or_else(|| obj_mut.get("max_completion_tokens"))
+        .cloned()
+        .filter(|v| v.as_u64().map_or(false, |n| n > 0))
+        .unwrap_or_else(|| json!(4096));
+    obj_mut.insert("max_tokens".into(), max_tokens);
+    obj_mut.insert("conversation_id".into(), json!(gen_uuid_like()));
+    obj_mut.insert("user_id".into(), json!(uid));
+    obj_mut.insert("session_id".into(), json!(gen_uuid_like()));
+    obj_mut.insert("device_id".into(), json!(device_id));
+    obj_mut.insert("machine_id".into(), json!(machine_id));
+    obj_mut.insert("project_id".into(), json!(gen_uuid_like()));
+    obj_mut.insert("workspace_id".into(), json!("e04cdd"));
+    // prompt_max_tokens：固定 168000（dev 通道实测值，issue #31）。
+    // 2026-09-26 真机实证矩阵（issue #38 复测链路）：
+    //   is_max_mode:true + prompt_max_tokens:168000 → 200 ✅
+    //   is_max_mode:true + 省略该字段              → 4001（上游必填）
+    //   is_max_mode:true + prompt_max_tokens:1M    → 4001（上游拒绝 1M 值）
+    // 1M 兑现已验证：`-max` 通路（注入 is_max_mode:true + 本字段 168000）实测
+    // 180051 prompt_tokens（>168000）HTTP 200——Max Mode 下该字段不钳制实际上下文，
+    // 1M 窗口由上游内部决策，网关侧固定 168000 即可
+    obj_mut.insert("prompt_max_tokens".into(), json!(168_000));
+    obj_mut.insert("mode".into(), json!("FunctionCall"));
+    obj_mut.insert("ide_version".into(), json!(super::IDE_VERSION));
+    obj_mut.insert("ide_version_code".into(), json!(super::IDE_VERSION_CODE));
+    obj_mut.insert("app_id".into(), json!(super::APP_ID));
+    obj_mut.insert("package_type".into(), json!("stable_cn"));
+
+    serde_json::to_vec(&obj).unwrap_or_else(|_| src.to_vec())
+}
+
+fn normalize_tool_choice(obj: &mut serde_json::Map<String, Value>) {
+    let suppress = |obj: &mut serde_json::Map<String, Value>| {
+        obj.remove("tools");
+        obj.remove("functions");
+    };
+    let tc = match obj.remove("tool_choice") {
+        Some(v) => v,
+        None => return,
+    };
+    match tc {
+        Value::String(s) => {
+            if s.trim().eq_ignore_ascii_case("none") {
+                suppress(obj);
+            } else {
+                obj.insert("tool_choice".into(), Value::String(s));
+            }
+        }
+        Value::Object(map) => {
+            let typ = map
+                .get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+            match typ.as_str() {
+                "none" => suppress(obj),
+                "auto" | "required" => {
+                    obj.insert("tool_choice".into(), Value::String(typ));
+                }
+                "function" => {
+                    let name = map
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .or_else(|| map.get("name").and_then(|n| n.as_str()))
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "auto".to_string());
+                    obj.insert("tool_choice".into(), Value::String(name));
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_tools(obj: &mut serde_json::Map<String, Value>) {
+    let raw = match obj.get_mut("tools") {
+        Some(v) => v,
+        None => return,
+    };
+    let list = match raw.as_array_mut() {
+        Some(a) => a,
+        None => return,
+    };
+    if list.is_empty() {
+        obj.remove("tools");
+        return;
+    }
+    let mut out = Vec::new();
+    for item in list.iter_mut() {
+        let t = match item.as_object_mut() {
+            Some(o) => o,
+            None => continue,
+        };
+        let fn_obj = match t.get_mut("function").and_then(|f| f.as_object_mut()) {
+            Some(o) => o,
+            None => continue,
+        };
+        // parameters object → JSON string
+        if let Some(params) = fn_obj.get("parameters") {
+            if params.is_object() {
+                if let Ok(s) = serde_json::to_string(params) {
+                    fn_obj.insert("parameters".into(), Value::String(s));
+                }
+            }
+        }
+        out.push(item.clone());
+    }
+    if out.is_empty() {
+        obj.remove("tools");
+    } else {
+        *raw = Value::Array(out);
+    }
+}
+
+// ==================== Anthropic 协议输入（F-39：+Anthropic 适配） ====================
+
+/// Anthropic Messages 请求体 → OpenAI 内部格式（随后复用 OpenAI → llm_utils_chat 链路）
+/// 支持：system（字符串/blocks）、text blocks、tool_use/tool_result、tools、tool_choice
+/// 不支持：image 等多模态 block（跳过）；max_tokens 由 prepare_llm_chat_body 统一设 4096
+pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
+    let v: Value = match serde_json::from_slice(src) {
+        Ok(v) => v,
+        Err(_) => return src.to_vec(),
+    };
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return src.to_vec(),
+    };
+
+    let mut out = serde_json::Map::new();
+    if let Some(m) = obj.get("model") {
+        out.insert("model".into(), m.clone());
+    }
+    if let Some(s) = obj.get("stream") {
+        out.insert("stream".into(), s.clone());
+    }
+    // 采样参数透传（P2 修复）：max_tokens（Anthropic 必填）/temperature/top_p
+    // 同名直传；stop_sequences → OpenAI stop
+    if let Some(m) = obj.get("max_tokens") {
+        out.insert("max_tokens".into(), m.clone());
+    }
+    if let Some(x) = obj.get("temperature") {
+        out.insert("temperature".into(), x.clone());
+    }
+    if let Some(x) = obj.get("top_p") {
+        out.insert("top_p".into(), x.clone());
+    }
+    if let Some(ss) = obj.get("stop_sequences").and_then(|s| s.as_array()) {
+        if !ss.is_empty() {
+            out.insert("stop".into(), json!(ss));
+        }
+    }
+
+    let mut messages: Vec<Value> = Vec::new();
+
+    // system → 首条 system 消息
+    match obj.get("system") {
+        Some(Value::String(s)) => {
+            messages.push(json!({ "role": "system", "content": s }));
+        }
+        Some(Value::Array(blocks)) => {
+            let text = blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("");
+            if !text.is_empty() {
+                messages.push(json!({ "role": "system", "content": text }));
+            }
+        }
+        _ => {}
+    }
+
+    for msg in obj
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let role = msg
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("user")
+            .to_string();
+        match msg.get("content") {
+            Some(Value::String(s)) => {
+                messages.push(json!({ "role": role, "content": s }));
+            }
+            Some(Value::Array(blocks)) => {
+                let mut text_parts: Vec<String> = Vec::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
+                let mut tool_results: Vec<Value> = Vec::new();
+                for b in blocks {
+                    let btype = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match btype {
+                        "text" => {
+                            if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                text_parts.push(t.to_string());
+                            }
+                        }
+                        "tool_use" => {
+                            let args = b.get("input").cloned().unwrap_or(json!({}));
+                            tool_calls.push(json!({
+                                "id": b.get("id").cloned()
+                                    .unwrap_or(json!(format!("toolu_{}", tool_calls.len()))),
+                                "type": "function",
+                                "function": {
+                                    "name": b.get("name").cloned().unwrap_or(json!("")),
+                                    "arguments": serde_json::to_string(&args).unwrap_or_default(),
+                                },
+                            }));
+                        }
+                        "tool_result" => {
+                            let content_str = match b.get("content") {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(Value::Array(arr)) => arr
+                                    .iter()
+                                    .filter_map(|c| c.get("text"))
+                                    .filter_map(|t| t.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(""),
+                                _ => String::new(),
+                            };
+                            // is_error 透传（P2 修复）：OpenAI tool 消息无 is_error
+                            // 字段，以「Error:」前缀标注，保证模型可感知工具执行失败
+                            let is_error = b
+                                .get("is_error")
+                                .and_then(|e| e.as_bool())
+                                .unwrap_or(false);
+                            let content_final = if is_error {
+                                if content_str.is_empty() {
+                                    "Error: tool execution failed".to_string()
+                                } else {
+                                    format!("Error: {}", content_str)
+                                }
+                            } else {
+                                content_str
+                            };
+                            tool_results.push(json!({
+                                "role": "tool",
+                                "tool_call_id": b.get("tool_use_id").cloned().unwrap_or(json!("")),
+                                "content": content_final,
+                            }));
+                        }
+                        _ => {} // image 等不支持类型跳过
+                    }
+                }
+                if !tool_results.is_empty() {
+                    // tool_result 属于 user 回合：先输出 tool 消息，再输出剩余文本
+                    for tr in tool_results {
+                        messages.push(tr);
+                    }
+                    if !text_parts.is_empty() {
+                        messages.push(json!({ "role": role, "content": text_parts.join("") }));
+                    }
+                } else if !tool_calls.is_empty() {
+                    let mut m = json!({
+                        "role": "assistant",
+                        "content": if text_parts.is_empty() { Value::Null } else { json!(text_parts.join("")) },
+                    });
+                    m["tool_calls"] = json!(tool_calls);
+                    messages.push(m);
+                } else if !text_parts.is_empty() {
+                    messages.push(json!({ "role": role, "content": text_parts.join("") }));
+                }
+            }
+            _ => {}
+        }
+    }
+    out.insert("messages".into(), json!(messages));
+
+    // tools: Anthropic {name, description, input_schema} → OpenAI function 格式
+    if let Some(Value::Array(ts)) = obj.get("tools") {
+        let converted: Vec<Value> = ts
+            .iter()
+            .filter_map(|t| {
+                let name = t.get("name")?.as_str()?.to_string();
+                Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": t.get("description").cloned().unwrap_or(json!("")),
+                        "parameters": t.get("input_schema").cloned().unwrap_or(json!({"type":"object"})),
+                    },
+                }))
+            })
+            .collect();
+        if !converted.is_empty() {
+            out.insert("tools".into(), json!(converted));
+        }
+    }
+
+    // tool_choice: auto/any/tool
+    if let Some(tc) = obj.get("tool_choice") {
+        match tc {
+            Value::String(s) => {
+                out.insert("tool_choice".into(), json!(s));
+            }
+            Value::Object(m) => {
+                let typ = m.get("type").and_then(|t| t.as_str()).unwrap_or("auto");
+                match typ {
+                    "any" => {
+                        out.insert("tool_choice".into(), json!("required"));
+                    }
+                    "tool" => {
+                        out.insert(
+                            "tool_choice".into(),
+                            json!({
+                                "type": "function",
+                                "function": { "name": m.get("name").cloned().unwrap_or(json!("")) },
+                            }),
+                        );
+                    }
+                    _ => {
+                        out.insert("tool_choice".into(), json!("auto"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    serde_json::to_vec(&Value::Object(out)).unwrap_or_else(|_| src.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn anthropic_basic_text_conversion() {
+        let src = json!({
+            "model": "glm-5.2",
+            "max_tokens": 1024,
+            "system": "你是助手",
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": [{"type": "text", "text": "你好！"}]},
+                {"role": "user", "content": [{"type": "text", "text": "继续"}]}
+            ]
+        });
+        let out: Value = serde_json::from_slice(&anthropic_to_openai(serde_json::to_vec(&src).unwrap().as_slice())).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "你是助手");
+        assert_eq!(msgs[1]["content"], "你好");
+        assert_eq!(msgs[2]["content"], "你好！");
+        assert_eq!(msgs[3]["content"], "继续");
+        assert_eq!(out["model"], "glm-5.2");
+    }
+
+    #[test]
+    fn anthropic_tool_roundtrip_conversion() {
+        let src = json!({
+            "model": "glm-5.2",
+            "max_tokens": 1024,
+            "tools": [{"name": "get_weather", "description": "查天气", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "北京天气"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "北京"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "晴 25 度"}
+                ]}
+            ]
+        });
+        let out: Value = serde_json::from_slice(&anthropic_to_openai(serde_json::to_vec(&src).unwrap().as_slice())).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        // user / assistant(tool_calls) / tool
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["tool_calls"][0]["id"], "toolu_1");
+        assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "get_weather");
+        let args: Value = serde_json::from_str(msgs[1]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["city"], "北京");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "toolu_1");
+        assert_eq!(msgs[2]["content"], "晴 25 度");
+        // tools → OpenAI function 格式
+        assert_eq!(out["tools"][0]["type"], "function");
+        assert_eq!(out["tools"][0]["function"]["name"], "get_weather");
+    }
+
+    fn mo(id: &str, function: &str) -> super::super::models_sync::ModelOption {
+        super::super::models_sync::ModelOption {
+            id: id.into(),
+            label: id.into(),
+            rate: None,
+            context_length: None,
+            context_length_max: None,
+            efforts: Vec::new(),
+            supports_image: None,
+            function: function.into(),
+        }
+    }
+
+    /// function 查表优先（官方新上架免改代码的关键路径）+ 未收录模型
+    /// 原样透传（config_name/model_name 按 __dev 实证规律兜底）
+    #[test]
+    fn llm_chat_body_function_from_table_and_passthrough() {
+        let models = vec![mo("brand-new-x", "solo_agent")];
+        let src = json!({
+            "model": "Brand-New-X",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            serde_json::to_vec(&src).unwrap().as_slice(),
+            "DeepSeek-V4-Flash", "u", "d", "m", &models, true, &[],
+        ))
+        .unwrap();
+        // 表内视图优先（id 大小写不敏感命中）
+        assert_eq!(out["function"], "solo_agent");
+        // 未收录于 model_config → 原样透传 + __dev 规律
+        assert_eq!(out["config_name"], "Brand-New-X");
+        assert_eq!(out["model_name"], "Brand-New-X__dev");
+    }
+
+    /// 空表（存量数据未重新同步）→ 硬编码回退：
+    /// solo_agent 专属模型与默认 function 各按实证行为分发
+    #[test]
+    fn llm_chat_body_function_falls_back_when_table_empty() {
+        let src = json!({
+            "model": "kimi-k2.8-preview",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            serde_json::to_vec(&src).unwrap().as_slice(),
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[],
+        ))
+        .unwrap();
+        assert_eq!(out["function"], "solo_agent");
+        assert_eq!(out["config_name"], "kimi-k2.8-preview");
+        assert_eq!(out["model_name"], "kimi-k2.8-preview__dev");
+
+        let src2 = json!({
+            "model": "glm-5.2",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out2: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            serde_json::to_vec(&src2).unwrap().as_slice(),
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[],
+        ))
+        .unwrap();
+        assert_eq!(out2["function"], super::super::FUNCTION);
+    }
+
+    /// prompt_max_tokens 恒为 168000（真机实证矩阵：省略 → 4001 必填；
+    /// 1M → 4001 拒绝；is_max_mode:true + 168000 → 200 唯一可行组合）
+    #[test]
+    fn llm_chat_body_prompt_max_tokens_max_mode() {
+        let mk = |extra: Value| {
+            let mut src = json!({
+                "model": "glm-5.3",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if !extra.is_null() {
+                src["is_max_mode"] = extra;
+            }
+            let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
+                serde_json::to_vec(&src).unwrap().as_slice(),
+                "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[],
+            ))
+            .unwrap();
+            out
+        };
+        // dev 请求：168000
+        let dev = mk(Value::Null);
+        assert_eq!(dev["prompt_max_tokens"], 168_000);
+        // Max Mode（布尔 true / 数值 1）：字段保留到上游，prompt_max_tokens 不变
+        let max = mk(json!(true));
+        assert_eq!(max["prompt_max_tokens"], 168_000);
+        assert_eq!(max["is_max_mode"], true);
+        let legacy = mk(json!(1));
+        assert_eq!(legacy["prompt_max_tokens"], 168_000);
+        assert_eq!(legacy["is_max_mode"], 1);
+    }
+
+    /// 指纹清洗（issue #57）：文本块 strip_cc + 模板映射、tool_calls arguments
+    /// 与工具描述仅模板映射；sanitize=false 时原样透传
+    #[test]
+    fn llm_chat_body_sanitize_washes_fingerprints() {
+        let templates = vec![
+            (
+                "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+                "You are a coding assistant, a generic CLI tool.".to_string(),
+            ),
+            (
+                "Main branch (you will usually use this with PRs)".to_string(),
+                "Default branch (you will usually use this with PRs)".to_string(),
+            ),
+        ];
+        let mk_src = || {
+            json!({
+                "model": "glm-5.3",
+                "messages": [
+                    {"role": "system", "content": "You are Claude Code, Anthropic's official CLI for Claude."},
+                    {"role": "user", "content": "see Main branch (you will usually use this with PRs)"},
+                    {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "f", "arguments": "{\"q\":\"Main branch (you will usually use this with PRs)\"}"}}]},
+                ],
+                "tools": [{"type": "function", "function": {"name": "f", "description": "Main branch (you will usually use this with PRs)", "parameters": {}}}],
+            })
+        };
+        let wash: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            serde_json::to_vec(&mk_src()).unwrap().as_slice(),
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &templates,
+        ))
+        .unwrap();
+        // 模板映射：身份句改写
+        assert_eq!(
+            wash["messages"][0]["content"][0]["text"],
+            "You are a coding assistant, a generic CLI tool."
+        );
+        // 模板映射：文本块
+        assert_eq!(
+            wash["messages"][1]["content"][0]["text"],
+            "see Default branch (you will usually use this with PRs)"
+        );
+        // 模板映射：function_call arguments（function → function_call 改名后仍命中）
+        assert!(wash["messages"][2]["tool_calls"][0]["function_call"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("Default branch"));
+        // 模板映射：工具描述
+        assert_eq!(
+            wash["tools"][0]["function"]["description"],
+            "Default branch (you will usually use this with PRs)"
+        );
+
+        let raw: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            serde_json::to_vec(&mk_src()).unwrap().as_slice(),
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], false, &templates,
+        ))
+        .unwrap();
+        assert_eq!(
+            raw["messages"][1]["content"][0]["text"],
+            "see Main branch (you will usually use this with PRs)"
+        );
+    }
+}

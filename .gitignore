@@ -1,0 +1,53 @@
+# Build
+dist/
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+
+# Logs
+*.log
+logs/
+
+# 临时文件
+tmp/
+temp
+scripts/.doubao_sample.local.json
+.tmp_research
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.trae/
+
+# WorkBuddy 自动产物（严禁提交）
+.workbuddy/
+.codebuddy/
+
+# 运行时数据（证书、账号状态等）
+data/
+
+# test_proxy 抓包产物（完整体另存目录）
+proxy_bodies/
+# test_proxy 系统代理崩溃自愈恢复记录
+.proxy_recovery.json
+
+# Python（开发工具脚本仍为 python；运行时/业务脚本已全部 Rust 化移除）
+__pycache__/
+*.pyc
+
+# Packaging outputs (installers) — disk에 보관(배포용), git에는 제외
+release/
+
+# MSI/NSIS 빌드 중 생성되는 WiX 소스
+*.wxs
+
+# WorkBuddy 산출물
+overview.md
+# tauri dev 动态端口合并配置（scripts/dev-tauri.mjs 生成）
+tauri.dev.conf.json
+# 本地素材导出产物（promo banner 等）
+out/
+target/
+

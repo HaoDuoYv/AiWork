@@ -1,0 +1,2271 @@
+//! Qoder 涓婃父璺敱鎵ц灞傦紙p3-3-wire锛夈€?//!
+//! 璇锋眰娴佺▼锛坵b_route 鐨?Qoder 渚ч暅鍍忥紝v1 绮剧畝锛夛細
+//! 1. 鐩綍鏉＄洰瑙ｆ瀽锛坄qoder_upstream::resolve` 鈫?upstreamKey/config锛屾墽琛屾椂鍐嶆煡
+//!    鈥斺€旇皟搴︿笌鎵ц涔嬮棿鐩綍鍙兘鍒锋柊锛屾潯鐩负鍑嗭級锛?//! 2. 璇锋眰浣撴瀯閫狅紙`prepare_qoder_body`锛歄penAI body 鈫?agent 鍥哄畾淇″皝锛?//!    session 鐢辫处鍙?uid + 涓嬫父绉嶅瓙娲剧敓锛夛紱
+//! 3. 鍙栧彿锛坬oder_pool 璋冨害锛孠ey 鐧藉悕鍗?涓撲竴绾︽潫鍚屾瀯閫傜敤锛夆啋 identity 鍥炶皟瑙ｆ瀽
+//!    鍑瘉锛圥AT 鎹?24h 浣滀笟浠ょ墝 / 鍒锋柊閾捐矾鍦ㄥ洖璋冮棴鍖呭唴璧板叏闃叉姢锛夆啋
+//!    `make_qoder_request`锛圕OSY 19 澶寸鍚嶏級锛?//! 4. 鍒嗙骇閲嶈瘯锛欻TTP 灞傝蛋 `retry_plan`锛?29/5xx/502 鍚屽彿閫€閬裤€?01/403 鎹㈠彿锛夛紱
+//!    **鎺掗槦锛堜笟鍔＄爜 10605锛夊悓鍙烽€€閬夸紭鍏?*鈥斺€旈涓繘鍏ユ帓闃熺殑璇锋眰鎸変笂娓稿缓璁?//!    鏃堕暱鍚屽彿閫€閬块噸璇曪紙鈮? 娆★紝瓒呴檺鏀惧洖璋冨害杞崲锛岄槻姝㈠崰姝诲苟鍙戞Ы锛夛紱骞跺彂鍦烘櫙
+//!    涓嬭嫢璇ユā鍨嬪凡璁板綍鍐峰嵈鍒欑洿鎺?break 鎹㈠彿锛堝揩閫熷け璐ワ級锛涘叾浣欐祦鍐呴敊璇寜
+//!    ErrMeta 鍒嗙被鏄犲皠 ErrKind 鍚庢崲鍙凤紱
+//! 5. 娴佸紡锛氶瀛楄秴鏃?10s锛坄open_qoder_stream`锛夆啋 QoderTranslate 缈昏瘧涓烘爣鍑?//!    OpenAI chunk 鈫?`wb_sse::stream_forward_ex`锛坘eep-alive 15s + 鏂繛涓夊眰
+//!    妫€娴嬪悓鏋勶級锛涢潪娴佸紡锛歚aggregate_qoder` 鈫?鍗忚鎶曞奖澶嶇敤 wb_sse 杞崲鍣紱
+//! 6. 鐢ㄩ噺璁拌处锛坄record_usage_qoder` 鐙珛 qoder 妗讹級+ 璇锋眰绾ф棩蹇椼€?//!
+//! 涓?wb_route 鐨勫樊寮傦紙v2锛夛細**浼氳瘽绮樻€?*锛團-80-浣?v2锛屽紑鍏抽粯璁ゅ叧锛変笌**绔為€熷鍐?*
+//! 锛團-80-浣?v2锛岄槇鍊肩儹鍙傛暟榛樿 8s锛夊凡鎸?WB 鍚屾瀯琛ラ綈鈥斺€旂矘鎬у懡涓攣瀹氳处鍙凤紙busy
+//! 涓旀湁绌洪棽鍊欓€夋椂璁╀綅锛孎-77鈶ｏ級锛屽悓璐﹀彿 + 鍚岀瀛愭淳鐢熷悓涓€涓婃父 session_id 淇濅綇
+//! 浼氳瘽渚у鐢紱瀵瑰啿鍦ㄥ師濮嬭婧愬眰绔為€燂紝鑳滆€呰婧愮粺涓€缁?QoderTranslate 缈昏瘧銆備粛鏃?//! 妯℃澘娓呮礂銆佹棤宸ュ叿浠ｆ墽琛屻€佹棤 401 鍒锋柊閲嶈瘯锛堝嚟璇佹柊椴滃害鐢?identity 鍥炶皟鎸夋瑙ｆ瀽
+//! 鍏滀綇锛夈€傛ā鍨嬬骇鍐峰嵈宸茶ˉ榻愶紙瀹℃煡淇锛夛細鎺掗槦/瓒呴檺绫婚敊璇褰?model 鈫?鍐峰嵈鎴锛?//! dispatch 棰勬蹇€熷洖閫€銆佹墽琛岃矾寰勮烦杩囧悓鍙烽€€閬匡紙瑙佷笅鏂广€屾ā鍨嬬骇鍐峰嵈銆嶈妭锛夈€?//! 瀵瑰啿鎺ョ鍚庢帓闃熷悓鍙烽€€閬夸笉閫傜敤锛堥噸璇曞嚟璇?璇锋眰浣撳睘涓昏处鍙凤紝涓庣敓鏁堣处鍙蜂笉涓€鑷达級銆?//!
+//! 瀹㈡埛绔柇杩烇細涓?wb_route 鍚屾涓夊眰妫€娴嬶紙杞崲/閲嶈瘯鍏ュ彛 tx.is_closed銆佸仠婊炴湡
+//! next_event_polling 杞銆佹椿璺冩祦閫愪簨浠堕《閮ㄦ娴嬶級銆?
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use axum::body::Body;
+use axum::http::StatusCode;
+use axum::response::Response;
+use serde_json::{json, Value};
+use tokio_stream::wrappers::ReceiverStream;
+
+use super::retry::{retry_plan, RetryAction};
+use super::wb_sse;
+use super::wb_sticky::SessionKey;
+use super::wb_upstream::{lines_with_first_byte_hedged, lines_with_first_byte_timeout, InterruptibleLines};
+use super::{ApiSharedState, ErrKind, InflightGuard};
+use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
+use crate::tasks::qoder_common::QoderCreds;
+use crate::tasks::qoder_upstream::{self, ErrMeta, UpstreamKind};
+
+/// 鎺掗槦鍚屽彿閲嶈瘯涓婇檺锛?0605 鎸変笂娓稿缓璁€€閬匡紱瓒呴檺鏀惧洖璋冨害杞崲闃插崰姝诲苟鍙戞Ы锛?const QUEUE_RETRY_LIMIT: u32 = 3;
+/// 鎺掗槦閫€閬跨己鐪佺鏁帮紙涓婃父 retryAfterSeconds/waitTime 缂哄け鏃讹級
+const QUEUE_DEFAULT_BACKOFF_SECS: u64 = 5;
+/// 閫€閬夸笂闄愶紙涓婃父寤鸿鍊煎紓甯稿ぇ鏃堕挸鍒讹級
+const QUEUE_BACKOFF_MAX_SECS: u64 = 30;
+/// 鍚屼竴璇锋眰鍐呮帓闃熺瓑寰呯殑**鎬婚绠?*锛堢锛?026-10-19 瀹炴満淇锛夈€?///
+/// 鍗曡处鍙锋睜锛坄tried=1`锛変笅锛屼笂娓告寔缁帓闃?+ 姣忔閽冲埗 鈮?0s 鐨勫悓鍙烽€€閬匡紝浼氭妸涓€涓姹?/// 鎷栧埌 **94 绉?*浠嶆棤浠讳綍 token 杈撳嚭锛屾渶鍚庤繕浠?503 `no healthy account available`
+/// 鏀跺熬鈥斺€旀棦鎱㈠張璇锛堣处鍙锋槸鍋ュ悍鐨勶紝鍙槸涓婃父鍦ㄦ帓闃燂級銆傛帓闃熼绠楀埌鐐瑰嵆鏀跺熬锛?/// 429 + 涓婃父寤鸿鐨勯€€閬跨鏁帮紝瀹㈡埛绔寜 Retry-After 绋嶅悗閲嶈瘯锛岃€屼笉鏄妸骞跺彂妲藉拰
+/// 瀹㈡埛绔秴鏃堕绠椾竴璧疯€楀厜銆?const QUEUE_WAIT_BUDGET_SECS: u64 = 20;
+
+/// 鎺掗槦鎬婚绠楀唴鐨勬敹灏炬枃妗堬紙娴佸紡/闈炴祦寮忓叡鐢紝渚夸簬鏂█锛?fn queue_budget_exhausted_msg(model: &str, waited: u64, next_wait: u64) -> String {
+    format!(
+        "upstream queue timeout: model {model} still queued after {waited}s (upstream suggests waiting {next_wait}s more) 鈥斺€?涓婃父鎺掗槦涓紝璐﹀彿涓庡嚟璇佹甯革紱璇风◢鍚庨噸璇曟垨鏀圭敤鍏跺畠妯″瀷"
+    )
+}
+
+/// 鎺掗槦棰勭畻鍒ゅ畾锛堢函鍑芥暟锛夛細鍐嶇瓑 `next` 绉掑氨浼氳秴鍑烘€婚绠?鈫?true锛堣皟鐢ㄦ柟绔嬪嵆鏀跺熬锛?fn queue_budget_exceeded(waited: u64, next: u64) -> bool {
+    waited.saturating_add(next) > QUEUE_WAIT_BUDGET_SECS
+}
+
+/// 瀹夊叏鑾峰彇 Mutex 閿侊細鑻ラ攣琚瘨鍖栵紙panic 瀵艰嚧锛夛紝浠嶆仮澶嶅唴閮ㄦ暟鎹户缁繍琛?fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ==================== 妯″瀷绾у喎鍗达紙瀹℃煡淇锛岄暅鍍?wb_route::model_cooldowns锛?====================
+
+/// Qoder 妯″瀷绾у喎鍗磋〃锛歚{pool_tag}:{瑁告ā鍨嬪悕}` 鈫?(鍐峰嵈鎴鏃跺埢, 杩炵画澶辫触娆℃暟)銆?/// 鎺掗槦/瓒呴檺绫婚敊璇紙ErrMeta 鍒嗙被 Queued锛夋槸妯″瀷绾х幇璞★紙鎹㈣处鍙峰悓鏍锋帓闃燂級锛屼笌璐﹀彿
+/// 鏃犲叧锛屾晠杩涚▼绾ч潤鎬佽〃璇箟绛変环锛涙寕 ApiSharedState 闇€鏀?server.rs锛堜粬浜鸿礋璐ｏ級锛?/// 闈欐€?OnceLock 鏈€灏忔敼鍔ㄣ€傚け璐ユ鏁颁粎鐢?Server 娓愯繘鍐峰嵈缁存姢锛坕ssue #90 淇鈶狅級锛?/// 鎴愬姛鍗抽殢鏉＄洰娓呴櫎銆?/// 閿甫姹犳爣绛撅紙`qoder_cn:` / `qoder_intl:`锛屽師澶囧繕 G6 鐨勫緟鍔炵幇宸叉帴绾垮弻鍖猴級锛?/// CN 涓庡浗闄呭尯鏄袱濂椾簰涓嶇浉閫氱殑璐﹀彿/缃戝叧锛屽悓鍚嶆ā鍨嬶紙DeepSeek-Flash銆丟LM-5.3鈥︼級
+/// 鍦ㄤ袱杈瑰悇鑷帓闃熲€斺€旇８鍚嶅仛閿椂锛屽浗鍐呭尯鎸備笂鐨勬帓闃熺獥鍙ｄ細鎶婂浗闄呭尯璇锋眰涓€璧峰彉鎴?/// 銆宮odel qoder-intl/x cooling down銆嶏紝鑰?intl 涓婃父鍏跺疄绌洪棽銆傛睜鍖栭敭鍚庝袱鍖?/// 鍚勮嚜杩涢€€锛屼笌璐﹀彿 / 鐩綍 / 绮樻€х殑鍙屾睜璇箟涓€鑷淬€傝〃涓嶅仛涓诲姩鍥炴敹锛屾畫鐣欐潯鐩殢
+/// 鍐峰嵈绐楀彛鑷劧杩囨湡锛岄噸鍚嵆娓呴浂銆?static QODER_MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, (Instant, u32)>>> = OnceLock::new();
+
+fn cooldown_map() -> &'static Mutex<HashMap<String, (Instant, u32)>> {
+    QODER_MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 鍐峰嵈琛ㄩ敭 `{pool_tag}:{瑁告ā鍨嬪悕}`锛氣憼 姹犳爣绛鹃殧绂?CN / INTL锛堣涓婏級锛?/// 鈶?鍓ユ帀 `qoder-intl/` 涓€绫诲尯鍓嶇紑鈥斺€旀墽琛岃矾寰勪笌 dispatch 浼犺繘鏉ョ殑褰㈡€佸彲鑳戒竴澶?/// 甯﹀墠缂€銆佷竴澶勮８鍚嶏紝涓嶅綊涓€浼氱粰鍚屼竴妯″瀷钀戒袱涓潯鐩紙鎸傚喎鍗存寕涓嶄綇銆佹竻鍐峰嵈婕忔竻锛?fn cooldown_key(pool_tag: &str, model: &str) -> String {
+    let bare = crate::tasks::qoder_realm::normalize_model_id(model).1;
+    format!("{}:{}", pool_tag.trim(), bare)
+}
+
+/// Server 绫伙紙5xx/涓氬姟 504銆屼笂娓告湇鍔″紓甯搞€嶏級娓愯繘鍐峰嵈鍙傛暟锛坕ssue #90 淇鈶狅級锛?/// 30s 璧枫€佽繛缁け璐ョ炕鍊嶏紙30/60/120/240/480锛夛紝涓婇檺 8 鍒嗛挓锛坆ase 30s 宸︾Щ 4 浣?/// 鍗?480s锛孧AX 鍙栧悓鍊间繚璇佸皝椤跺彲杈撅紱鍘?600s 鎭掍笉鍙揪涓庢敞閲婄煕鐩锯€斺€斿鏌ヤ腑绛夐」锛夈€?/// 妯″瀷绾у喎鍗寸獥鍙ｅ唴 dispatch 鍋ュ悍棰勬锛坉ispatch.rs pool_health锛夊揩閫熷洖閫€澶氭簮
+/// 妯″瀷鍒?Trae/Buddy 姹狅紝涓嶅啀姣忚姹傜‖鎵撳凡鐭?504 鐨?qoder 涓婃父锛涙垚鍔熷嵆娓?///锛坈lear_model_cooldown锛夈€?const SERVER_COOLDOWN_BASE_SECS: u64 = 30;
+const SERVER_COOLDOWN_MAX_SECS: u64 = 480;
+
+/// 璁板綍妯″瀷绾у喎鍗达細鎸夋湰娆℃帓闃熼€€閬挎椂闀匡紙宸查挸鍒讹級璁惧畾鎴鏃跺埢锛屼繚鐣欐棦鏈夎繛缁?/// 澶辫触璁℃暟锛堟帓闃熼€€閬夸笌 Server 娓愯繘鍐峰嵈鍏辩敤涓€寮犺〃锛夈€傚喎鍗寸獥鍙ｅ唴鍚庣画璇锋眰鐢?/// dispatch 鍋ュ悍棰勬蹇€熷洖閫€锛堝婧愶級/鏄惧紡 429锛堝崟婧愶級锛屾墽琛岃矾寰勮烦杩囧悓鍙烽€€閬匡紝
+/// 涓嶅啀姣忚姹傜┖杞?5s脳3~30s脳3銆?/// `pool_tag`锛氳姹傚懡涓殑鍖哄煙姹狅紙`qoder_cn` / `qoder_intl`锛夛紝鍐峰嵈鎸夊尯闅旂
+fn note_model_cooldown(pool_tag: &str, model: &str, secs: u64) {
+    let key = cooldown_key(pool_tag, model);
+    cooldown_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        // 鍙栬緝澶ц€咃細鏃㈡湁 Server 娓愯繘鍐峰嵈绐楀彛锛堝彲鑳借繙闀夸簬鎺掗槦寤鸿鍊硷級涓嶅緱琚?        // 鏈寤鸿鍊肩缉鐭紙issue #90 淇鈶犻厤濂楄涔夛紝queued_cooldown 娴嬭瘯鍥哄寲锛?        .and_modify(|(until, _)| {
+            let candidate = Instant::now() + Duration::from_secs(secs);
+            if candidate > *until {
+                *until = candidate;
+            }
+        })
+        .or_insert_with(|| (Instant::now() + Duration::from_secs(secs), 0));
+}
+
+/// Server 绫婚敊璇紙涓婃父 5xx / 涓氬姟 504銆屼笂娓告湇鍔″紓甯搞€嶏級妯″瀷绾ф笎杩涘喎鍗?/// 锛坕ssue #90 淇鈶狅級锛氬喎鍗寸獥鍙?= min(30s 脳 2^n, 480s)锛宯 = 澶辫触鐗囨鏁般€?/// **閫掑鏉′欢鏄棦鏈夌獥鍙ｅ凡杩囨湡**鑰岄潪璋冪敤娆℃暟鈥斺€旀祦鍐?HTTP 涓よ矾寰勫湪 !sent_any
+/// 鏃堕兘浼?`break` 閫愯处鍙锋崲鍙凤紝涓€娆¤姹傚唴杩炵画鎹㈠彿浼氬鍚屼竴妯″瀷璁拌处澶氭锛涜嫢鎸?/// 璋冪敤娆℃暟閫掑锛? 璐﹀彿涓€娆¤姹傚嵆鍙妸绐楀彛鎺ㄥ埌 480s锛屾妸銆岃法鐗囨娓愯繘銆嶆斁澶ф垚
+/// 銆屽崟璇锋眰杞崲鏀惧ぇ銆嶏紝鎭㈠鎺㈡祴琚媺闀垮埌 8 鍒嗛挓銆傛寜鐗囨璁℃暟鍚庯細鍚岃姹傚唴鎹㈠彿
+/// 锛堢獥鍙ｆ湭杩囨湡锛変笉閫掑锛屾帰娴嬭妭濂?= 鍐峰嵈绐楀彛锛?0s鈫?0s鈫掆€︹啋8min锛夛紝鎴愬姛鍗虫竻銆?fn note_model_server_cooldown(pool_tag: &str, model: &str) {
+    let key = cooldown_key(pool_tag, model);
+    cooldown_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .and_modify(|(until, fails)| {
+            // 鏃㈡湁绐楀彛宸茶繃鏈?= 鏂颁竴娆″け璐ョ墖娈?鈫?閫掑骞堕噸璁剧獥鍙ｏ紱鏈繃鏈?=
+            // 鍚岀墖娈靛唴鐨勬崲鍙?骞跺彂澶辫触锛岀獥鍙ｇ淮鎸佸師鎴鏃跺埢涓嶅悗寤讹紙瀹℃煡涓瓑椤癸細
+            // 鍘熷疄鐜版瘡娆″け璐ラ兘鎶?until 鎺ㄥ埌 now+delay锛屾寔缁け璐ュ彲鎶婄獥鍙ｆ棤闄?            // 婊戝姩鍚庡欢锛屾仮澶嶆帰娴嬭涓嶆柇鎺ㄨ繜鈥斺€斿崐寮€鎺㈡祴璇箟鐢便€岀獥鍙ｅ埌鏈熷悗涓嬩竴娆?            // 璇锋眰鑷劧鏀捐銆嶄繚璇侊紝鏃犻渶棰濆鎺㈡祴鏈哄埗锛?            if Instant::now() >= *until {
+                *fails = fails.saturating_add(1);
+                // saturating_sub锛歠ails 鍙兘涓?0锛坣ote_model_cooldown 鎺掗槦閫€閬胯矾寰?                // or_insert 鐨?(until, 0) 鏉＄洰锛夆€斺€旇８ `*fails - 1` 浼氫笅婧紙debug panic /
+                // release 鍥炵粫鑷?min(4) 鎭掑彇 4銆佸喎鍗磋閿欒鎺ㄥ埌 480s锛?                let delay = (SERVER_COOLDOWN_BASE_SECS
+                    << (*fails).saturating_sub(1).min(4))
+                .min(SERVER_COOLDOWN_MAX_SECS);
+                *until = Instant::now() + Duration::from_secs(delay);
+            } else if *fails == 0 {
+                // 鎺掗槦閫€閬胯惤涓嬬殑鐭獥锛坒ails=0锛夛細Server 澶辫触搴旇嚦灏戞姮鍒板熀鍑嗙獥
+                // 锛?s 鎺掗槦绐椾笉瓒充互瑕嗙洊 5xx锛夛紝浣嗕笉閫掑璁℃暟锛堝悓鐗囨璇箟锛?                // fails>=1 鐨?Server 鍐峰嵈绐楃淮鎸併€屾湭杩囨湡涓嶅悗寤躲€嶉槻婊戝姩锛?                let cand = Instant::now() + Duration::from_secs(SERVER_COOLDOWN_BASE_SECS);
+                if cand > *until {
+                    *until = cand;
+                }
+            }
+        })
+        .or_insert_with(|| {
+            (
+                Instant::now() + Duration::from_secs(SERVER_COOLDOWN_BASE_SECS),
+                1,
+            )
+        });
+}
+
+/// 妯″瀷鍐峰嵈鍓╀綑绉掓暟锛汵one = 鏃犲喎鍗达紙杩囨湡娈嬬暀鏉＄洰鍚?wb 鐗堣涔夋寜鏃犲喎鍗村鐞嗭級銆?/// 绉掓暟**鍚戜笂鍙栨暣**锛歚as_secs()` 鎴柇浼氭妸鍓╀綑 1.4s 鎶ユ垚 1s锛堝鎴风 1s 鍚庨噸璇?/// 浠嶅湪绐楀彛鍐?鈫?鍐嶆潵涓€鍙?429锛夛紝鍓╀綑 <1s 鏇翠細鎶ユ垚 0s锛堛€宺etry after 0s銆嶏級銆?pub fn model_cooling_remaining_secs(pool_tag: &str, model: &str) -> Option<u64> {
+    let key = cooldown_key(pool_tag, model);
+    let map = cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
+    let until = map.get(&key)?;
+    let left = until.0.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        None
+    } else {
+        Some(left.as_secs() + u64::from(left.subsec_nanos() > 0))
+    }
+}
+
+/// 璇锋眰鎴愬姛鍚庢竻闄よ妯″瀷鍐峰嵈锛堝悓 wb_route::clear_model_failure 璇箟锛夛紱杩炵画
+/// 澶辫触璁℃暟闅忔潯鐩竴骞舵竻闄わ紙鎴愬姛 = 璇ユā鍨嬫仮澶嶆湇鍔★紝娓愯繘鍐峰嵈浠庡熀鍑嗗€艰捣姝ワ級
+fn clear_model_cooldown(pool_tag: &str, model: &str) {
+    cooldown_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&cooldown_key(pool_tag, model));
+}
+
+/// 鎵ц璺緞鐨勫喎鍗撮棬锛坆ug 淇锛氬熬宸存斁琛屽繀椤讳袱绔竴鑷达級
+///
+/// dispatch 渚х殑 `SHORT_COOLDOWN_GRACE_SECS` 宸叉妸绐楀彛灏惧反褰撳仴搴锋斁琛岋紝浣嗘墽琛?/// 璺緞閲屻€屽凡鍦ㄥ喎鍗翠腑 鈫?绔嬪埢缁堟杞崲銆嶇殑鍒嗘敮浠嶄細鎶婂畠鎵撳洖 429鈥斺€斿疄娴嬫棩蹇楀氨鏄?/// `[SCHED] 鍐峰嵈灏惧反瀹芥澗鏀捐` 绱ц窡涓€鏉?`429 妯″瀷鍐峰嵈涓紝缁堟杞崲`锛屾斁琛岀瓑浜庣櫧鍋氥€?/// 杩欓噷缁熶竴鍙ｅ緞锛氬熬宸达紙鍓╀綑 鈮?闃堝€硷級鐫″畬绐楀彛鍚庣户缁悓鍙烽噸璇曪紱鍙湁鐪熺獥鍙ｆ墠缁堟銆?enum CooldownGate {
+    /// 鏃犳椿鍔ㄥ喎鍗达紙杩囨湡娈嬬暀鏉＄洰鍚屾棤鍐峰嵈锛夆€斺€旇皟鐢ㄦ柟鎸夊師璺緞璁扮獥鍙?+ 閫€閬块噸璇?    None,
+    /// 灏惧反宸茬瓑瀹屸€斺€旇皟鐢ㄦ柟鐩存帴閲嶈瘯鏈疆锛堜笉閲嶅璁扮獥鍙?閫€閬匡級
+    Waited,
+    /// 绐楀彛浠嶉暱锛氱‖缁堟锛堣皟鐢ㄦ柟鍥?429锛岄檮鍓╀綑绉掓暟锛?    Hard(u64),
+    /// 绛夊熬宸存湡闂村鎴风鏂繛鈥斺€旇皟鐢ㄦ柟鏀跺熬杩斿洖
+    Disconnected,
+}
+
+fn cooldown_gate(
+    pool_tag: &str,
+    model: &str,
+    tx: Option<&tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>,
+) -> CooldownGate {
+    let Some(rem) = model_cooling_remaining_secs(pool_tag, model) else {
+        return CooldownGate::None;
+    };
+    if rem > super::dispatch::SHORT_COOLDOWN_GRACE_SECS {
+        return CooldownGate::Hard(rem);
+    }
+    // +120ms 浣欓噺锛氱獥鍙ｆ寜鏁寸鍚戜笂鍙栨暣锛岀潯婊?rem 绉掑悗鍙兘浠嶅樊鍑犲崄姣
+    let total = Duration::from_millis(rem * 1000 + 120);
+    if !sleep_interruptible(total, tx) {
+        return CooldownGate::Disconnected;
+    }
+    CooldownGate::Waited
+}
+
+/// last_error 鏃堕棿鎴筹紙UTC+8锛屼笌 app 鏃ュ織鏃堕棿绾垮悓鍖猴紝issue #90 淇鈶★級锛?/// 504 绫讳笂娓稿紓甯告槸鍚︽寔缁€佷綍鏃跺紑濮嬶紝鐢ㄦ埛姝ゅ墠鍙兘闈犵寽锛堟鏄€屽垏鎹㈡ā鍨嬪鑷淬€?/// 璇В鐨勬垚鍥狅級锛屽甫鏃跺埢鍚庡彲涓庢棩蹇楅€愯瀵圭収
+fn now_cn_timestamp() -> String {
+    use chrono::FixedOffset;
+    let cn = FixedOffset::east_opt(8 * 3600).expect("UTC+8 offset is valid");
+    chrono::Utc::now()
+        .with_timezone(&cn)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+/// 鎺掗槦/閫€閬垮垎娈电瓑寰咃紙瀹℃煡淇锛夛細闀?sleep 鍒囨垚 鈮?00ms 鐗囨閫愭鐫★紝姣忔鍚?/// 妫€鏌ユ祦閫氶亾鏄惁鍏抽棴鈥斺€斿鎴风宸叉柇杩炲嵆鎻愬墠閫€鍑猴紝涓嶅啀绌虹瓑鏁板崄绉掓帓闃?閫€閬?/// 鏃堕暱锛涜繑鍥?false = 宸叉柇杩炪€傞潪娴佸紡璺緞鏃犱笅琛岄€氶亾鍙煡锛坔andler 杩斿洖
+/// Response 鍓嶆棤鏂繛閫氱煡鏈哄埗锛夛紝淇濇寔鏁存 sleep
+fn sleep_interruptible(
+    total: Duration,
+    tx: Option<&tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>,
+) -> bool {
+    let mut left = total;
+    while !left.is_zero() {
+        let step = left.min(Duration::from_millis(500));
+        std::thread::sleep(step);
+        left = left.saturating_sub(step);
+        if let Some(t) = tx {
+            if t.is_closed() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// 浠庝笂娓?usage JSON 鎻愬彇 Qoder 绉垎娴嬮噺锛坕ssue #82 T2锛夛細
+/// 杩斿洖 (credits, original_credits)銆俢redits 鍙栧鏁板瓧娈碘€斺€斿崟鏁?`credit` 鏄棫鐗?/// 瀛楁锛岃瀹冩亽涓?0锛坬oder2api-hub issue #22 鍛介棬锛夛紝鏁呬粎鍦ㄥ鏁扮己澶辨椂鍙備笌鍥為€€銆?/// **绛変环鎬у墠鎻?*锛氫笌 Python `or` 閾俱€岄鍊奸潪闆跺嵆鐢ㄣ€嶇瓑浠凤紝浠呭湪涓婃父淇濊瘉鍗曟暟
+/// credit 鎭掍负 0/缂哄け鏃舵垚绔嬶紱涓ゅ€煎悓鐜版椂鍙?max锛堟寜鏇撮珮绉垎璁★級鏄湁鎰忎负涔嬬殑
+/// 淇濆畧鍙ｅ緞锛屼笉杩芥眰涓?or 閾鹃€愬€肩瓑浠枫€倁sage 缂哄け鎴栬璐瑰瓧娈甸兘鍙栦笉鍒?鈫?None
+/// 锛堣皟鐢ㄦ柟浼?None 涓嶅叆璐︼紝涓庛€屼笂娓告湭涓嬪彂 usage 涓嶅緱浼€犮€嶅彛寰勪竴鑷达級
+fn extract_billing(usage: Option<&Value>) -> (Option<f64>, Option<f64>) {
+    let Some(u) = usage else {
+        return (None, None);
+    };
+    let num = |key: &str| -> Option<f64> {
+        u.get(key)
+            .and_then(|v| v.as_f64())
+            .filter(|n| n.is_finite() && *n >= 0.0)
+    };
+    let pick = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) => Some(x),
+        (None, y) => y,
+    };
+    let credits = pick(num("credits"), num("credit"));
+    let original = pick(num("original_credits"), num("original_credit"));
+    (credits, original)
+}
+
+/// system-reminder 鍓ョ姝ｅ垯锛堟儼鎬х紪璇戜竴娆★級锛氶潪璐┆璺ㄨ鍖归厤鏁村潡娉ㄥ叆銆?fn reminder_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?s)\s*<system-reminder>.*?</system-reminder>\s*")
+            .expect("system-reminder regex")
+    })
+}
+
+/// user 杈撳叆鍖呰９鏍囩姝ｅ垯锛堟儼鎬х紪璇戜竴娆★級锛?user_input> / </user_input>锛堝蹇嶅睘鎬э級銆?fn user_input_tag_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"</?user_input[^>]*>").expect("user_input tag regex")
+    })
+}
+
+/// 鍓ユ帀瀹㈡埛绔敞鍏ョ殑 `<system-reminder>` 鍧椾笌 `<user_input>` 鍖呰９鏍囩锛坅gent
+/// 瀹㈡埛绔妸瀹冧滑鎷艰繘 user 娑堟伅鈥斺€攔eminder 鍓嶇疆鍔寔姝ｆ枃銆佽緭鍏ヨ鏍囩鍖呰９锛夛紝
+/// 鍓╀綑鍗崇敤鎴峰師璇濄€傚墺绂诲悗浠呭墿绌虹櫧鏃惰繑鍥炵┖涓诧紙璋冪敤鏂规寜鏃?preview 澶勭悊锛夈€?fn strip_reminders(text: &str) -> String {
+    let no_reminders = reminder_re().replace_all(text, " ");
+    let stripped = user_input_tag_re().replace_all(&no_reminders, " ");
+    // 杩炵画绌虹櫧鍘嬫垚鍗曚釜绌烘牸鍚?trim锛堝鍧楀墺绂诲悗甯告畫鐣欑┖琛?绌烘牸锛?    let mut out = String::with_capacity(stripped.len());
+    let mut in_ws = false;
+    for ch in stripped.chars() {
+        if ch.is_whitespace() {
+            in_ws = true;
+        } else {
+            if in_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            in_ws = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// issue #82 闂5锛氫細璇?preview鈥斺€旀湯鏉?user 娑堟伅鏂囨湰锛堜笌 build_upstream_body
+/// last_user_text 鍚屾閫嗗簭鍙ｅ緞锛夛紝鍓ョ娉ㄥ叆鍧?鍖呰９鏍囩鍚庢埅 200 瀛楃銆?fn session_preview(peek: &Value) -> String {
+    let mut text = String::new();
+    if let Some(messages) = peek.get("messages").and_then(Value::as_array) {
+        for message in messages.iter().rev() {
+            if message.get("role").and_then(Value::as_str) == Some("user") {
+                text = qoder_upstream::content_to_text(
+                    message.get("content").unwrap_or(&Value::Null),
+                );
+                break;
+            }
+        }
+    }
+    strip_reminders(&text).chars().take(200).collect()
+}
+
+/// issue #82 闂5锛氬け璐ヨ矾寰勮璐︿細璇濅笂涓嬫枃銆傚け璐ユ椂鏈棤涓婃父淇″皝鍙В鏋?/// 锛堜袱澶勮皟鐢ㄦ亽涓哄崰浣嶏級锛屾亽閫€鍖栦负 uuid 鍗犱綅锛坮equest_id 浠呭箓绛夌敤閫旓紝鍗犱綅涓?/// 褰卞搷姝ｇ‘鎬э級銆傛垚鍔熻矾寰勭敱棰勮В鏋?id 璧?session_ctx_from_ids锛屼笉缁忔湰鍑芥暟銆?fn session_ctx(peek: &Value) -> super::usage::QoderSessionCtx {
+    super::usage::QoderSessionCtx::placeholder(session_preview(peek))
+}
+
+/// issue #82 瀹℃煡淇 K锛氫俊灏侀《灞?request_id/session_id 鎻愬彇銆備俊灏佸惈瀹屾暣瀵硅瘽鍘嗗彶
+/// 锛堝ぇ body锛夛紝鍐呭眰閲嶈瘯寰幆鑻ユ瘡娆¤璐﹂兘鍏ㄩ噺鍙嶅簭鍒楀寲灞炵儹璺緞鍐椾綑锛?/// id 闅忎俊灏佹亽瀹氾紝搴斿湪淇″皝鐢熸垚鍚庤В鏋愪竴娆°€佸惊鐜唴澶嶇敤锛堟湰鍑芥暟鍗充竴娆¤В鏋愮殑浜х墿婧愶級銆?/// 浼氳瘽鑱氬悎鎵╁睍锛氫笁鍏冪粍甯?chat_record_id锛堣疆閿紝銆屽睍寮€浼氳瘽鐪嬪悇杞槑缁嗐€嶅垎缁勭敤锛夈€?fn extract_envelope_ids(body: &[u8]) -> Option<(String, String, String)> {
+    let v = serde_json::from_slice::<Value>(body).ok()?;
+    let get = |k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let (rid, sid, rec) = (get("request_id"), get("session_id"), get("chat_record_id"));
+    (!rid.is_empty()).then_some((rid, sid, rec))
+}
+
+/// 鐢遍瑙ｆ瀽鐨勪俊灏?id 鏋勯€犺璐︿笂涓嬫枃锛坕d 涓?None = 鏃犱俊灏?瑙ｆ瀽澶辫触 鈫?uuid 鍗犱綅锛?fn session_ctx_from_ids(
+    peek: &Value,
+    ids: Option<&(String, String, String)>,
+) -> super::usage::QoderSessionCtx {
+    match ids {
+        Some((rid, sid, rec)) => super::usage::QoderSessionCtx {
+            request_id: rid.clone(),
+            session_id: sid.clone(),
+            record_id: rec.clone(),
+            ts: chrono::Local::now().timestamp(),
+            preview: session_preview(peek),
+        },
+        None => super::usage::QoderSessionCtx::placeholder(session_preview(peek)),
+    }
+}
+
+/// resolve 鍛戒腑鏉＄洰鏄惁 Global 涓撳睘锛堝鏌ヤ慨澶嶏細v1 鎭?CN 缃戝叧鎵ц锛孏lobal
+/// 涓撳睘鏉＄洰璋冨害 resolve 鍙屽尯鍏滃簳鍒ゆ椿銆佹墽琛屽繀姝伙紝闇€鍦ㄦ墽琛屽叆鍙ｆ槑纭嫆缁濓級銆?///
+/// qoder_upstream 鏈毚闇插垎鍖哄垎鐩綍/鍏滃簳琛ㄧ殑鏌ヨ鎺ュ彛锛堜粬浜烘枃浠朵笉鍙敼锛夛紝鍒ゅ畾
+/// 鍩轰簬涓よ矾**纭畾鎬ц瘉鎹?*锛屼笉渚濊禆鏃у疄鐜般€宺esolve(Global) 缁撴灉涓庡懡涓潯鐩?Value
+/// 鍏ㄧ瓑 鉄?涓ゅ尯鍚屽悕鏉＄洰澹版槑蹇呮湁宸紓銆嶇殑鑴嗗急鍊煎亣璁撅紙鍚屽悕鍚屽€煎満鏅細璇垽锛夛細
+/// 鈶?list() 骞堕泦鎸?id 鍘婚噸銆丟lobal 渚у厛娉ㄥ唽锛氭爣娉?"cn" 鉄?Global 渚э紙杩滅▼鐩綍
+///    + 闈欐€佸厹搴曡〃锛夊畬鍏ㄦ棤姝?id 鈫?CN resolve 鐨勫懡涓繀鏉ヨ嚜 CN 渚?鈫?蹇呴潪涓撳睘锛?/// 鈶?鏍囨敞 "global" 鏃跺€?resolve 鍙屽尯浼樺厛搴忓樊寮傚彇绗簩璇佹嵁锛歳esolve(Global) 搴?///    = [Global 鐩綍, CN 鐩綍, CN 鍏滃簳, Global 鍏滃簳]锛宺esolve(Cn) 搴?= [CN 鐩綍,
+///    Global 鐩綍, Global 鍏滃簳, CN 鍏滃簳]銆備袱璺懡涓?*涓嶅悓**鏉＄洰鏃跺彲閫愭簮璇佹槑
+///    CN 渚у繀鏈夋 id锛圕N 杩滅▼鐩綍鎴?CN 鍏滃簳琛ㄨ嚦灏戝叾涓€澹版槑锛夆啋 蹇呴潪涓撳睘锛?/// 鈶?涓よ矾鍛戒腑鍏ㄧ瓑锛氭棦鏈?pub 鎺ュ彛鏃犳硶鍖哄垎銆屼粎 Global 鐙寔銆嶄笌銆屼袱鍖哄悓鍚嶅悓鍊笺€?///    锛堝悗鑰呬粎鍙兘鏉ヨ嚜杩滅▼鐩綍鍔ㄦ€佸埛鏂帮紱闈欐€佸厹搴曡〃涓ゅ尯鍚屽悕鏉＄洰鍊嶇巼/妗ｄ綅鍏?///    涓嶅悓锛夈€傛寜 v1 鎭?CN 鎵ц鐨?fail-closed 绛栫暐鍒?Global 涓撳睘锛欸lobal 渚?///    澹版槑浜嗘 id 鑰?CN 渚ф棤浠讳綍纭畾鎬у彲寰楄瘉鎹紝鏀捐鍙細鎶婅姹傞€佽繘 CN 缃戝叧
+///    鏀朵笂娓歌寮傛姤閿欙紝鎷掔粷鍒欒蛋鏄庣‘鐨?404 鎻愮ず閫氶亾銆?fn entry_is_global_only(model: &str, entry: &Value) -> bool {
+    let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty() {
+        return false; // name/upstreamKey 鍛戒腑涓旀棤 id 鐨勮竟缂橈細淇濆畧鏀捐
+    }
+    let Some(listed) = qoder_upstream::list()
+        .into_iter()
+        .find(|m| m.get("id").and_then(Value::as_str) == Some(id))
+    else {
+        return false; // list 鏃犳 id锛堟寜 name/upstreamKey 鍛戒腑锛夛細淇濆畧鏀捐
+    };
+    if listed.get("region").and_then(Value::as_str) == Some("cn") {
+        return false; // 璇佹嵁鈶狅細Global 渚х‘瀹氭棤姝?id
+    }
+    match qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Global) {
+        // 璇佹嵁鈶★細涓よ矾鍛戒腑涓嶅悓 鉄?CN 渚ц嚦灏戜竴婧愬０鏄庢 id锛堥€愭簮鍙瘉锛岃涓婏級
+        Some(g) if g != *entry => false,
+        // 鍏ㄧ瓑锛欳N 渚х‘瀹氭€у彲寰楄瘉鎹己澶憋紝鎸?fail-closed 绛栫暐鍒や笓灞烇紙瑙佲憿锛?        _ => true,
+    }
+}
+
+/// 瀛楃杈圭晫瀹夊叏鎴柇锛堣嚜鎶?wb_route::safe_slice锛岀鏈変笉鍙鐢級锛?/// 瀛楄妭钀界偣鍦ㄥ瀛楄妭瀛楃鍐呮椂鍥為€€鍒板墠涓€涓竟鐣岋紝閬垮厤瓒呴暱涓婃父鍝嶅簲浣?/// 鏁存杩涘叆閿欒娑堟伅/鏃ュ織
+fn safe_slice(s: &str, n: usize) -> &str {
+    if let Some(t) = s.get(..n) {
+        return t;
+    }
+    let mut end = n.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+// ==================== F-80-浣?v2 鎱㈣姹傜珵閫熷鍐诧紙鍙栧彿渚х紪鎺掞紝wb_route 鍚屾瀯锛?====================
+
+/// 瀵瑰啿璐﹀彿鍦ㄩ€旇鏁扮绾︼紙闀滃儚 wb_route::HedgeLease锛夛細鏋勯€犲嵆 +1锛堢珵閫熺獥鍙?/// 鍗犵敤锛夛紝Drop 鍗?-1鈥斺€斿缓杩?鍑瘉瑙ｆ瀽澶辫触锛堥棴鍖呭唴鎻愬墠杩斿洖锛夈€佸弻璐ャ€佺珵閫熻儨鍑?/// 涓夌被閫€鍑鸿矾寰勫潎鎭板ソ閲婃斁涓€娆★紝鏉滅粷璁℃暟娉勬紡瀵艰嚧鐨勮处鍙锋案涔?busy
+struct QoderHedgeLease {
+    uid: String,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// 瀵瑰啿璐﹀彿淇″皝鐨?(request_id, session_id, record_id)锛圙4锛夛細瀵瑰啿璇锋眰鎸夊鍐茶处鍙?uid
+    /// 閲嶅缓淇″皝锛屼袱璐﹀彿淇″皝 id 涓嶅悓鈥斺€旀帴绠¤璐﹀繀椤昏惤瀵瑰啿璐﹀彿淇″皝鐨?id锛?    /// 鍚﹀垯琛?uid=瀵瑰啿璐﹀彿鑰屼細璇濋敭灞炰富璐﹀彿淇″皝锛屽綊灞為敊浣?    session_ids: Option<(String, String, String)>,
+}
+
+impl QoderHedgeLease {
+    fn acquire(
+        state: &ApiSharedState,
+        pool_tag: &'static str,
+        uid: &str,
+        session_ids: Option<(String, String, String)>,
+    ) -> Self {
+        let counter = state.qoder_pool_for(pool_tag).inflight_handle(uid);
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { uid: uid.to_string(), counter, session_ids }
+    }
+}
+
+impl Drop for QoderHedgeLease {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 棣栧瓧绔為€熻儨鑰呬俊鎭細**鍘熷鏈炕璇?*涓婃父琛屾簮锛圦oder 鍙屽眰淇″皝缈昏瘧鍦ㄧ珵閫熻惤瀹氬悗
+/// 缁熶竴杩涜锛岃儨鑰呰婧愮粡 QoderTranslate 杞崲锛? 鐢熸晥璐﹀彿 + 瀵瑰啿璁℃暟绉熺害
+struct QoderRaceWin {
+    lines: Box<dyn std::iter::Iterator<Item = String> + Send>,
+    uid: String,
+    hedge: Option<QoderHedgeLease>,
+    takeover: bool,
+    /// 鑳滆€呬俊灏佺殑 (request_id, session_id, record_id)锛圙4锛夛細涓昏处鍙疯儨 = 涓讳俊灏?id锛?    /// 瀵瑰啿鎺ョ = 瀵瑰啿淇″皝 id锛涜璐︽寜鑳滆€呰惤瀹氾紝涓庝細璇濊 uid 鍚屾簮
+    session_ids: Option<(String, String, String)>,
+}
+
+/// 棣栧瓧绔為€燂紙F-80-浣?v2锛岄暅鍍?wb_route::race_first_byte锛夛細瀵瑰啿鍏抽棴锛堥槇鍊?0锛?/// 鏃朵笌绾瀛楄秴鏃惰涔夊畬鍏ㄤ竴鑷达紱寮€鍚椂涓昏姹傞瀛楄妭瓒呴槇鍊?鈫?浠庢睜鍐呭彇绗簩璐﹀彿
+/// 锛堣蛋鍚屼竴 busy 杩囨护鈥斺€斾富璐﹀彿宸?inflight 澶╃劧璁╀綅锛屽彈 F-77 骞跺彂涓婇檺绾︽潫锛?/// 鍙戝鍐茶姹傦紝鍏堝嚭棣栧瓧鑰呰儨銆傚鍐茶姹傜嫭绔嬭В鏋愬嚟璇侊紙identity 鍥炶皟锛夊苟鎸夊鍐?/// 璐﹀彿 uid 閲嶅缓 agent 淇″皝锛坰ession 娲剧敓渚濊禆 uid锛夈€?#[allow(clippy::too_many_arguments)]
+fn race_qoder_first_byte(
+    state: &Arc<ApiSharedState>,
+    pool_tag: &'static str,
+    primary_uid: &str,
+    primary_reader: Box<dyn std::io::Read + Send>,
+    peek: &Value,
+    entry: &Value,
+    model_key: &str,
+    model_source: &str,
+    tried: &HashSet<String>,
+    allowed: Option<&HashSet<String>>,
+    dedicated: Option<&str>,
+    primary_session_ids: &Option<(String, String, String)>,
+) -> Result<QoderRaceWin, ()> {
+    let hedge_ms = state
+        .qoder_hedge_threshold_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if hedge_ms == 0 {
+        let lines = lines_with_first_byte_timeout(primary_reader)?;
+        return Ok(QoderRaceWin {
+            lines,
+            uid: primary_uid.to_string(),
+            hedge: None,
+            takeover: false,
+            session_ids: primary_session_ids.clone(),
+        });
+    }
+    let state2 = state.clone();
+    let tried2 = tried.clone();
+    // issue #111锛氬鍐插彇鍙蜂笌涓昏矾寰勫悓鍙ｅ緞鈥斺€斿厤璐规ā鍨嬭眮鍏嶇Н鍒嗙淮搴﹁繃婊?    let free2 = qoder_upstream::entry_is_free(entry);
+    let allowed2 = allowed.cloned();
+    let dedicated2 = dedicated.map(str::to_string);
+    let peek2 = peek.clone();
+    let entry2 = entry.clone();
+    let mk2 = model_key.to_string();
+    let ms2 = model_source.to_string();
+    let spawn_backup = move || -> Option<(Box<dyn std::io::Read + Send>, QoderHedgeLease)> {
+        let (picked2, ev) = state2
+            .qoder_pool_for(pool_tag)
+            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref(), free2)?;
+        // F-77鈶?鍙娴嬶細瀵瑰啿鍙栧彿鍚屾牱璁板綍 busy 璁╀綅/闄嶇骇浜嬩欢
+        if let Some(ev) = ev {
+            state2.logger.log_sched_event(&ev);
+        }
+        // 绉熺害鍏堜簬鍑瘉瑙ｆ瀽鑾峰彇锛氬け璐ヨ矾寰勯殢闂寘灞€閮ㄥ彉閲?Drop 鑷姩 -1
+        let creds2 = (state2.qoder_identity.as_ref()? )(&picked2.uid).ok()?;
+        let converted2 = qoder_upstream::prepare_qoder_body(&peek2, &entry2, &creds2.uid).ok()?;
+        // G4锛氬鍐蹭俊灏?id 闅忕绾﹀甫鍑猴紝鎺ョ璁拌处鎸夊鍐茶处鍙蜂俊灏佽惤瀹?        let session_ids = extract_envelope_ids(&converted2);
+        let lease = QoderHedgeLease::acquire(&state2, pool_tag, &picked2.uid, session_ids);
+        let reader2 = qoder_upstream::make_qoder_request(&creds2, &converted2, &mk2, &ms2).ok()?;
+        Some((reader2, lease))
+    };
+    match lines_with_first_byte_hedged(primary_reader, hedge_ms, spawn_backup) {
+        Ok(out) => {
+            let uid = if out.takeover {
+                out.hedge
+                    .as_ref()
+                    .map(|l| l.uid.clone())
+                    .unwrap_or_else(|| primary_uid.to_string())
+            } else {
+                primary_uid.to_string()
+            };
+            // G4锛氫細璇?id 鎸夎儨鑰呬俊灏佽惤瀹氣€斺€旀帴绠″彇瀵瑰啿淇″皝 id锛屼富鑳滃彇涓讳俊灏?id
+            let session_ids = if out.takeover {
+                out.hedge.as_ref().and_then(|l| l.session_ids.clone())
+            } else {
+                primary_session_ids.clone()
+            };
+            Ok(QoderRaceWin {
+                lines: out.lines,
+                uid,
+                hedge: out.hedge,
+                takeover: out.takeover,
+                session_ids,
+            })
+        }
+        Err(()) => Err(()),
+    }
+}
+
+/// 绔為€熺粨鏉熷悗澶勭悊瀵瑰啿璁℃暟涓庢棩蹇楋紙闀滃儚 wb_route::settle_hedge锛夛細
+/// 閲婃斁瀵瑰啿璐﹀彿绔為€熺獥鍙ｅ崰鐢紱鎺ョ鏃?guard 閲嶇粦鍒板鍐茶处鍙凤紱[SCHED] 鏃ュ織璁板綍
+/// hedge_takeover / hedge_lost
+fn settle_qoder_hedge(
+    state: &ApiSharedState,
+    win: &mut QoderRaceWin,
+    mut guard: InflightGuard,
+    primary_uid: &str,
+) -> InflightGuard {
+    let Some(lease) = win.hedge.take() else {
+        return guard;
+    };
+    let hedge_uid = lease.uid.as_str();
+    if win.takeover {
+        state
+            .logger
+            .log_sched_event(&format!("hedge_takeover primary={} hedge={}", primary_uid, hedge_uid));
+        guard = guard.bind_account(lease.counter.clone());
+    } else {
+        state
+            .logger
+            .log_sched_event(&format!("hedge_lost primary={} hedge={}", primary_uid, hedge_uid));
+    }
+    drop(lease);
+    guard
+}
+
+/// 绔為€熻儨鑰呭師濮嬭婧?鈫?缈昏瘧涓?OpenAI chunk 琛?鈫?鍙腑鏂婧愶紙瀵瑰啿寮€鍚矾寰勶級銆?/// 瀵瑰啿鍏抽棴鏃?run_* 鐩存帴璧?open_qoder_stream锛堢瓑浠峰疄鐜帮紝灏戜竴灞傝凯浠ｅ櫒鍖呰锛?fn translate_race_lines(
+    win: QoderRaceWin,
+    err_slot: Arc<Mutex<Option<ErrMeta>>>,
+    chat_id: &str,
+    model: &str,
+) -> InterruptibleLines {
+    let translated = qoder_upstream::QoderTranslate::new(win.lines, err_slot, chat_id, model);
+    InterruptibleLines::from_iterator(Box::new(translated))
+}
+
+// ==================== 娴佸紡鍏ュ彛 ====================
+
+/// 瀹氬尯绾嚱鏁帮紙涓夌骇浼樺厛绾?+ 鍥介檯姹犲紑鍏冲洖钀斤級锛宍resolve_realm_pool_tag` 鐨勫喅绛栨牳
+/// 鈥斺€旀棤鐘舵€佷究浜庡崟娴嬮攣瀹氬彛寰勶細妯″瀷鍓嶇紑 > Key 缁戝尯 > 璁剧疆榛樿鍖哄煙锛孖NTL 涓斿紑鍏?/// 鍏抽棴鏃跺洖钀?CN銆?fn realm_pool_tag_from(
+    explicit: Option<&'static str>,
+    bind_realm: Option<&'static str>,
+    default_realm: &str,
+    intl_enabled: bool,
+) -> &'static str {
+    use crate::tasks::qoder_realm;
+    let preferred = explicit
+        .or(bind_realm)
+        .unwrap_or_else(|| qoder_realm::normalize(default_realm));
+    let realm = if preferred == qoder_realm::INTL && !intl_enabled {
+        qoder_realm::CN
+    } else {
+        preferred
+    };
+    qoder_realm::pool_tag(realm)
+}
+
+/// 鍙屽尯瀹氬尯锛堜笌 dispatch 涓夌骇璺敱鍚屾簮锛夛細瀹㈡埛绔ā鍨嬫樉寮忓尯鍩熷墠缂€ > Key 缁戝尯 >
+/// 璁剧疆榛樿鍖哄煙锛涢粯璁?鍓嶇紑涓?INTL 涓?`qoder_intl_enabled` 鍏抽棴鏃跺洖钀?CN銆?///
+/// 涓轰綍杩樿鐪嬭姹備綋 model锛歞ispatch 褰掍竴鍖栧悗浜ょ粰鏈眰鐨勬槸鐩綍 id锛堣８鍚嶏級锛?/// `qoder-intl/x` 涓?`qoder/x` 鐨勫尯鍓嶇紑鍦ㄩ偅閲屽凡琚秷璐光€斺€斿彧鐪嬪叆鍙傛ā鍨嬪悕浼氭妸
+/// 鍥介檯鍖鸿姹傚垽鍥炲浗鍐呭尯锛屽彇鍙疯惤鍒扮┖鐨?CN 姹狅紙鍥介檯璐﹀彿姘镐笉灏辩华鐨勬牴鍥犱箣涓€锛夈€?/// 杩斿洖姹犳爣绛撅紝鐩存帴鍠?`ApiSharedState::qoder_pool_for`銆?fn resolve_realm_pool_tag(
+    state: &Arc<ApiSharedState>,
+    model: &str,
+    body_model: Option<&str>,
+    key_id: &str,
+) -> &'static str {
+    use crate::tasks::qoder_realm;
+    // 鍗曟鍙栬缃紙榛樿鍖哄煙 + 鍥介檯鐗堟睜寮€鍏冲悓婧愶級
+    let s: crate::models::Settings = crate::store::db(&state.data_dir).kv_get("app_settings");
+    let explicit = qoder_realm::normalize_model_id(model)
+        .0
+        .or_else(|| body_model.and_then(|m| qoder_realm::normalize_model_id(m).0));
+    let key_bind_pool = crate::api_server::api_keys::constraints_for(&state.data_dir, key_id)
+        .map(|k| k.bind_pool)
+        .unwrap_or_default();
+    let bind_realm = crate::api_server::api_keys::pool_realm_of(&key_bind_pool);
+    realm_pool_tag_from(
+        explicit,
+        bind_realm,
+        &s.qoder_default_realm,
+        s.qoder_intl_enabled,
+    )
+}
+
+/// Qoder 娴佸紡瀵硅瘽锛坮outes.rs 鍚勫崗璁鐐?TargetPool::Qoder 鍒嗘敮璋冪敤锛?pub fn qoder_stream_chat(
+    state: Arc<ApiSharedState>,
+    body_vec: Vec<u8>,
+    model: String,
+    start_ts: Instant,
+    proto: Protocol,
+    key_id: String,
+    guard: InflightGuard,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+    // 鎵规 D-1 绾跨▼闅旂锛氭祦浠诲姟杩佸叆涓撶敤闃诲姹狅紙鍚?wb_stream_chat锛?    super::stream_runtime().spawn_blocking(move || {
+        let chat_id = match proto {
+            Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
+            Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
+            Protocol::Anthropic => format!("msg_{}", now_ts()),
+            Protocol::Responses => format!("resp_{}", now_ts()),
+        };
+
+        // SSE keep-alive 15s锛歸atch + DoneSignal 鏂规锛堜富浠诲姟缁撴潫鍚?panic 灞曞紑
+        // 缃?done=true锛宼icker 閫€鍑烘斁琛屾祦缁堢粨锛夆€斺€斾笌 wb_stream_chat 鍚屾瀯
+        let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+        let _done = super::routes::DoneSignal(done_tx);
+        {
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                tick.tick().await; // 棣栦釜 tick 绔嬪嵆杩斿洖锛岃烦杩?                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            if tx2
+                                .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        _ = done_rx.changed() => break,
+                    }
+                }
+            });
+        }
+
+        run_qoder_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| internal_error_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qoder_stream(
+    state: &Arc<ApiSharedState>,
+    body_vec: &[u8],
+    model: &str,
+    proto: Protocol,
+    key_id: &str,
+    chat_id: &str,
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    start_ts: Instant,
+    mut guard: InflightGuard,
+) {
+    // 鏂规 C锛氬尯鍩熸睜閫夋嫨鈥斺€斾笌 dispatch 涓夌骇鍚屾簮锛堟ā鍨嬪墠缂€ > Key 缁戝尯 > 榛樿鍖哄煙锛夛紝
+    // 鍖哄墠缂€鍙兘宸茶 dispatch 褰掍竴鍖栨秷璐癸紝鏁呭悓鏃惰璇锋眰浣撳師鍊?    let _bare_model = crate::tasks::qoder_realm::normalize_model_id(&model).1;
+    // 璇锋眰浣撳師鍊硷紙peek 鍚庣画澶氬澶嶇敤锛屽厛瑙ｆ瀽涓€娆★級
+    let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
+    let body_model = peek.get("model").and_then(Value::as_str);
+    let pool_tag = resolve_realm_pool_tag(
+        &state,
+        &model,
+        body_model,
+        format!("{key_id}").as_str(),
+    );
+    let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
+
+    // 鐩綍鏉＄洰锛坲pstreamKey/config锛夛細璋冨害鍛戒腑鍚庣洰褰曞埛鏂板鑷存潯鐩秷澶辨椂鎸?404 閫忎紶銆?    // 鍖哄煙杈圭晫锛氭寜鍛戒腑姹犵殑鍖哄煙锛坧ool_tag 鈫?CN/INTL锛夎В鏋愮洰褰曪紝鏈懡涓啀浠?CN 鍖?    // 鍏滃簳锛涗笂娓稿熀鍧€涓庨壌鏉冪敱鍑瘉鍖哄煙鍐冲畾锛坬oder_upstream::make_qoder_request /
+    // region(creds.realm)锛夛紝鍥犳 CN 鐩綍鏉＄洰涓嶄細鍦ㄥ浗闄呭嚟璇佷笅鎵撳線鍥藉唴缃戝叧
+    let Some(entry) = qoder_upstream::resolve(
+        &_bare_model,
+        crate::tasks::qoder_realm::region(pool_tag),
+    )
+    .or_else(|| qoder_upstream::resolve(&_bare_model, qoder_upstream::QoderRegion::Cn))
+    else {
+        let msg = format!("model {model} not in Qoder catalog");
+        state.logger.log_request(
+            "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
+            start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
+        );
+        send_stream_error(tx, proto, 404, &msg);
+        return;
+    };
+    // 鍖哄煙杈圭晫鎵ц鍏ュ彛妫€鏌ワ紙瀹℃煡淇锛夛細resolve 鍙屽尯鍏滃簳鍙兘鍛戒腑 Global 涓撳睘
+    // 鏉＄洰鈥斺€旇皟搴﹀垽娲讳絾 CN 缃戝叧鎵ц蹇呮锛屾澶勬槑纭嫆缁濓紙404 鍙В鏋愰€氶亾锛夎€岄潪
+    // 閫忎紶涓婃父璇″紓鎶ラ敊
+    if pool_tag != "qoder_intl" && entry_is_global_only(model, &entry) {
+        let msg = format!(
+            "upstream 404 error: model {model} only available in Qoder Global region, not yet supported"
+        );
+        state.logger.log_request(
+            "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
+            start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
+        );
+        send_stream_error(tx, proto, 404, &msg);
+        return;
+    }
+    let model_key = entry
+        .get("upstreamKey")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let model_source = entry
+        .pointer("/config/source")
+        .and_then(Value::as_str)
+        .unwrap_or("system")
+        .to_string();
+    // issue #111锛氬厤璐规。妯″瀷锛堝€嶇巼 0锛夐浂娑堣€楋紝鍙栧彿璞佸厤绉垎缁村害杩囨护
+    //锛堥浂绉垎/淇濈暀闃堝€?绉垎杩囨湡锛夛紝璐﹀彿绾х姸鎬佽繃婊や繚鎸佷笉鍙樸€?    // 鍏嶈垂娲诲姩瑕嗙洊锛堣祫婧愯皟搴﹂〉寮€鍏筹級锛氬湪鍦板尯涓撳睘鍒ゅ畾涔嬪悗搴旂敤鈥斺€?    // entry_is_global_only 姣旇緝鍘熷鏉＄洰鐩哥瓑鎬э紝鎻愬墠鏀瑰啓浼氱牬鍧忓垽瀹?    let entry = {
+        let mut e = entry;
+        qoder_upstream::apply_flash_free_override(
+            &mut e,
+            state
+                .qoder_flash_free_rate
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        e
+    };
+    let free_model = qoder_upstream::entry_is_free(&entry);
+
+    // F-35 瀛?Key 绾︽潫锛坬oder 姹犱綔鐢ㄥ煙锛涘尶鍚?鏃犵害鏉?Key 鍏ㄧ┖ 鈫?璧伴粯璁よ皟搴︼級
+    let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, key_id)
+        .and_then(|k| k.pool_constraints("qoder"))
+        .map_or((None, None), |c| (c.allowed, c.dedicated));
+
+    // F-80-浣?v2 浼氳瘽绮樻€э紙寮€鍏冲叧闂椂鎭?None锛寁1 杞崲琛屼负闆跺彉鍖栵級锛氱矘鎬у懡涓笖
+    // 璐﹀彿鍦ㄦ睜 鈫?棣栭€夌矘浣忚处鍙凤紙busy 涓旀湁绌洪棽鍊欓€夋椂璁╀綅锛孎-77鈶?鍚屾瀯锛夛紱瀛?Key
+    // 闄愬畾涓婃父涓嶅惈绮樻€ц处鍙锋椂蹇界暐绮樻€с€傚悓璐﹀彿 + 鍚岀瀛愭淳鐢熷悓涓€涓婃父 session_id
+    //锛坧repare_qoder_body session_id_for锛夛紝绮樹綇璐﹀彿鍗充繚浣忎笂娓镐細璇濅晶澶嶇敤
+    let sticky_key = SessionKey::from_body(&peek);
+    let sticky0: Option<String> = if state
+        .qoder_sticky_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        state
+            .qoder_sticky
+            .resolve(&sticky_key, now_ts())
+            .and_then(|b| {
+                if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
+                    return None;
+                }
+                state.qoder_pool_for(pool_tag).pick_by_uid(&b.uid, free_model).map(|_| b.uid)
+            })
+    } else {
+        None
+    };
+    // 缁戝畾鍥炲啓鐢ㄤ細璇濈瀛愶紙浠呰惤搴撶暀妗ｏ紱session 鐢?body 鏋勯€犳椂鎸?uid+seed 娲剧敓锛?    let sticky_seed: String = peek
+        .get("session_id")
+        .and_then(Value::as_str)
+        .or_else(|| peek.get("user").and_then(Value::as_str))
+        .unwrap_or("-")
+        // 瀹℃煡 P3锛歴eed 杩?sticky 瀛樺偍鍋氫細璇濆尮閰嶏紝瓒呴暱鍊兼斁澶х暀妗ｄ綋绉€斺€?        // 闄愰暱 128 瀛楃锛堜笌涓婃父璇锋眰浣?session_seed 鍚屾纭畾鎬ф埅鏂級
+        .chars()
+        .take(128)
+        .collect();
+
+    // 棣栭€夛細绮樻€?> 璋冨害绛栫暐锛團-77鈶ｏ細绮樻€ц处鍙?busy 涓旀湁绌洪棽鍊欓€夋椂璁╀綅锛?    let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
+        state
+            .qoder_pool_for(pool_tag)
+            .pick_sticky_yield(u, allowed_set.as_ref(), free_model)
+            .map(|(p, ev)| {
+                if let Some(ev) = ev {
+                    state.logger.log_sched_event(&ev);
+                }
+                p
+            })
+    });
+
+    let mut tried: HashSet<String> = HashSet::new();
+    let mut empty_hits: usize = 0; // 绌哄畬鎴愯鏁帮細杞崲鑰楀敖鏀跺熬鍖哄垎鎸囩汗鎷︽埅涓庤处鍙疯€楀敖
+    // 鎺掗槦绱绛夊緟锛堥绠楄 QUEUE_WAIT_BUDGET_SECS锛変笌鏈€鍚庝竴娆′笂娓稿け璐ュ垎绫伙細
+    // 鑰楀敖鏀跺熬鎹鍒ゆ柇銆屼笂娓镐竴鐩村湪鎺掗槦銆嶈繕鏄€岃处鍙风湡涓嶅彲鐢ㄣ€?    let mut queue_waited_secs: u64 = 0;
+    let mut last_kind: Option<UpstreamKind> = None;
+
+    loop {
+        // 瀹㈡埛绔柇杩炴娴嬶細閫氶亾鍏抽棴鍗崇粓姝㈣疆鎹?閲嶈瘯锛堝榻?run_wb_stream锛夈€?        // 瀹℃煡 M5锛氭柇杩炰篃鏄姹傜粓灞€锛岃ˉ璁颁竴琛屽け璐ョ敤閲忥紙鏈彇鍙?鈫?"none"锛?        // 涓庝笅鏂硅疆鎹㈣€楀敖鏀跺熬鍚屽彛寰勶級锛岄槻鐢ㄩ噺椤?requests 缂哄彛
+        if tx.is_closed() {
+            state.record_usage_qoder(
+                model, "none", key_id, false, true,
+                start_ts.elapsed().as_millis() as u64, 0, 0, None, None, None,
+                &session_ctx(&peek),
+            );
+            return;
+        }
+        // 鈹€鈹€ 鍙栧彿锛氱矘鎬у懡涓紭鍏堬紝鍚﹀垯鎸?Key 绾︽潫 + 璋冨害绛栫暐锛涙崲鍙峰悗浠呰蛋绛栫暐 鈹€鈹€
+        let picked = match first_pick.take() {
+            Some(p) => p,
+            None => match state
+                .qoder_pool_for(pool_tag)
+                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), free_model)
+            {
+                Some((p, ev)) => {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                }
+                None => {
+                    let duration_ms = start_ts.elapsed().as_millis() as u64;
+                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
+                    // 瀹℃煡 P2锛氳疆鎹㈣€楀敖鏀跺熬瀵归綈 routes.rs锛坕ssue #57 鍙娴嬶級鈥斺€?                    // 绌哄畬鎴愪富瀵?鈫?鏄庣ず娓犻亾鎸囩汗鎷︽埅璇箟锛堣处鍙?妯″瀷鏃犲叧锛屾彁绀烘洿鏂?                    // wb_template_map.json锛夛紝鍚﹀垯缁存寔鏃犲仴搴疯处鍙锋枃妗堬紱
+                    // code 淇濇寔 no_healthy_account锛堝鎴风鍏煎锛?                    //
+                    // 2026-10-19 瀹炴満淇锛氭渶鍚庝竴娆″け璐ユ槸銆屼笂娓告帓闃熴€嶆椂涓嶅啀鎶?                    // no_healthy_account鈥斺€旇处鍙锋槸濂界殑锛屾槸涓婃父鍦ㄦ帓闃熴€傛鏃舵寜闄愭祦璇箟
+                    // 鏀跺熬 429锛堝甫宸茬瓑寰呯鏁帮級锛屽苟鏄庣‘銆岀◢鍚庨噸璇曘€嶈€岄潪銆屽幓鏌ヨ处鍙枫€嶃€?                    if last_kind == Some(UpstreamKind::Queued) {
+                        let msg = queue_budget_exhausted_msg(
+                            model,
+                            queue_waited_secs,
+                            QUEUE_DEFAULT_BACKOFF_SECS,
+                        );
+                        state.logger.log_request(
+                            "qoder", "POST", "/v1/chat/completions", model, true, 429, "none",
+                            duration_ms, &key_name, "", Some(&msg),
+                        );
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] UPSTREAM_QUEUE_TIMEOUT tried={} waited={}s pool=qoder",
+                            tried.len(),
+                            queue_waited_secs,
+                        ));
+                        let err_body = json!({
+                            "error": {"message": msg, "type": "api_error", "code": "upstream_queue_timeout"}
+                        });
+                        let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                            "data: {err_body}\n\n"
+                        ))));
+                        let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                        return;
+                    }
+                    let (healthy_total, _) = state.qoder_pool_for(pool_tag).selectable_stats_in(None, free_model);
+                    let (exhaust_msg, exhaust_tag) =
+                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    state.logger.log_request(
+                        "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
+                        duration_ms, &key_name, "", Some(&exhaust_msg),
+                    );
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder{}",
+                        tried.len(),
+                        empty_hits,
+                        // issue #99 鈶狅細褰卞瓙椋庢帶锛堢┖瀹屾垚涓诲锛夋敹灏捐惤鍘熷鎸囩汗鏍锋湰锛堜笁姹犲悓鍙ｅ緞锛?                        if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                            format!(" 鎸囩汗鏍锋湰: {}", super::wb_payload::fingerprint_sample(body_vec))
+                        } else {
+                            String::new()
+                        }
+                    ));
+                    let err_body = json!({
+                        "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
+                    });
+                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                        "data: {err_body}\n\n"
+                    ))));
+                    let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                    return;
+                }
+            },
+        };
+        tried.insert(picked.uid.clone());
+        // 褰撳墠璐﹀彿鎺掗槦閲嶈瘯璁℃暟锛堣处鍙峰眬閮細鎹㈠彿鑷劧閲嶇疆锛?        let mut queue_same: u32 = 0;
+        // F-77 璐﹀彿绾у湪閫旇鏁帮細鍙栧彿鍗崇粦瀹氾紙鎹㈠彿鏃?bind_account 鑷姩瑙ｇ粦鏃ц处鍙凤級銆?        // 瀹℃煡 P1-4 TOCTOU 鏀剁揣锛氭櫘閫氬€欓€?CAS 澶嶆牳銆屽湪閫?< 骞跺彂涓婇檺銆嶏紝宸叉弧鍒?        // 涓嶅彂璧疯姹傛崲涓嬩竴鍊欓€夛紙涓嶈閿欒涓嶅喎鍗达級锛沷ver_limit 鍊欓€夛紙绮樻€ч攣瀹氥€?        // busy_fallback 闄嶇骇锛変繚鐣欏師鏃犳潯浠剁粦瀹氳涔夈€?        // active_uid 浠呭湪缁戝畾鎴愬姛鍚庢洿鏂帮紙CAS 鎷掔粷鐨勫€欓€変笉寰楁薄鏌撱€屽綋鍓嶈处鍙枫€嶅睍绀猴級
+        let bound = if picked.over_limit {
+            guard = guard.bind_account(state.qoder_pool_for(pool_tag).inflight_handle(&picked.uid));
+            true
+        } else {
+            guard.bind_account_cas(
+                state.qoder_pool_for(pool_tag).inflight_handle(&picked.uid),
+                state.qoder_pool_for(pool_tag).concurrency_limit(),
+            )
+        };
+        if !bound {
+            continue;
+        }
+        *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+
+        // 鍑瘉瑙ｆ瀽锛氬洖璋冪己澶憋紙鏈敞鍏?鍗曟祴锛夆啋 鎹㈠彿涓嶅喎鍗达紙閰嶇疆闂闈炶处鍙烽棶棰橈級锛?        // 鍥炶皟鎶ラ敊锛圥AT 鎹护鐗屽け璐?鐧诲綍鎬佸け鏁堬級鈫?SessionDead 绂佺敤鍚庢崲鍙?        let creds: QoderCreds = match state.qoder_identity.as_ref() {
+            None => {
+                state.logger.log_request(
+                    "qoder", "POST", "/v1/chat/completions", model, true, 503, &picked.uid,
+                    start_ts.elapsed().as_millis() as u64, &key_name,
+                    &state.qoder_pool_for(pool_tag).name_of(&picked.uid), Some("qoder identity 鍥炶皟鏈敞鍏?),
+                );
+                continue;
+            }
+            Some(resolve) => match resolve(&picked.uid) {
+                Ok(c) => c,
+                Err(e) => {
+                    // 瀹℃煡淇锛氱灛鏃跺け璐ワ紙缃戠粶/5xx锛屽甫 TRANSIENT_ERR_TAG锛夎 Server 鐔旀柇
+                    //锛堝彲鑷剤锛夛紱浠呮案涔呭け鏁?SessionDead 绂佺敤
+                    let kind = if crate::tasks::qoder_common::is_transient_identity_err(&e) {
+                        ErrKind::Server
+                    } else {
+                        ErrKind::SessionDead
+                    };
+                    state.qoder_pool_for(pool_tag).note_error(&picked.uid, kind);
+                    // issue #67锛氱‖鍐峰嵈/绂佺敤绫婚敊璇В缁戣璐﹀彿绮樻€?                    if kind.unbinds_sticky() {
+                        state.qoder_sticky.unbind_uid(&picked.uid);
+                    }
+                    *safe_lock(&state.last_error) = Some(format!(
+                        // 瀹℃煡淇锛歟rr 鍘熸枃锛堜笂娓稿搷搴?URL 鐗囨鍙兘鍚护鐗岋級鎴柇鑴辨晱锛?                        // 鍚?HTTP 鍒嗘敮 safe_slice 鍙ｅ緞
+                        "qoder identity uid={} err={}",
+                        picked.uid,
+                        safe_slice(&e, 200)
+                    ));
+                    state.logger.log_request(
+                        "qoder", "POST", "/v1/chat/completions", model, true, 503, &picked.uid,
+                        start_ts.elapsed().as_millis() as u64, &key_name,
+                        &state.qoder_pool_for(pool_tag).name_of(&picked.uid), Some("鍑瘉瑙ｆ瀽澶辫触"),
+                    );
+                    continue;
+                }
+            },
+        };
+
+        // 璇锋眰浣擄紙agent 淇″皝锛涗緷璧栬处鍙?uid 娲剧敓 session锛?        let converted = match qoder_upstream::prepare_qoder_body(&peek, &entry, &creds.uid) {
+            Ok(b) => b,
+            Err(e) => {
+                state.logger.log_request(
+                    "qoder", "POST", "/v1/chat/completions", model, true, 500, &picked.uid,
+                    start_ts.elapsed().as_millis() as u64, &key_name,
+                    &state.qoder_pool_for(pool_tag).name_of(&picked.uid), Some(&e),
+                );
+                send_stream_error(tx, proto, 500, &e);
+                return;
+            }
+        };
+
+        // 瀹℃煡淇 K锛氫俊灏佸惈瀹屾暣瀵硅瘽鍘嗗彶锛堝ぇ body锛夛紝request_id/session_id 闅忎俊灏佹亽瀹氾紝
+        // 鍦ㄥ灞傛崲鍙峰惊鐜唴瑙ｆ瀽涓€娆′緵鍐呭眰鍚勬灏濊瘯璁拌处澶嶇敤锛岄伩鍏嶇儹璺緞閲嶅鍏ㄩ噺鍙嶅簭鍒楀寲
+        let envelope_ids = extract_envelope_ids(&converted);
+
+        let mut same_attempt: u32 = 0;
+        // 瀵瑰啿鎺ョ鏍囪锛堟湰杞皾璇曞唴鏈夋晥锛夛細鎺ョ鍚庢帓闃熷悓鍙烽€€閬夸笉鍐嶉€傜敤鈥斺€?        // 閫€閬块噸璇曡蛋涓昏处鍙?creds/converted锛屼笌鐢熸晥锛堝鍐诧級璐﹀彿涓嶄竴鑷淬€?        // 鍒濆€煎湪 Ok 鍒嗘敮蹇呯劧鍏堣祴鍊煎悗璇诲彇锛宭int 瀵瑰垵鍊艰鎶ワ紝鏄惧紡鍏佽
+        #[allow(unused_assignments)]
+        let mut hedge_taken = false;
+        loop {
+            // 鏂繛妫€娴嬶細閲嶈瘯绛夊緟/闀胯矾寰勬湡闂寸寮€鍒欑粓姝紙guard 闅?Drop 閲婃斁锛夈€?            // 瀹℃煡 M5锛氭柇杩炰负璇锋眰缁堝眬锛岃ˉ璁颁竴琛屽け璐ョ敤閲忥紙宸茬粦瀹?picked 璐﹀彿锛?            if tx.is_closed() {
+                state.record_usage_qoder(
+                    model, &picked.uid, key_id, false, true,
+                    start_ts.elapsed().as_millis() as u64, 0, 0, None, None, None,
+                    &session_ctx(&peek),
+                );
+                return;
+            }
+            // F-76鈶?TTFT 閲囨牱锛堝悓 wb_route锛氬悇娆″皾璇曠嫭绔嬭鏃讹紝绔為€熻儨鑰呴瀛楀嵆 TTFB锛?            let ttfb_start = Instant::now();
+            match qoder_upstream::make_qoder_request(
+                &creds,
+                &converted,
+                &model_key,
+                &model_source,
+            ) {
+                Ok(reader) => {
+                    // 棣栧瓧瓒呮椂 10s锛氳秴鏃惰涓轰笂娓告晠闅?鈫?鎹㈠彿锛堝悓 run_wb_stream 璇箟锛夛紱
+                    // F-80-浣?v2 鎱㈣姹傜珵閫熷鍐诧細棣栧瓧瓒呴槇鍊煎悜绗簩璐﹀彿鍙戝鍐茶姹傦紝
+                    // 鍏堝嚭棣栧瓧鑰呰儨锛堝鍐插叧闂椂涓庣函棣栧瓧瓒呮椂璇箟涓€鑷达級
+                    let err_slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
+                    let mut race = match race_qoder_first_byte(
+                        state,
+                        pool_tag,
+                        &picked.uid,
+                        reader,
+                        &peek,
+                        &entry,
+                        &model_key,
+                        &model_source,
+                        &tried,
+                        allowed_set.as_ref(),
+                        dedicated.as_deref(),
+                        &envelope_ids,
+                    ) {
+                        Ok(w) => w,
+                        Err(()) => {
+                            state.qoder_pool_for(pool_tag).note_error(&picked.uid, ErrKind::Server);
+                            break;
+                        }
+                    };
+                    let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
+                    // 瀵瑰啿璁℃暟钀藉畾 + guard 閲嶇粦锛堟帴绠℃椂鐢熸晥璐﹀彿 = 瀵瑰啿璐﹀彿锛?                    guard = settle_qoder_hedge(state, &mut race, guard, &picked.uid);
+                    hedge_taken = race.takeover;
+                    let win_uid = race.uid.clone();
+                    // G4锛氳璐︿細璇?id 鎸夎儨鑰呬俊灏佽惤瀹氾紙race 鍦?translate 澶勮娑堣垂锛屽厛鍙栧揩鐓э級
+                    let win_session_ids = race.session_ids.clone().or_else(|| envelope_ids.clone());
+                    // 绔為€熻儨鑰呰婧愶紙鍘熷涓婃父琛岋級缁熶竴缈昏瘧鍚庡杺 stream_forward_ex
+                    let ilines = translate_race_lines(race, err_slot.clone(), chat_id, model);
+                    let (error_info, sent_any, failed_inline, usage) =
+                        // Qoder 鏃?namespace 灞曞钩缂栫爜锛圧esponses 鍒嗘敮涓洪槻寰℃€у厹搴曪紝
+                        // 瀹為檯浠?OpenAi/Anthropic 鍙揪锛夆啋 绌洪泦鍚堢鐢ㄧ紪鐮佸悕鎷嗗垎锛堝鏌?F4锛?                        wb_sse::stream_forward_ex(ilines, tx, proto, chat_id, model, &std::collections::HashSet::new());
+                    let duration_ms = start_ts.elapsed().as_millis() as u64;
+                    let meta = err_slot
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    // M1 淇锛堝鏌ワ級锛歛s_u64 绐勫彛寰勫瀛楃涓?娴偣鏁板瓧娈靛舰鎬侀潤榛?                    // 寰?0鈥斺€旀敼鐢?wb_sse::u64_pair 瀹藉彛寰勶紙涓?wb/Trae 璁拌处鍚屾簮锛?                    let (pt, ct) = usage.as_ref().map(wb_sse::u64_pair).unwrap_or((0, 0));
+                    // M4锛氱紦瀛樿 tokens 鍚屾簮瀹藉彛寰勬彁鍙栵紝缁堟€佹梺璺璐︼紙0 鍊间笉鍏ヨ处锛?                    let cached = usage.as_ref().map(wb_sse::cached_tokens_of).unwrap_or(0);
+                    let (credits, original_credits) = extract_billing(usage.as_ref());
+                    // issue #111锛氬厤璐规。璋冨害锛堝厤璐规椿鍔ㄨ鐩栧紑鍚垨鐩綍浠?0锛夋秷鑰楁寜 0
+                    // 钀借处鈥斺€斾笂娓?billable=false 瀹為檯涓嶆墸鍒嗭紝鍚嶄箟鍊肩収璁颁細铏氬鐢ㄩ噺
+                    let (credits, original_credits) = if free_model {
+                        (Some(0.0), Some(0.0))
+                    } else {
+                        (credits, original_credits)
+                    };
+                    // 瀹℃煡淇锛堜腑绛夐」锛夛細娴佸紡璁拌处瀵归綈闈炴祦寮忋€屾瘡璇锋眰涓€琛屻€嶅彛寰勨€斺€?                    // 涓嶅啀閫愬皾璇曡璐︼紙鍘熸瘡娆″皾璇曡涓€鏉★紝鎹㈠彿閲嶈瘯鑷?requests/errors
+                    // 铏氶珮锛夛紱usage 浠呭湪璇锋眰缁堝眬锛堟垚鍔?灏卞湴鏀跺熬/鍐峰嵈缁堟/Fatal/鍙栧彿
+                    // 鑰楀敖锛夊璁板綍锛屾崲鍙蜂腑闂存€侊紙break 缁х画杞崲锛変笉璁?                    match error_info {
+                        Some((code, msg)) => {
+                            // 娴佸唴閿欒鍒嗙被浠?ErrMeta 涓哄噯锛坱ranslate 鍐欏叆锛屽惈鎺掗槦/棰濆害淇″彿锛?                            match meta.as_ref().map(|m| m.kind) {
+                                Some(UpstreamKind::Queued) => {
+                                    // 鎺掗槦锛氬悓鍙烽€€閬块噸璇曚负涓伙紙瀵瑰啿鎺ョ鍚庝笉閫傜敤鈥斺€旈噸璇?                                    // 鍑瘉/璇锋眰浣撳睘涓昏处鍙凤紝涓庣敓鏁堣处鍙蜂笉涓€鑷达紝鐩存帴鎹㈠彿锛夛紱
+                                    // 鑻ヨ妯″瀷宸茶骞跺彂璇锋眰璁板叆鍐峰嵈锛屽垯鐩存帴 break 鎹㈠彿
+                                    //锛堝揩閫熷け璐ワ級
+                                    if !sent_any && !hedge_taken && queue_same < QUEUE_RETRY_LIMIT {
+                                        let secs = meta
+                                            .as_ref()
+                                            .and_then(|m| m.queue.as_ref())
+                                            .and_then(|q| q.retry_after_secs)
+                                            .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
+                                            .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                        last_kind = Some(UpstreamKind::Queued);
+                                        // 鎺掗槦鎬婚绠楋細瓒呴绠楃珛鍗虫敹灏撅紙429 + 閫€閬挎彁绀猴級锛?                                        // 涓嶅啀鎶婅姹傛嫋鍒板垎閽熺骇浠嶆棤杈撳嚭
+                                        if queue_budget_exceeded(queue_waited_secs, secs) {
+                                            let duration_ms =
+                                                start_ts.elapsed().as_millis() as u64;
+                                            state.record_usage_qoder(
+                                                model, &win_uid, key_id, false, true,
+                                                duration_ms, 0, 0, None, None, None,
+                                                &session_ctx(&peek),
+                                            );
+                                            state.logger.log_request(
+                                                "qoder", "POST", "/v1/chat/completions",
+                                                model, true, 429, &win_uid, duration_ms,
+                                                &key_name,
+                                                &state.qoder_pool_for(pool_tag).name_of(&win_uid),
+                                                Some("涓婃父鎺掗槦瓒呴绠楋紝鏀跺熬 429"),
+                                            );
+                                            send_stream_error(
+                                                tx, proto, 429,
+                                                &queue_budget_exhausted_msg(
+                                                    model,
+                                                    queue_waited_secs,
+                                                    secs,
+                                                ),
+                                            );
+                                            return;
+                                        }
+                                        // 瀹℃煡淇锛氭ā鍨嬬骇鍐峰嵈鈥斺€旀帓闃熸槸妯″瀷绾х幇璞★紝
+                                        // 璁板綍绐楀彛渚?dispatch 棰勬蹇€熷洖閫€锛涘凡鍦ㄥ喎鍗?                                        // 涓紙骞跺彂璇锋眰鍒氳褰曡繃锛夋椂鎸?cooldown_gate 澶勭疆锛?                                        // 灏惧反鐫″畬鍐嶈瘯涓€娆★紝闀跨獥鍙ｆ墠缁堟杞崲杩斿洖 429锛?                                        // 涓嶅啀瀵规睜鍐呮瘡涓处鍙风‖鎵撳凡鐭ユ晠闅滀笂娓?                                        //锛堝師 break 鎹㈠彿浼氳疆鎹㈠埌鑰楀敖锛岄€愯处鍙风湡瀹炶姹傦級
+                                        match cooldown_gate(pool_tag, model, Some(tx)) {
+                                            // 灏惧反宸茬瓑瀹岋細鐩存帴閲嶈瘯鏈疆锛堜笉鍐嶉噸澶嶈绐楀彛/閫€閬匡級
+                                            CooldownGate::Waited => {
+                                                queue_same += 1;
+                                                continue;
+                                            }
+                                            CooldownGate::None => {}
+                                            CooldownGate::Hard(rem) => {
+                                                let duration_ms =
+                                                    start_ts.elapsed().as_millis() as u64;
+                                                state.record_usage_qoder(
+                                                    model, &win_uid, key_id, false, true,
+                                                    duration_ms, 0, 0, None, None, None,
+                                                    &session_ctx(&peek),
+                                                );
+                                                state.logger.log_request(
+                                                    "qoder", "POST", "/v1/chat/completions",
+                                                    model, true, 429, &win_uid, duration_ms,
+                                                    &key_name,
+                                                    &state.qoder_pool_for(pool_tag).name_of(&win_uid),
+                                                    Some("妯″瀷鍐峰嵈涓紝缁堟杞崲"),
+                                                );
+                                                send_stream_error(
+                                                    tx, proto, 429,
+                                                    &format!("model {model} cooling down, retry after {rem}s"),
+                                                );
+                                                return;
+                                            }
+                                            CooldownGate::Disconnected => {
+                                                // 瀹℃煡 M5锛氭柇杩炰负璇锋眰缁堝眬锛岃ˉ璁板け璐ョ粓鎬佺敤閲?                                                state.record_usage_qoder(
+                                                    model, &win_uid, key_id, false, true,
+                                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                                    None, None, None, &session_ctx(&peek),
+                                                );
+                                                return;
+                                            }
+                                        }
+                                        note_model_cooldown(pool_tag, model, secs);
+                                        queue_same += 1;
+                                        if !sleep_interruptible(Duration::from_secs(secs), Some(tx)) {
+                                            // 瀹℃煡 M5锛氭柇杩炰负璇锋眰缁堝眬锛岃ˉ璁板け璐ョ粓鎬佺敤閲?                                            state.record_usage_qoder(
+                                                model, &win_uid, key_id, false, true,
+                                                start_ts.elapsed().as_millis() as u64, 0, 0,
+                                                None, None, None, &session_ctx(&peek),
+                                            );
+                                            return; // 瀹㈡埛绔柇杩烇細鎻愬墠閫€鍑?                                        }
+                                        queue_waited_secs = queue_waited_secs.saturating_add(secs);
+                                        continue;
+                                    }
+                                    // 瓒呴檺/sent_any锛氫笉鍐?break 纭崲鍙封€斺€斿唴瀹瑰凡娴佸嚭
+                                    // 锛坰ent_any=true锛夋椂鎹㈠彿閲嶅彂浼氬悜鍚屼竴 SSE 娴佹嫾鎺?                                    // 绗簩浠藉畬鏁村搷搴旓紱浜や笅鏂瑰叕鍏辨敹灏撅紙!sent_any鈫掓崲鍙凤紝
+                                    // sent_any鈫掑氨鍦版敹灏撅級锛屼笌鍏朵粬閿欒鍒嗘敮鍙ｅ緞涓€鑷?                                }
+                                Some(kind) => {
+                                    last_kind = Some(kind);
+                                    let ek = kind.to_err_kind();
+                                    if ek != ErrKind::None {
+                                        state.qoder_pool_for(pool_tag).note_error(&win_uid, ek);
+                                        // issue #67锛氱‖鍐峰嵈/绂佺敤绫婚敊璇В缁戣璐﹀彿绮樻€?                                        if ek.unbinds_sticky() {
+                                            state.qoder_sticky.unbind_uid(&win_uid);
+                                        }
+                                    }
+                                    // issue #90 淇鈶狅細涓婃父鏈嶅姟绔紓甯革紙5xx/涓氬姟 504锛夌撼鍏?                                    // 妯″瀷绾ф笎杩涘喎鍗粹€斺€斾粎鍦ㄥ唴瀹规湭娴佸嚭鏃惰璐︼紙sent_any=true
+                                    // 璇存槑妯″瀷瀹為檯鍦ㄦ湇鍔★紝灏鹃儴閿欒甯т笉浠ｈ〃妯″瀷鏁呴殰锛?                                    if kind == UpstreamKind::Server && !sent_any {
+                                        note_model_server_cooldown(pool_tag, model);
+                                    }
+                                    // issue #90 淇鈶★細last_error 甯︽ā鍨嬪悕 + 鏃跺埢锛堟鍓嶅彧鏈?                                    // uid/code/msg锛屾棤娉曞畾浣嶆槸鍝釜妯″瀷銆佹晠闅滀粠浣曟椂寮€濮嬶級
+                                    *safe_lock(&state.last_error) = Some(format!(
+                                        "qoder uid={} model={} code={} msg={} at {}",
+                                        win_uid,
+                                        model,
+                                        code,
+                                        msg,
+                                        now_cn_timestamp()
+                                    ));
+                                }
+                                None => {
+                                    // translate 涔嬪鐨勯敊璇抚銆侲OF 闆跺畬鎴愬摠鍏碉紙-9901锛変笉缁?                                    // translate 鍐?ErrMeta锛屽繀钀芥湰鍒嗘敮锛堥潪銆岀悊璁轰笉鍙揪銆嶏級锛?                                    // 涓婃父闂存瓏鎬х┖鍥炴斁灞炴殏鎬侊紝鎸?wb_route 鍙ｅ緞鍏嶇啍鏂紝
+                                    // 浠呯敱涓嬫柟 !sent_any 鍒嗘敮鎹㈠彿閲嶈瘯
+                                    if super::is_empty_completion(code, &msg) {
+                                        empty_hits += 1; // 绌哄畬鎴愯鏁帮細鑰楀敖鏀跺熬鍖哄垎鎸囩汗鎷︽埅
+                                    } else {
+                                        state.qoder_pool_for(pool_tag).note_error(&win_uid, ErrKind::Server);
+                                    }
+                                }
+                            }
+                            if !sent_any {
+                                // 娴佹湭寮€濮嬶細閿欒涓嶄笅鍙戯紝鍏佽鎹㈠彿閲嶈瘯锛堟崲鍙蜂腑闂存€佷笉璁?usage锛?                                break;
+                            }
+                            // 灏卞湴鏀跺熬缁堝眬锛氳 usage锛堥儴鍒嗘垚鍔熸寜瀹為檯 usage 钀借处锛?                            state.record_usage_cached(super::usage::UsageBucket::Qoder, cached);
+                            state.record_usage_qoder(
+                                model,
+                                &win_uid,
+                                key_id,
+                                false,
+                                true,
+                                duration_ms,
+                                pt,
+                                ct,
+                                Some(ttfb_ms),
+                                credits,
+                                original_credits,
+                                &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
+                            );
+                            state.logger.log_request_ttfb(
+                                "qoder", "POST", "/v1/chat/completions", model, true, 200,
+                                &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                &state.qoder_pool_for(pool_tag).name_of(&win_uid), Some(&msg),
+                            );
+                            return; // 宸叉湁鏁版嵁娴佸嚭锛氬氨鍦版敹灏?                        }
+                        None => {
+                            if failed_inline {
+                                // 娴佸唴澶辫触宸插氨鍦伴€忎紶瀹㈡埛绔細涓嶉噸璇曚笉璁拌处鍐峰嵈锛堝悓 wb_route锛?                                state.logger.log_request_ttfb(
+                                    "qoder", "POST", "/v1/chat/completions", model, true, 200,
+                                    &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.qoder_pool_for(pool_tag).name_of(&win_uid),
+                                    Some("娴佸唴澶辫触宸查€忎紶瀹㈡埛绔?),
+                                );
+                                return;
+                            }
+                            clear_model_cooldown(pool_tag, model); // 瀹℃煡淇锛氭垚鍔熷嵆娓呮ā鍨嬬骇鍐峰嵈
+                            state.qoder_pool_for(pool_tag).note_success(&win_uid);
+                            // 鎴愬姛缁堝眬锛氳 usage锛堝鏌ヤ慨澶嶁€斺€斿師閫愬皾璇曡璐﹀凡绉婚櫎锛?                            // 鎴愬姛琛屽湪姝ょ粺涓€钀借处锛夛紱M4锛氱紦瀛樿 tokens 鏃佽矾鍚岃惤
+                            state.record_usage_cached(super::usage::UsageBucket::Qoder, cached);
+                            state.record_usage_qoder(
+                                model,
+                                &win_uid,
+                                key_id,
+                                true,
+                                true,
+                                duration_ms,
+                                pt,
+                                ct,
+                                Some(ttfb_ms),
+                                credits,
+                                original_credits,
+                                &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
+                            );
+                            // F-80-浣?v2锛氱粦瀹氱矘鎬т細璇濓紙寮€鍏冲紑鍚椂锛汳utex 鍐?re-check
+                            // 闃?TOCTOU 鐢?StickyStore::bind 淇濊瘉锛?                            if state
+                                .qoder_sticky_enabled
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                state.qoder_sticky.bind(&sticky_key, &win_uid, &sticky_seed, now_ts());
+                                state.qoder_sticky.save(&state.data_dir);
+                            }
+                            state.logger.log_request_ttfb(
+                                "qoder", "POST", "/v1/chat/completions", model, true, 200,
+                                &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                &state.qoder_pool_for(pool_tag).name_of(&win_uid), None,
+                            );
+                            return;
+                        }
+                    }
+                }
+                Err((status, resp_body, retry_after)) => {
+                    // HTTP 灞傚垎绾ч噸璇曪紙429/5xx/502 鍚屽彿閫€閬匡紱401/403/4xx 鎹㈠彿/缁堟锛?                    match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                        RetryAction::RetrySame { delay_ms } => {
+                            same_attempt += 1;
+                            // 瀹℃煡淇锛氬垎娈?sleep + 鏂繛鎰熺煡锛堝師鏁存 sleep 鏈€闀?60s锛?                            // 鏂繛鍚庝粛绌虹瓑锛涘師 sleep 鍚庣殑 is_closed 妫€鏌ヤ竴骞跺悎骞讹級
+                            if !sleep_interruptible(
+                                Duration::from_millis(delay_ms.min(60_000)),
+                                Some(tx),
+                            ) {
+                                // 瀹℃煡 M5锛氭柇杩炰负璇锋眰缁堝眬锛岃ˉ璁板け璐ョ粓鎬佺敤閲?                                state.record_usage_qoder(
+                                    model, &picked.uid, key_id, false, true,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                    None, None, None, &session_ctx(&peek),
+                                );
+                                return;
+                            }
+                            continue;
+                        }
+                        RetryAction::SwitchKey => {
+                            // Qoder 涓氬姟閿欒甯稿湪 403/200 淇″皝閲岋細鎸?upstream 鍒嗙被锛?                            // 鎺掗槦锛?0605锛夊悓鍙烽€€閬夸紭鍏堚€斺€旀ā鍨嬪凡鍦ㄥ喎鍗翠腑鍒?                            // break 鎹㈠彿锛堝揩閫熷け璐ワ紝瑙佷笅鏂瑰喎鍗存鏌ワ級
+                            let classified =
+                                qoder_upstream::classify_upstream_error(status, &resp_body);
+                            if classified.kind == UpstreamKind::Queued
+                                && queue_same < QUEUE_RETRY_LIMIT
+                            {
+                                let secs = classified
+                                    .queue
+                                    .as_ref()
+                                    .and_then(|q| q.retry_after_secs)
+                                    .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
+                                    .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                // 瀹℃煡淇锛氭ā鍨嬬骇鍐峰嵈锛堝悓娴佸唴 Queued 鍒嗘敮锛夆€斺€?                                // 灏惧反鐫″畬鍐嶈瘯銆侀暱绐楀彛鎵嶇粓姝㈣疆鎹㈣繑鍥?429
+                                match cooldown_gate(pool_tag, model, Some(tx)) {
+                                    CooldownGate::Waited => {
+                                        queue_same += 1;
+                                        continue;
+                                    }
+                                    CooldownGate::None => {}
+                                    CooldownGate::Hard(rem) => {
+                                        let duration_ms = start_ts.elapsed().as_millis() as u64;
+                                        state.record_usage_qoder(
+                                            model, &picked.uid, key_id, false, true,
+                                            duration_ms, 0, 0, None, None, None,
+                                            &session_ctx(&peek),
+                                        );
+                                        state.logger.log_request(
+                                            "qoder", "POST", "/v1/chat/completions", model, true,
+                                            429, &picked.uid, duration_ms, &key_name,
+                                            &state.qoder_pool_for(pool_tag).name_of(&picked.uid),
+                                            Some("妯″瀷鍐峰嵈涓紝缁堟杞崲"),
+                                        );
+                                        send_stream_error(
+                                            tx, proto, 429,
+                                            &format!("model {model} cooling down, retry after {rem}s"),
+                                        );
+                                        return;
+                                    }
+                                    CooldownGate::Disconnected => {
+                                        // 瀹℃煡 M5锛氭柇杩炰负璇锋眰缁堝眬锛岃ˉ璁板け璐ョ粓鎬佺敤閲?                                        state.record_usage_qoder(
+                                            model, &picked.uid, key_id, false, true,
+                                            start_ts.elapsed().as_millis() as u64, 0, 0,
+                                            None, None, None, &session_ctx(&peek),
+                                        );
+                                        return;
+                                    }
+                                }
+                                note_model_cooldown(pool_tag, model, secs);
+                                queue_same += 1;
+                                if !sleep_interruptible(Duration::from_secs(secs), Some(tx)) {
+                                    // 瀹℃煡 M5锛氭柇杩炰负璇锋眰缁堝眬锛岃ˉ璁板け璐ョ粓鎬佺敤閲?                                    state.record_usage_qoder(
+                                        model, &picked.uid, key_id, false, true,
+                                        start_ts.elapsed().as_millis() as u64, 0, 0,
+                                        None, None, None, &session_ctx(&peek),
+                                    );
+                                    return; // 瀹㈡埛绔柇杩烇細鎻愬墠閫€鍑?                                }
+                                continue;
+                            }
+                            let kind = classified.kind.to_err_kind();
+                            if kind != ErrKind::None {
+                                state.qoder_pool_for(pool_tag).note_error(&picked.uid, kind);
+                                // issue #67锛氱‖鍐峰嵈/绂佺敤绫婚敊璇В缁戣璐﹀彿绮樻€?                                if kind.unbinds_sticky() {
+                                    state.qoder_sticky.unbind_uid(&picked.uid);
+                                }
+                            }
+                            // issue #90 淇鈶狅細HTTP 灞?5xx锛堝惈 504锛夋崲鍙峰墠璁版ā鍨嬬骇
+                            // 娓愯繘鍐峰嵈鈥斺€斿惁鍒?504 鍙€愯处鍙疯疆鎹㈢‖鎵擄紝dispatch 棰勬
+                            // 姘镐笉瑙﹀彂璺ㄦ睜鍥為€€锛坕ssue #90 涓昏瘔鍦烘櫙锛?                            if classified.kind == UpstreamKind::Server {
+                                note_model_server_cooldown(pool_tag, model);
+                            }
+                            *safe_lock(&state.last_error) = Some(format!(
+                                "qoder uid={} model={} status={} body={} at {}",
+                                picked.uid,
+                                model,
+                                status,
+                                safe_slice(&resp_body, 200),
+                                now_cn_timestamp()
+                            ));
+                            state.logger.log_request(
+                                "qoder", "POST", "/v1/chat/completions", model, true, status,
+                                &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
+                                &state.qoder_pool_for(pool_tag).name_of(&picked.uid),
+                                Some(&format!("upstream status={status}")),
+                            );
+                            break; // 鎹㈠彿
+                        }
+                        RetryAction::Fatal => {
+                            let msg =
+                                format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                            // 缁堟€佽璐﹀榻愩€屾瘡璇锋眰涓€琛屻€嶅彛寰勶紙瀹℃煡 F3锛夛細Fatal 鏄姹?                            // 缁堝眬锛堝悓 no-healthy 鐢卞彇鍙峰垎鏀褰曪級锛屾鍓嶄粎 log_request
+                            // 瀵艰嚧鐢ㄩ噺缁熻椤电己鍙ｏ紱ttfb/credits 鏃犲け璐ヨ涔変紶 None
+                            state.record_usage_qoder(model, &picked.uid, key_id, false, true,
+                                start_ts.elapsed().as_millis() as u64, 0, 0,
+                                None, None, None, &session_ctx(&peek));
+                            state.logger.log_request(
+                                "qoder", "POST", "/v1/chat/completions", model, true, status,
+                                &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
+                                &state.qoder_pool_for(pool_tag).name_of(&picked.uid), Some(&msg),
+                            );
+                            send_stream_error(tx, proto, status as i64, &msg);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== 闈炴祦寮忥紙涓婃父鍙洖 SSE 鈫?鏈湴鑱氬悎锛?====================
+
+/// Qoder 闈炴祦寮忓璇濓細鑱氬悎 + 鍗忚鎶曞奖锛坮outes.rs 鍚勫崗璁鐐硅皟鐢級
+#[allow(clippy::too_many_arguments)]
+pub async fn qoder_aggregate_chat(
+    state: Arc<ApiSharedState>,
+    body_vec: Vec<u8>,
+    model: String,
+    stream: bool,
+    start_ts: Instant,
+    proto: Protocol,
+    key_id: String,
+    guard: InflightGuard,
+) -> Response {
+    // 鏂规 C锛氬尯鍩熸睜閫夋嫨鈥斺€斾笌 dispatch 涓夌骇鍚屾簮锛堟ā鍨嬪墠缂€ > Key 缁戝尯 > 榛樿鍖哄煙锛夛紝
+    // 鍖哄墠缂€鍙兘宸茶 dispatch 褰掍竴鍖栨秷璐癸紝鏁呭悓鏃惰璇锋眰浣撳師鍊?    let _bare_model = crate::tasks::qoder_realm::normalize_model_id(&model).1;
+    // 璇锋眰浣撳師鍊硷細peek 鍦ㄩ棴鍖呭唴澶氬澶嶇敤锛屾澶勮В鏋愪竴娆″嵆鍙悓鏃朵緵瀹氬尯涓庢墽琛屼娇鐢?    let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
+    let body_model = peek.get("model").and_then(Value::as_str);
+    let pool_tag = resolve_realm_pool_tag(
+        &state,
+        &model,
+        body_model,
+        format!("{key_id}").as_str(),
+    );
+    let model_out = model.clone();
+    // 鑱氬悎鍚垎绾ч噸璇曪紙鍚屽彿閫€閬挎渶闀?60s脳N锛夛紝杩佸叆 stream_runtime 涓撶敤闃诲姹?    //锛堝悓 wb_aggregate_chat锛涢暱闃诲鍗犱富姹犱細楗挎閴存潈绛夌煭浠诲姟锛?    let result = super::stream_runtime().spawn_blocking(move || {
+        let mut guard = guard;
+        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+
+        // 鐩綍鎸夊尯瑙ｆ瀽锛坧ool_tag 鍐冲畾鍖哄煙锛夛紝鏈懡涓互 CN 鍖哄厹搴?        let Some(entry) = qoder_upstream::resolve(
+        &_bare_model,
+        crate::tasks::qoder_realm::region(pool_tag),
+    )
+    .or_else(|| qoder_upstream::resolve(&_bare_model, qoder_upstream::QoderRegion::Cn))
+    else {
+            // 瀹℃煡淇锛氳蛋 "upstream {status} error:" 鍙В鏋愰€氶亾鈥斺€旈潪娴佸紡閿欒
+            // 瑙ｆ瀽鎸夊墠缂€鎻愬彇鐘舵€佺爜锛岃８娑堟伅姝ゅ墠钀?503锛屼笌娴佸紡 404 璇箟涓嶄竴鑷?            return Err(format!("upstream 404 error: model {model} not in Qoder catalog"));
+        };
+        // 鍖哄煙杈圭晫鎵ц鍏ュ彛妫€鏌ワ紙瀹℃煡淇锛夛細鍚?run_qoder_stream锛孏lobal 涓撳睘
+        // 鏉＄洰鍦?*鍥藉唴鐗堟睜**鎵ц蹇呮锛屾槑纭嫆缁濊€岄潪閫忎紶涓婃父璇″紓鎶ラ敊锛涘浗闄呯増姹?        // 锛坧ool_tag == qoder_intl锛夋湰灏辨墦 Global 缃戝叧锛屽簲褰撴斁琛岋紙姝ゅ墠婕忔瀹堝崼锛?        // 鍥介檯鐗堜笓灞炴ā鍨嬭 404 鎷︽锛?        if pool_tag != "qoder_intl" && entry_is_global_only(&model, &entry) {
+            return Err(format!(
+                "upstream 404 error: model {model} only available in Qoder Global region, not yet supported"
+            ));
+        }
+        let model_key = entry
+            .get("upstreamKey")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let model_source = entry
+            .pointer("/config/source")
+            .and_then(Value::as_str)
+            .unwrap_or("system")
+            .to_string();
+        // issue #111锛氬厤璐规。妯″瀷锛堝€嶇巼 0锛夐浂娑堣€楋紝鍙栧彿璞佸厤绉垎缁村害杩囨护锛屽悓娴佸紡璺緞銆?        // 鍏嶈垂娲诲姩瑕嗙洊锛堣祫婧愯皟搴﹂〉寮€鍏筹級鍦ㄥ湴鍖轰笓灞炲垽瀹氫箣鍚庡簲鐢紙鍚屾祦寮忔敞閲婏級
+        let entry = {
+            let mut e = entry;
+            qoder_upstream::apply_flash_free_override(
+                &mut e,
+                state
+                    .qoder_flash_free_rate
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            e
+        };
+        let free_model = qoder_upstream::entry_is_free(&entry);
+
+        let (allowed_set, dedicated) =
+            super::api_keys::constraints_for(&state.data_dir, &key_id)
+                .and_then(|k| k.pool_constraints("qoder"))
+                .map_or((None, None), |c| (c.allowed, c.dedicated));
+
+        // F-80-浣?v2 浼氳瘽绮樻€э紙鍚?run_qoder_stream锛涘紑鍏冲叧闂亽 None 淇濇寔 v1 琛屼负锛?        let sticky_key = SessionKey::from_body(&peek);
+        let sticky0: Option<String> = if state
+            .qoder_sticky_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            state
+                .qoder_sticky
+                .resolve(&sticky_key, now_ts())
+                .and_then(|b| {
+                    if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
+                        return None;
+                    }
+                    state.qoder_pool_for(pool_tag).pick_by_uid(&b.uid, free_model).map(|_| b.uid)
+                })
+        } else {
+            None
+        };
+        let sticky_seed: String = peek
+            .get("session_id")
+            .and_then(Value::as_str)
+            .or_else(|| peek.get("user").and_then(Value::as_str))
+            .unwrap_or("-")
+            .to_string();
+        // 棣栭€夛細绮樻€?> 璋冨害绛栫暐锛團-77鈶ｏ細绮樻€ц处鍙?busy 涓旀湁绌洪棽鍊欓€夋椂璁╀綅锛?        let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
+            state
+                .qoder_pool_for(pool_tag)
+                .pick_sticky_yield(u, allowed_set.as_ref(), free_model)
+                .map(|(p, ev)| {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                })
+        });
+
+        let mut tried: HashSet<String> = HashSet::new();
+        let mut empty_hits: usize = 0; // 绌哄畬鎴愯鏁帮細杞崲鑰楀敖鏀跺熬鍖哄垎鎸囩汗鎷︽埅涓庤处鍙疯€楀敖
+        // 鎺掗槦绱绛夊緟涓庢渶鍚庡け璐ュ垎绫伙紙涓庢祦寮忚矾寰勫悓鍙ｅ緞锛岃 QUEUE_WAIT_BUDGET_SECS锛?        let mut queue_waited_secs: u64 = 0;
+        let mut last_kind: Option<UpstreamKind> = None;
+
+        loop {
+            // 鈹€鈹€ 鍙栧彿锛氱矘鎬у懡涓紭鍏堬紝鍚﹀垯鎸?Key 绾︽潫 + 璋冨害绛栫暐锛涙崲鍙峰悗浠呰蛋绛栫暐 鈹€鈹€
+            let picked = match first_pick.take() {
+                Some(p) => p,
+                None => match state.qoder_pool_for(pool_tag).pick_excluding_constrained_ev(
+                    &tried,
+                    allowed_set.as_ref(),
+                    dedicated.as_deref(),
+                    free_model,
+                ) {
+                    Some((p, ev)) => {
+                        if let Some(ev) = ev {
+                            state.logger.log_sched_event(&ev);
+                        }
+                        p
+                    }
+                    None => {
+                        state.record_usage_qoder(
+                            &model,
+                            "none",
+                            &key_id,
+                            false,
+                            stream,
+                            start_ts.elapsed().as_millis() as u64,
+                            0,
+                            0,
+                            None,
+                            None,
+                            None,
+                            &session_ctx(&peek),
+                        );
+                        // 瀹℃煡 P2锛氳疆鎹㈣€楀敖鏀跺熬瀵归綈 routes.rs鈥斺€旂┖瀹屾垚涓诲 鈫?鎸囩汗鎷︽埅璇箟
+                        // 2026-10-19 瀹炴満淇锛氭湯娆″け璐ユ槸銆屼笂娓告帓闃熴€嶁啋 闄愭祦璇箟鏀跺熬锛?29
+                        // 鍓嶇紑鐢辩鐐规槧灏勪负 429锛夛紝鑰屼笉鏄妸鍋ュ悍鐨勮处鍙锋姤鎴?no healthy account
+                        if last_kind == Some(UpstreamKind::Queued) {
+                            let msg =
+                                queue_budget_exhausted_msg(&model, queue_waited_secs, QUEUE_DEFAULT_BACKOFF_SECS);
+                            state.logger.log_debug_line(format!(
+                                "[DEBUG] UPSTREAM_QUEUE_TIMEOUT tried={} waited={}s pool=qoder",
+                                tried.len(),
+                                queue_waited_secs,
+                            ));
+                            return Err(format!("upstream 429 error: {msg}"));
+                        }
+                        let (healthy_total, _) = state.qoder_pool_for(pool_tag).selectable_stats_in(None, free_model);
+                        let (exhaust_msg, exhaust_tag) =
+                            super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        // issue #99 鈶狅細褰卞瓙椋庢帶鏀跺熬钀藉師濮嬫寚绾规牱鏈紙闈炴祦寮忚矾寰勬棤鏀跺熬
+                        // [DEBUG] 琛岋紝灏卞湴琛ラ綈锛涗笁姹犲悓鍙ｅ緞锛?                        if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                            state.logger.log_debug_line(format!(
+                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder 鎸囩汗鏍锋湰: {}",
+                                tried.len(),
+                                empty_hits,
+                                super::wb_payload::fingerprint_sample(&body_vec),
+                            ));
+                        }
+                        return Err(exhaust_msg);
+                    }
+                },
+            };
+            tried.insert(picked.uid.clone());
+            // 褰撳墠璐﹀彿鎺掗槦閲嶈瘯璁℃暟锛堣处鍙峰眬閮細鎹㈠彿鑷劧閲嶇疆锛?            let mut queue_same: u32 = 0;
+            // 瀹℃煡 P1-4 TOCTOU 鏀剁揣锛氭櫘閫氬€欓€?CAS 澶嶆牳銆屽湪閫?< 骞跺彂涓婇檺銆嶏紝宸叉弧鍒?            // 涓嶅彂璧疯姹傛崲涓嬩竴鍊欓€夛紙涓嶈閿欒涓嶅喎鍗达級锛沷ver_limit 鍊欓€夛紙绮樻€ч攣瀹氥€?            // busy_fallback 闄嶇骇锛変繚鐣欏師鏃犳潯浠剁粦瀹氳涔夈€?            // active_uid 浠呭湪缁戝畾鎴愬姛鍚庢洿鏂帮紙CAS 鎷掔粷鐨勫€欓€変笉寰楁薄鏌撱€屽綋鍓嶈处鍙枫€嶅睍绀猴級
+            let bound = if picked.over_limit {
+                guard = guard.bind_account(state.qoder_pool_for(pool_tag).inflight_handle(&picked.uid));
+                true
+            } else {
+                guard.bind_account_cas(
+                    state.qoder_pool_for(pool_tag).inflight_handle(&picked.uid),
+                    state.qoder_pool_for(pool_tag).concurrency_limit(),
+                )
+            };
+            if !bound {
+                continue;
+            }
+            *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+
+            let creds: QoderCreds = match state.qoder_identity.as_ref() {
+                None => continue, // 鍥炶皟鏈敞鍏ワ細鎹㈠彿锛坱ried 澧為暱鑷劧鑰楀敖鍚?503锛?                Some(resolve) => match resolve(&picked.uid) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // 瀹℃煡淇锛氱灛鏃跺け璐ヨ蛋 Server 鐔旀柇鍙嚜鎰堬紙鍚屾祦寮忚矾寰勶級
+                        let kind = if crate::tasks::qoder_common::is_transient_identity_err(&e) {
+                            ErrKind::Server
+                        } else {
+                            ErrKind::SessionDead
+                        };
+                        state.qoder_pool_for(pool_tag).note_error(&picked.uid, kind);
+                        // issue #67锛氱‖鍐峰嵈/绂佺敤绫婚敊璇В缁戣璐﹀彿绮樻€?                        if kind.unbinds_sticky() {
+                            state.qoder_sticky.unbind_uid(&picked.uid);
+                        }
+                        *safe_lock(&state.last_error) = Some(format!(
+                            // 瀹℃煡淇锛氬悓娴佸紡鍒嗘敮锛宔rr 鍘熸枃鎴柇鑴辨晱
+                            "qoder identity uid={} err={}",
+                            picked.uid,
+                            safe_slice(&e, 200)
+                        ));
+                        continue;
+                    }
+                },
+            };
+
+            let converted = match qoder_upstream::prepare_qoder_body(&peek, &entry, &creds.uid) {
+                Ok(b) => b,
+                Err(e) => return Err(e),
+            };
+            // 瀹℃煡淇 K锛氫俊灏?id 鍦ㄥ灞傝В鏋愪竴娆★紝鍐呭眰璁拌处澶嶇敤锛堝悓娴佸紡璺緞锛?            let envelope_ids = extract_envelope_ids(&converted);
+
+            let mut same_attempt: u32 = 0;
+            // 瀵瑰啿鎺ョ鏍囪锛氭帴绠″悗鎺掗槦鍚屽彿閫€閬夸笉閫傜敤锛堥噸璇曞嚟璇?璇锋眰浣撳睘涓昏处鍙凤級
+            #[allow(unused_assignments)]
+            let mut hedge_taken = false;
+            loop {
+                // F-76鈶?TTFT 閲囨牱锛堝悓 wb_route 鑱氬悎锛氬悇杞嫭绔嬭鏃讹紝鏈€缁堣疆鍗虫渶缁堝洖澶?TTFT锛?                let ttfb_start = Instant::now();
+                match qoder_upstream::make_qoder_request(
+                    &creds,
+                    &converted,
+                    &model_key,
+                    &model_source,
+                ) {
+                    Ok(reader) => {
+                        let err_slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
+                        // 棣栧瓧瓒呮椂 10s + F-80-浣?v2 绔為€熷鍐诧紙瀵瑰啿鍏抽棴鏃朵笌绾瀛?                        // 瓒呮椂璇箟涓€鑷达級锛氳秴鏃?鍙岃触瑙嗕负涓婃父鏁呴殰 鈫?鎹㈠彿
+                        let mut race = match race_qoder_first_byte(
+                            &state,
+                            pool_tag,
+                            &picked.uid,
+                            reader,
+                            &peek,
+                            &entry,
+                            &model_key,
+                            &model_source,
+                            &tried,
+                            allowed_set.as_ref(),
+                            dedicated.as_deref(),
+                            &envelope_ids,
+                        ) {
+                            Ok(w) => w,
+                            Err(()) => {
+                                state.qoder_pool_for(pool_tag).note_error(&picked.uid, ErrKind::Server);
+                                break;
+                            }
+                        };
+                        let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
+                        // 瀵瑰啿璁℃暟钀藉畾 + guard 閲嶇粦锛堟帴绠℃椂鐢熸晥璐﹀彿 = 瀵瑰啿璐﹀彿锛?                        guard = settle_qoder_hedge(&state, &mut race, guard, &picked.uid);
+                        hedge_taken = race.takeover;
+                        let win_uid = race.uid.clone();
+                        // G4锛氳璐︿細璇?id 鎸夎儨鑰呬俊灏佽惤瀹氾紙race 鍦ㄨ仛鍚堝琚儴鍒嗘秷璐癸紝鍏堝彇蹇収锛?                        let win_session_ids = race.session_ids.clone().or_else(|| envelope_ids.clone());
+                        // 绔為€熻儨鑰呭師濮嬭婧?鈫?缈昏瘧 鈫?鑱氬悎锛坱ool_calls 鍚堝苟/usage 鏀堕泦锛夛紱
+                        // 棣栧瓧瓒呮椂宸插湪 race 鍐呰瀹氾紝鑱氬悎闃舵鏃犲け璐ラ€氶亾
+                        let agg_chat_id = format!("chatcmpl-{}", now_ts());
+                        let translated =
+                            qoder_upstream::QoderTranslate::new(race.lines, err_slot.clone(), &agg_chat_id, &model);
+                        let (resp, error) = wb_sse::aggregate(translated, &agg_chat_id);
+                        let duration_ms = start_ts.elapsed().as_millis() as u64;
+                        match (resp, error) {
+                            (Some(mut r), None) => {
+                                r["model"] = json!(model);
+                                // M1 淇锛堝鏌ワ級锛歛s_u64 绐勫彛寰勬敼 wb_sse::u64_pair
+                                // 瀹藉彛寰勶紙瀛楃涓?娴偣褰㈡€佷笉鍐嶉潤榛樺緱 0锛?                                let (pt, ct) = r.get("usage").map(wb_sse::u64_pair).unwrap_or((0, 0));
+                                let (credits, original_credits) =
+                                    extract_billing(r.get("usage"));
+                                // issue #111锛氬厤璐规。璋冨害娑堣€楁寜 0 钀借处锛堝悓娴佸紡璺緞娉ㄩ噴锛?                                let (credits, original_credits) = if free_model {
+                                    (Some(0.0), Some(0.0))
+                                } else {
+                                    (credits, original_credits)
+                                };
+                                // M4锛氱紦瀛樿 tokens 鏃佽矾璁拌处锛堟垚鍔熺粓灞€锛? 鍊间笉鍏ヨ处锛?                                state.record_usage_cached(
+                                    super::usage::UsageBucket::Qoder,
+                                    r.get("usage").map(wb_sse::cached_tokens_of).unwrap_or(0),
+                                );
+                                state.record_usage_qoder(
+                                    &model, &win_uid, &key_id, true, stream, duration_ms, pt, ct,
+                                    Some(ttfb_ms),
+                                    credits,
+                                    original_credits,
+                                    &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
+                                );
+                                clear_model_cooldown(pool_tag, &model); // 瀹℃煡淇锛氭垚鍔熷嵆娓呮ā鍨嬬骇鍐峰嵈
+                                state.qoder_pool_for(pool_tag).note_success(&win_uid);
+                                // F-80-浣?v2锛氱粦瀹氱矘鎬т細璇濓紙寮€鍏冲紑鍚椂锛涘悓娴佸紡璺緞锛?                                if state
+                                    .qoder_sticky_enabled
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    state.qoder_sticky.bind(&sticky_key, &win_uid, &sticky_seed, now_ts());
+                                    state.qoder_sticky.save(&state.data_dir);
+                                }
+                                state.logger.log_request_ttfb(
+                                    "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
+                                    &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.qoder_pool_for(pool_tag).name_of(&win_uid), None,
+                                );
+                                return Ok(r);
+                            }
+                            (None, Some((code, msg))) => {
+                                let meta = err_slot
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                match meta.as_ref().map(|m| m.kind) {
+                                    Some(UpstreamKind::Queued) => {
+                                        // 鎺掗槦锛氬悓鍙烽€€閬块噸璇曚负涓伙紙瀵瑰啿鎺ョ鍚庝笉閫傜敤锛?                                        // 鍚屾祦寮忚矾寰勨€斺€旂洿鎺ユ崲鍙凤級锛涙ā鍨嬪凡鍦ㄥ喎鍗翠腑
+                                        // 鍒?break 鎹㈠彿锛堝揩閫熷け璐ワ紝瑙佷笅鏂瑰喎鍗存鏌ワ級
+                                        if !hedge_taken && queue_same < QUEUE_RETRY_LIMIT {
+                                            let secs = meta
+                                                .as_ref()
+                                                .and_then(|m| m.queue.as_ref())
+                                                .and_then(|q| q.retry_after_secs)
+                                                .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
+                                                .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                            last_kind = Some(UpstreamKind::Queued);
+                                            // 鎺掗槦鎬婚绠楋細瓒呴绠楀嵆鏀跺熬锛?29 鍓嶇紑鐢辩鐐?                                            // 鏄犲皠涓?429锛夛紝涓嶅啀鎶婅姹傛嫋鍒板垎閽熺骇
+                                            if queue_budget_exceeded(queue_waited_secs, secs) {
+                                                state.record_usage_qoder(
+                                                    &model, &win_uid, &key_id, false, stream,
+                                                    duration_ms, 0, 0, None, None, None,
+                                                    &session_ctx(&peek),
+                                                );
+                                                let msg = queue_budget_exhausted_msg(
+                                                    &model,
+                                                    queue_waited_secs,
+                                                    secs,
+                                                );
+                                                state.logger.log_request_ttfb(
+                                                    "qoder", "POST", "/v1/chat/completions",
+                                                    &model, stream, 429, &win_uid, duration_ms,
+                                                    Some(ttfb_ms), &key_name,
+                                                    &state.qoder_pool_for(pool_tag).name_of(&win_uid),
+                                                    Some("涓婃父鎺掗槦瓒呴绠楋紝鏀跺熬 429"),
+                                                );
+                                                return Err(format!("upstream 429 error: {msg}"));
+                                            }
+                                            // 瀹℃煡淇锛氭ā鍨嬬骇鍐峰嵈锛堝悓娴佸紡鍒嗘敮锛夆€斺€?                                            // 鍐峰嵈涓洿鎺ョ粓姝㈣疆鎹㈣繑鍥?429锛坲pstream
+                                            // 鍓嶇紑鍊熷姪绔偣鐘舵€佺爜閫忎紶鏄犲皠锛夛紝涓嶅啀閫愯处鍙风‖鎵?                                            match cooldown_gate(pool_tag, &model, None) {
+                                                CooldownGate::Waited => {
+                                                    queue_same += 1;
+                                                    continue;
+                                                }
+                                                CooldownGate::None => {}
+                                                CooldownGate::Hard(rem) => {
+                                                    state.record_usage_qoder(
+                                                        &model, &win_uid, &key_id, false, stream,
+                                                        duration_ms, 0, 0, None, None, None,
+                                                        &session_ctx(&peek),
+                                                    );
+                                                    state.logger.log_request_ttfb(
+                                                        "qoder", "POST", "/v1/chat/completions",
+                                                        &model, stream, 429, &win_uid, duration_ms,
+                                                        Some(ttfb_ms), &key_name,
+                                                        &state.qoder_pool_for(pool_tag).name_of(&win_uid),
+                                                        Some("妯″瀷鍐峰嵈涓紝缁堟杞崲"),
+                                                    );
+                                                    return Err(format!(
+                                                        "upstream 429 error: model {model} cooling down, retry after {rem}s"
+                                                    ));
+                                                }
+                                                // 闈炴祦寮忔棤涓嬭閫氶亾锛坱x=None锛夆啋 涓嶄細鏂繛
+                                                CooldownGate::Disconnected => {}
+                                            }
+                                            note_model_cooldown(pool_tag, &model, secs);
+                                            queue_same += 1;
+                                            // 缁熶竴璧?sleep_interruptible(None)锛氬垎娈电瓑寰咃紝
+                                            // 涓庢祦寮忓疄鐜板彛寰勪竴鑷达紙闈炴祦寮忔棤涓嬭閫氶亾浼?None锛?                                            // 璇箟绛夊悓鏁存 sleep锛屼粎灏佽缁熶竴锛?                                            sleep_interruptible(Duration::from_secs(secs), None);
+                                            queue_waited_secs = queue_waited_secs.saturating_add(secs);
+                                            continue;
+                                        }
+                                        break; // 瓒呴檺鎹㈠彿
+                                    }
+                                    Some(kind) => {
+                                        last_kind = Some(kind);
+                                        let ek = kind.to_err_kind();
+                                        if ek != ErrKind::None {
+                                            state.qoder_pool_for(pool_tag).note_error(&win_uid, ek);
+                                            // issue #67 瀹℃煡淇锛氳处鍙风骇闀垮喎鍗磋В缁戠矘鎬э紙涓庢祦寮忓垎鏀彛寰勫榻愶級
+                                            if ek.unbinds_sticky() {
+                                                state.qoder_sticky.unbind_uid(&win_uid);
+                                            }
+                                        }
+                                        // issue #90 淇鈶狅細鍚屾祦寮忓垎鏀紙闈炴祦寮忔棤閮ㄥ垎娴佸嚭姒傚康锛?                                        if kind == UpstreamKind::Server {
+                                            note_model_server_cooldown(pool_tag, &model);
+                                        }
+                                    }
+                                    None => {
+                                        state.qoder_pool_for(pool_tag).note_error(&win_uid, ErrKind::Server);
+                                    }
+                                }
+                                *safe_lock(&state.last_error) = Some(format!(
+                                    "qoder uid={} model={} code={} msg={} at {}",
+                                    win_uid,
+                                    model,
+                                    code,
+                                    msg,
+                                    now_cn_timestamp()
+                                ));
+                                state.logger.log_request_ttfb(
+                                    "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
+                                    &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.qoder_pool_for(pool_tag).name_of(&win_uid), Some(&msg),
+                                );
+                                // 娴佸唴閿欒涓旀湭浜у嚭鍐呭 鈫?鎹㈠彿閲嶈瘯
+                                break;
+                            }
+                            _ => {
+                                // (None, None)锛欵OF 闆跺畬鎴愶紙褰卞瓙椋庢帶/涓婃父寮傚父锛夆€斺€旇鏁板悗鎹㈠彿
+                                empty_hits += 1;
+                                state.qoder_pool_for(pool_tag).note_error(&win_uid, ErrKind::Server);
+                                state.logger.log_request_ttfb(
+                                    "qoder", "POST", "/v1/chat/completions", &model, stream, 502,
+                                    &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.qoder_pool_for(pool_tag).name_of(&win_uid),
+                                    Some("empty response"),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Err((status, resp_body, retry_after)) => {
+                        match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                            RetryAction::RetrySame { delay_ms } => {
+                                same_attempt += 1;
+                                sleep_interruptible(
+                                    Duration::from_millis(delay_ms.min(60_000)),
+                                    None,
+                                );
+                                continue;
+                            }
+                            RetryAction::SwitchKey => {
+                                let classified =
+                                    qoder_upstream::classify_upstream_error(status, &resp_body);
+                                if classified.kind == UpstreamKind::Queued
+                                    && queue_same < QUEUE_RETRY_LIMIT
+                                {
+                                    let secs = classified
+                                        .queue
+                                        .as_ref()
+                                        .and_then(|q| q.retry_after_secs)
+                                        .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
+                                        .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                    // 瀹℃煡淇锛氭ā鍨嬬骇鍐峰嵈锛堝悓娴佸紡鍒嗘敮锛夆€斺€斿喎鍗翠腑
+                                    // 鐩存帴缁堟杞崲杩斿洖 429锛屼笉鍐嶉€愯处鍙风‖鎵?                                    match cooldown_gate(pool_tag, &model, None) {
+                                        CooldownGate::Waited => {
+                                            queue_same += 1;
+                                            continue;
+                                        }
+                                        CooldownGate::None => {}
+                                        CooldownGate::Hard(rem) => {
+                                            state.record_usage_qoder(&model, &picked.uid, &key_id,
+                                                false, stream,
+                                                start_ts.elapsed().as_millis() as u64, 0, 0,
+                                                None, None, None, &session_ctx(&peek));
+                                            state.logger.log_request(
+                                                "qoder", "POST", "/v1/chat/completions", &model,
+                                                stream, 429, &picked.uid,
+                                                start_ts.elapsed().as_millis() as u64, &key_name,
+                                                &state.qoder_pool_for(pool_tag).name_of(&picked.uid),
+                                                Some("妯″瀷鍐峰嵈涓紝缁堟杞崲"),
+                                            );
+                                            return Err(format!(
+                                                "upstream 429 error: model {model} cooling down, retry after {rem}s"
+                                            ));
+                                        }
+                                        // 闈炴祦寮忔棤涓嬭閫氶亾锛坱x=None锛夆啋 涓嶄細鏂繛
+                                        CooldownGate::Disconnected => {}
+                                    }
+                                    note_model_cooldown(pool_tag, &model, secs);
+                                    queue_same += 1;
+                                    // 瀹℃煡 Low锛氬榻愬悓鍑芥暟鍏朵綑闈炴祦寮忛€€閬跨偣锛岀粺涓€璧?                                    // sleep_interruptible(None)锛堝垎娈电瓑寰咃紝闈炴祦寮忔棤
+                                    // 涓嬭閫氶亾浼?None锛岃涔夌瓑鍚屾暣娈?sleep锛屼粎灏佽缁熶竴锛?                                    sleep_interruptible(Duration::from_secs(secs), None);
+                                    continue;
+                                }
+                                let kind = classified.kind.to_err_kind();
+                                if kind != ErrKind::None {
+                                    state.qoder_pool_for(pool_tag).note_error(&picked.uid, kind);
+                                    // issue #67锛氱‖鍐峰嵈/绂佺敤绫婚敊璇В缁戣璐﹀彿绮樻€?                                    if kind.unbinds_sticky() {
+                                        state.qoder_sticky.unbind_uid(&picked.uid);
+                                    }
+                                }
+                                // issue #90 淇鈶狅細鍚屾祦寮?HTTP 鍒嗘敮锛?xx 鎹㈠彿鍓嶈妯″瀷绾у喎鍗达級
+                                if classified.kind == UpstreamKind::Server {
+                                    note_model_server_cooldown(pool_tag, &model);
+                                }
+                                *safe_lock(&state.last_error) = Some(format!(
+                                    "qoder uid={} model={} status={} body={} at {}",
+                                    picked.uid,
+                                    model,
+                                    status,
+                                    safe_slice(&resp_body, 200),
+                                    now_cn_timestamp()
+                                ));
+                                // 璁拌处鍙ｅ緞瀵归綈娴佸紡璺緞锛堟瘡璇锋眰涓€琛岋級锛氭崲鍙蜂腑闂存€佷笉璁?                                // usage锛堝師鑱氬悎璺緞姣忔鎹㈠彿澶氳涓€鏉″け璐ワ紝qoder 妗?                                // requests/errors 铏氶珮锛夛紱鏈€缁?no-healthy 鐢卞彇鍙峰垎鏀褰?                                state.logger.log_request(
+                                    "qoder", "POST", "/v1/chat/completions", &model, stream,
+                                    status, &picked.uid,
+                                    start_ts.elapsed().as_millis() as u64, &key_name,
+                                    &state.qoder_pool_for(pool_tag).name_of(&picked.uid),
+                                    Some(&format!("upstream status={status}")),
+                                );
+                                break;
+                            }
+                            RetryAction::Fatal => {
+                                // 缁堟€佽璐﹀榻愩€屾瘡璇锋眰涓€琛屻€嶅彛寰勶紙瀹℃煡 F3锛夛細Fatal 鏄?                                // 璇锋眰缁堝眬锛堝悓 no-healthy 鐢卞彇鍙峰垎鏀褰曪級锛屾鍓嶄粎
+                                // log_request 瀵艰嚧鐢ㄩ噺缁熻椤电己鍙?                                state.record_usage_qoder(&model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                    None, None, None, &session_ctx(&peek));
+                                state.logger.log_request(
+                                    "qoder", "POST", "/v1/chat/completions", &model, stream,
+                                    status, &picked.uid,
+                                    start_ts.elapsed().as_millis() as u64, &key_name,
+                                    &state.qoder_pool_for(pool_tag).name_of(&picked.uid),
+                                    Some(&safe_slice(&resp_body, 300)),
+                                );
+                                return Err(format!(
+                                    "upstream {} error: {}",
+                                    status,
+                                    safe_slice(&resp_body, 300)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => {
+            let body = match proto {
+                Protocol::Anthropic => wb_sse::completion_to_anthropic(
+                    &resp,
+                    &format!("msg_{}", now_ts()),
+                    &model_out,
+                ),
+                Protocol::OpenAiText => wb_sse::completion_to_text(&resp, &model_out),
+                Protocol::Responses => super::wb_responses::completion_to_responses(
+                    &resp,
+                    &format!("resp_{}", now_ts()),
+                    &model_out,
+                    // Qoder 鏃?namespace 灞曞钩缂栫爜锛圧esponses 鍒嗘敮涓洪槻寰℃€у厹搴曪級
+                    &std::collections::HashSet::new(),
+                ),
+                Protocol::OpenAi => resp,
+            };
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap_or_else(|_| internal_error_response())
+        }
+        Ok(Err(msg)) => {
+            // 瀹℃煡淇锛堝榻?wb_aggregate_chat锛夛細Fatal 閿欒閫忎紶涓婃父鐘舵€佺爜鈥斺€?            // 涓婃父 400/404/413 绛夎姹傜骇閿欒涓嶉檷绾?503锛岄伩鍏嶄弗鏍煎鎴风鏃犳剰涔夐噸璇曪紱
+            // 401/403 缁存寔 503 璇箟锛?29 涓烘ā鍨嬪喎鍗翠富鍔ㄩ檺娴侊紙瀹℃煡涓瓑椤癸級锛岄€忎紶
+            // 璁╁鎴风鎸?Retry-After 璇箟閫€閬胯€岄潪绔嬪嵆閲嶈瘯
+            let upstream_status = msg
+                .strip_prefix("upstream ")
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|s| s.parse::<u16>().ok());
+            let status = match upstream_status {
+                Some(s) if (400..500).contains(&s) && !matches!(s, 401 | 403) => {
+                    StatusCode::from_u16(s).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+                }
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            let resp = match proto {
+                Protocol::Anthropic => anthropic_error(status, "api_error", &msg),
+                _ => openai_error(status, "upstream_error", &msg),
+            };
+            // 429 鐨勫喎鍗村墿浣欑鏁板彧鍦ㄦ枃妗堥噷锛圗rr(String) 鏃犵粨鏋勯€氶亾锛夆€斺€斿洖鏀跺悗琛ユ垚
+            // Retry-After 澶达紝瀹㈡埛绔墠鎸夈€岃繕鍓╁嚑绉掋€嶉€€閬胯€屼笉鏄嚜宸辩寽
+            match (status, super::routes::retry_after_in_msg(&msg)) {
+                (StatusCode::TOO_MANY_REQUESTS, Some(secs)) => {
+                    super::routes::with_retry_after(resp, secs)
+                }
+                _ => resp,
+            }
+        }
+        Err(e) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            &format!("task join error: {}", e),
+        ),
+    }
+}
+
+// ==================== 灏忓伐鍏?====================
+
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 娴佸唴閿欒甯т笅鍙戯紙鑷妱 send_stream_error_wb锛氱鏈変笉鍙鐢紱褰㈡€佸悓鏋勶級
+fn send_stream_error(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    proto: Protocol,
+    code: i64,
+    msg: &str,
+) {
+    let msg = stream_msg_or_fallback(msg, code);
+    match proto {
+        Protocol::Anthropic => {
+            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: error\ndata: {}\n\n",
+                err
+            ))));
+        }
+        Protocol::Responses => {
+            let resp = json!({
+                "id": format!("resp_{}", now_ts()),
+                "object": "response",
+                "status": "failed",
+                "output": [],
+                "error": {"code": code.to_string(), "message": msg},
+            });
+            let body = json!({"type": "response.failed", "response": resp});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: response.failed\ndata: {}\n\n",
+                body
+            ))));
+        }
+        _ => {
+            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        }
+    }
+}
+
+fn internal_error_response() -> Response {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Body::from("{\"error\":{\"message\":\"internal error\"}}"))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== 鏂规 C锛氬弻鍖哄畾鍖哄彛寰?====================
+
+    /// 瀹氬尯涓夌骇浼樺厛绾?+ 鍥介檯姹犲紑鍏冲洖钀斤細
+    /// 妯″瀷鍓嶇紑 > Key 缁戝尯 > 榛樿鍖哄煙锛汭NTL 鍦ㄥ紑鍏冲叧闂椂鍥炶惤 CN锛堜笌 dispatch 鍚屽彛寰勶級
+    #[test]
+    fn realm_pool_tag_priority_and_intl_switch() {
+        use crate::tasks::qoder_realm::{pool_tag, CN, INTL};
+        // 鏃犳樉寮忓墠缂€/缁戝畾 鈫?榛樿鍖哄煙锛堥粯璁?CN锛岃缃」 INTL 鏃跺彇鍥介檯姹狅級
+        assert_eq!(realm_pool_tag_from(None, None, "", true), pool_tag(CN));
+        assert_eq!(realm_pool_tag_from(None, None, "intl", true), pool_tag(INTL));
+        assert_eq!(realm_pool_tag_from(None, None, "Global", true), pool_tag(INTL));
+        // 妯″瀷鍓嶇紑鍘嬭繃 Key 缁戝尯涓庨粯璁ゅ尯鍩燂紝涓斿紑鍏冲紑鍚椂鐢熸晥
+        assert_eq!(
+            realm_pool_tag_from(Some(INTL), Some(CN), "cn", true),
+            pool_tag(INTL)
+        );
+        assert_eq!(
+            realm_pool_tag_from(Some(CN), Some(INTL), "intl", true),
+            pool_tag(CN)
+        );
+        // Key 缁戝尯鍘嬭繃榛樿鍖哄煙
+        assert_eq!(
+            realm_pool_tag_from(None, Some(INTL), "cn", true),
+            pool_tag(INTL)
+        );
+        // 鍥介檯鐗堟睜鍏抽棴 鈫?鍥介檯鍖轰竴寰嬪洖钀藉浗鍐呮睜锛堝墠缂€/缁戝畾/榛樿涓夋潯鍏ュ彛鍚岃鍒欙級
+        assert_eq!(realm_pool_tag_from(Some(INTL), None, "cn", false), pool_tag(CN));
+        assert_eq!(realm_pool_tag_from(None, Some(INTL), "cn", false), pool_tag(CN));
+        assert_eq!(realm_pool_tag_from(None, None, "intl", false), pool_tag(CN));
+        // 鍥藉唴鍖轰笉鍙楀紑鍏冲奖鍝?        assert_eq!(realm_pool_tag_from(Some(CN), None, "intl", false), pool_tag(CN));
+    }
+
+    // ==================== issue #90 淇鈶狅細Server 娓愯繘妯″瀷绾у喎鍗?====================
+
+    /// 鍐峰嵈琛ㄥ崟娴嬬粺涓€鐢ㄧ殑姹犳爣绛撅紙涓庣湡瀹炴睜鏃犲叧锛屽彧淇濊瘉骞惰娴嬭瘯浜掍笉涓查敭锛?    const TP: &str = "qoder_test";
+
+    /// Server 鍐峰嵈鎸夈€屽け璐ョ墖娈点€嶆笎杩涳紙绐楀彛杩囨湡鎵嶉€掑锛変笖灏侀《锛涙垚鍔熸竻闄ゅ悗褰掗浂銆?    /// 鍐峰嵈琛ㄦ槸杩涚▼绾у叡浜潤鎬侊紝鐢ㄧ嫭鍗犳ā鍨嬪悕锛堝墠缂€ + 璁℃暟鍣級閬垮厤骞惰娴嬭瘯浜掓壈銆?    #[test]
+    fn server_cooldown_progressive_capped_and_cleared() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let model = format!(
+            "t90-prog-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let key = cooldown_key(TP, &model);
+        assert!(model_cooling_remaining_secs(TP, &model).is_none());
+        // 鐗囨 1锛氬熀鍑?30s
+        note_model_server_cooldown(TP, &model);
+        let r1 = model_cooling_remaining_secs(TP, &model).unwrap();
+        assert!(r1 > 28 && r1 <= 30, "棣栨澶辫触搴斾负 30s 鍩哄噯锛屽疄闄?{r1}");
+        // 鍚岀墖娈靛唴杩炵画璁拌处锛堜竴娆¤姹傞€愯处鍙锋崲鍙峰満鏅紝绐楀彛鏈繃鏈燂級锛?        // 涓嶉€掑鐗囨鏁帮紝绐楀彛浠呭欢闀匡紙鍓╀綑浠?鈮?0s锛岀粷涓嶇炕鍊嶏級
+        for _ in 0..4 {
+            note_model_server_cooldown(TP, &model);
+        }
+        let (_, fails) = *cooldown_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .unwrap();
+        assert_eq!(fails, 1, "绐楀彛鏈繃鏈熸椂杩炵画璁拌处涓嶅緱閫掑鐗囨鏁?);
+        // 浜轰负鎺ㄨ繘鍒扮獥鍙ｈ繃鏈燂紙涓嶇湡绛?30s锛夛細鐗囨 2 鈫?缈诲€?60s
+        cooldown_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), (Instant::now() - Duration::from_secs(1), 1));
+        note_model_server_cooldown(TP, &model);
+        let r2 = model_cooling_remaining_secs(TP, &model).unwrap();
+        assert!(r2 > 55 && r2 <= 60, "杩囨湡鍚庢柊鐗囨搴旂炕鍊嶈嚦 60s锛屽疄闄?{r2}");
+        // 杩炵画澶辫触鐗囨鑷冲皝椤讹細绐楀彛鎭?鈮?480s
+        for _ in 0..10 {
+            let cur = cooldown_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .copied()
+                .unwrap();
+            cooldown_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key.clone(), (Instant::now() - Duration::from_secs(1), cur.1));
+            note_model_server_cooldown(TP, &model);
+        }
+        let capped = model_cooling_remaining_secs(TP, &model).unwrap();
+        assert!(capped <= SERVER_COOLDOWN_MAX_SECS, "鍐峰嵈绐楀彛搴斿皝椤?480s锛屽疄闄?{capped}");
+        // 鎴愬姛娓呴櫎 鈫?鏃犲喎鍗达紙鐗囨璁℃暟闅忎箣褰掗浂锛?        clear_model_cooldown(TP, &model);
+        assert!(model_cooling_remaining_secs(TP, &model).is_none());
+    }
+
+    /// 鎺掗槦閫€閬匡紙note_model_cooldown锛変笉缂╃煭鏃㈡湁 Server 鍐峰嵈绐楀彛锛氭帓闃熷缓璁€?    /// 锛堥挸鍒?鈮?0s锛夊埌杈炬椂鑻ュ苟鍙戣姹傚垰璁颁簡鏇撮暱鐨?Server 绐楀彛锛屽簲鍙栬緝澶ц€呫€?    #[test]
+    fn queued_cooldown_does_not_shorten_server_window() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let model = format!(
+            "t90-queue-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        // 涓ゆ Server 澶辫触锛堝悓涓€鐗囨鍐咃級鈫?绐楀彛缁存寔鍩哄噯 ~30s 涓嶅悗寤?        note_model_server_cooldown(TP, &model);
+        note_model_server_cooldown(TP, &model);
+        let before = model_cooling_remaining_secs(TP, &model).unwrap();
+        // 鎺掗槦閫€閬垮缓璁?5s锛氫笉寰楁妸 60s 绐楀彛缂╃煭
+        note_model_cooldown(TP, &model, 5);
+        let after = model_cooling_remaining_secs(TP, &model).unwrap();
+        assert!(
+            after >= before.saturating_sub(1),
+            "鎺掗槦寤鸿鍊间笉寰楃缉鐭棦鏈?Server 绐楀彛锛坽before} 鈫?{after}锛?
+        );
+        clear_model_cooldown(TP, &model);
+    }
+
+    /// 鍥炲綊锛氭帓闃熼€€閬垮厛鎻掑叆 fails=0 鏉＄洰锛坣ote_model_cooldown 鐨?or_insert 璺緞锛夛紝
+    /// 闅忓悗 Server 澶辫触杩涘叆 and_modify 鈥斺€?fails=0 涓嶅緱涓嬫孩锛堟浘涓?`*fails - 1`锛?    /// debug panic / release 鍐峰嵈琚敊璇帹鍒?480s锛夛紝搴斾繚鎸佸熀鍑?30s 涓旇鏁颁笉鍔?    #[test]
+    fn server_cooldown_after_queued_only_entry_no_underflow() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let model = format!(
+            "t90-queue0-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        // 鎺掗槦閫€閬垮厛钀芥潯鐩細fails = 0
+        note_model_cooldown(TP, &model, 5);
+        // Server 澶辫触锛氱獥鍙ｆ湭杩囨湡锛?s 鍐咃級涓嶉€掑璁℃暟锛屽熀鍑?30s 鍏滃簳
+        note_model_server_cooldown(TP, &model);
+        let r = model_cooling_remaining_secs(TP, &model).unwrap();
+        assert!(r > 28 && r <= 30, "fails=0 鏃跺簲涓?30s 鍩哄噯绐楀彛锛屽疄闄?{r}");
+        let (_, fails) = *cooldown_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&cooldown_key(TP, &model))
+            .unwrap();
+        assert_eq!(fails, 0, "绐楀彛鏈繃鏈熶笉寰楅€掑澶辫触璁℃暟");
+        clear_model_cooldown(TP, &model);
+    }
+
+    /// 鍥炲綊閿侊紙鏍瑰洜锛氬喎鍗磋〃瑁稿悕鍋氶敭锛夆€斺€斿悓鍚嶆ā鍨嬪湪涓ゅ尯鍚勮嚜鍐峰嵈锛屼簰涓嶅奖鍝嶏細
+    /// 鍥藉唴鍖烘寕涓婄殑鎺掗槦绐楀彛涓嶅緱鎶婂浗闄呭尯璇锋眰鎵撴垚銆宷oder-intl/x cooling down銆嶏紱
+    /// 鍖哄墠缂€褰㈡€侊紙`qoder-intl/x`锛変笌瑁稿悕鎶樺彔涓哄悓涓€鏉＄洰锛堟竻鍐峰嵈涓嶄細婕忔竻锛夈€?    #[test]
+    fn model_cooldown_is_region_scoped() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let model = format!(
+            "t91-region-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        note_model_cooldown("qoder_cn", &model, 60);
+        assert!(
+            model_cooling_remaining_secs("qoder_intl", &model).is_none(),
+            "鍥藉唴鍖哄喎鍗翠笉寰椾紶鏌撳埌鍥介檯鍖?
+        );
+        assert!(model_cooling_remaining_secs("qoder_cn", &model).is_some());
+        // 鍖哄墠缂€涓庤８鍚嶅悓閿細甯﹀墠缂€鏌ヨ鍛戒腑鍚屼竴绐楀彛
+        let prefixed = format!("qoder-intl/{model}");
+        note_model_cooldown("qoder_intl", &prefixed, 30);
+        assert!(model_cooling_remaining_secs("qoder_intl", &model).is_some());
+        // 娓呭喎鍗村鍓嶇紑褰㈡€佸悓鏍风敓鏁堬紙鎴愬姛鍗虫竻涓嶇暀娈嬫潯锛?        clear_model_cooldown("qoder_intl", &model);
+        assert!(model_cooling_remaining_secs("qoder_intl", &prefixed).is_none());
+        clear_model_cooldown("qoder_cn", &model);
+    }
+
+    /// 鍐峰嵈鍓╀綑绉掓暟鍚戜笂鍙栨暣锛氬墿浣欎笉瓒?1s 鏃朵笉寰楁姤 0锛堟棫瀹炵幇 `as_secs()` 鎴柇锛?    /// 瀹㈡埛绔寜銆宺etry after 0s銆嶇珛鍗抽噸璇曞張浼氭挒鍦ㄧ獥鍙ｉ噷锛夛紝杩囨湡鎵嶈繑鍥?None
+    #[test]
+    fn cooling_remaining_rounds_up_and_expires() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let model = format!(
+            "t91-ceil-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let key = cooldown_key(TP, &model);
+        // 鍓╀綑 300ms锛氬悜涓婂彇鏁?= 1s锛堢粷涓?0锛?        cooldown_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), (Instant::now() + Duration::from_millis(300), 1));
+        assert_eq!(model_cooling_remaining_secs(TP, &model), Some(1));
+        // 宸茶繃鏈?鈫?None锛堟畫鐣欐潯鐩寜鏃犲喎鍗村鐞嗭級
+        cooldown_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (Instant::now() - Duration::from_millis(1), 1));
+        assert!(model_cooling_remaining_secs(TP, &model).is_none());
+    }
+
+    /// issue #82 T2.3锛歝redits 澶嶆暟浼樺厛锛堟柊鐗堝瓧娈碉級锛屽崟鏁?credit 涓烘棫鐗堝厹搴?    #[test]
+    fn extract_billing_prefers_plural_credits() {
+        let u = json!({"credits": 12.5, "credit": 0, "original_credits": 25.0});
+        let (c, o) = extract_billing(Some(&u));
+        assert_eq!(c, Some(12.5));
+        assert_eq!(o, Some(25.0));
+        // 浠呮湁鏃х増鍗曟暟瀛楁鏃跺厹搴曞彲璇伙紙鏂拌皟鐢ㄦ柟 None 缂虹渷涓嶅啀璧版璺級
+        let old = json!({"credit": 7});
+        let (c, o) = extract_billing(Some(&old));
+        assert_eq!(c, Some(7.0));
+        assert_eq!(o, None);
+    }
+
+    /// issue #82 T2.3锛氬弻瀛楁鍧囩己 鈫?None锛堣皟鐢ㄦ柟涓嶅叆璐︼紝涓嶅緱浼€?0锛?    #[test]
+    fn extract_billing_missing_fields_yields_none() {
+        assert_eq!(extract_billing(None), (None, None));
+        let empty = json!({"prompt_tokens": 10, "completion_tokens": 5});
+        assert_eq!(extract_billing(Some(&empty)), (None, None));
+        let nulls = json!({"credits": null});
+        assert_eq!(extract_billing(Some(&nulls)), (None, None));
+    }
+
+    /// issue #82 T2.3锛氳礋鍊?闈炴湁闄愬€艰涓轰笉鍙俊锛屾暣浣撲笉鍏ヨ处
+    #[test]
+    fn extract_billing_rejects_negative() {
+        let neg = json!({"credits": -3.0});
+        assert_eq!(extract_billing(Some(&neg)), (None, None));
+        let neg_pair = json!({"credits": 5.0, "original_credits": -1.0});
+        let (c, o) = extract_billing(Some(&neg_pair));
+        assert_eq!(c, Some(5.0));
+        assert_eq!(o, None);
+    }
+
+    /// 浼氳瘽 preview 鍓ョ system-reminder 娉ㄥ叆鍧椾笌 <user_input> 鍖呰９鏍囩锛?    /// agent 瀹㈡埛绔妸鎻愰啋鎷煎湪姝ｆ枃鍓嶃€佽緭鍏ョ敤鏍囩鍖呰９锛宲review 蹇呴』鍙栧墺绂诲悗鐨?    /// 鐢ㄦ埛鍘熻瘽锛堝鍧?/ 璺ㄨ / 鍓嶇疆娈嬬暀绌虹櫧锛夈€?    #[test]
+    fn session_preview_strips_system_reminder_blocks() {
+        // 鍏稿瀷褰㈡€侊細澶氬潡 reminder 鍓嶇疆 + <user_input> 鍖呰９鐨勭敤鎴峰師璇?        let peek = json!({"messages": [{"role": "user", "content":
+            "<system-reminder>\nTodos have changed...\n# Todos\n- x\n</system-reminder>\n\n<system-reminder>The maximum number of terminals is 5</system-reminder>\n<user_input>\n璇翠竴涓?00瀛楃瑧璇漒n</user_input>"}]});
+        assert_eq!(session_preview(&peek), "璇翠竴涓?00瀛楃瑧璇?);
+
+        // 浠?<user_input> 鍖呰９銆佹棤 reminder
+        let wrapped = json!({"messages": [{"role": "user", "content":
+            "<user_input>鍐欎竴涓?00瀛楃瑧璇?/user_input>"}]});
+        assert_eq!(session_preview(&wrapped), "鍐欎竴涓?00瀛楃瑧璇?);
+
+        // 鍓ョ鍚庝粎鍓╃┖鐧?鈫?绌轰覆锛堣皟鐢ㄦ柟鎸夋棤 preview 澶勭悊锛屼笉灞曠ず娉ㄥ叆鍐呭锛?        let only_reminder = json!({"messages": [{"role": "user", "content":
+            "<system-reminder>绾敞鍏?/system-reminder>"}]});
+        assert_eq!(session_preview(&only_reminder), "");
+
+        // 鏃?reminder 鐨勬櫘閫氭秷鎭笉鍙楀奖鍝嶏紱鏈潯 user 鎵嶆槸鍙栧€兼潵婧?        let plain = json!({"messages": [
+            {"role": "user", "content": "绗竴鏉?},
+            {"role": "assistant", "content": "鍥炲"},
+            {"role": "user", "content": "<system-reminder>x</system-reminder> 鍐欎竴涓?00瀛楃瑧璇?}
+        ]});
+        assert_eq!(session_preview(&plain), "鍐欎竴涓?00瀛楃瑧璇?);
+
+        // reminder 涔嬪悗鍐嶆棤姝ｆ枃 鈫?绌猴紱reminder 鍐呭惈 "</system-reminder>" 瀛楁牱涔熸寜鏁村潡鍖归厤锛堥潪璐┆锛?        let empty_tail = json!({"messages": [{"role": "user", "content":
+            "鍓嶆枃<system-reminder>娉ㄥ叆</system-reminder>  \n"}]});
+        assert_eq!(session_preview(&empty_tail), "鍓嶆枃");
+    }
+
+    /// 杩滅▼鐩綍娴嬭瘯鏉＄洰锛坅dopt_remote 鎺ュ彈鐨勬渶灏忓悎娉曚俊灏佽浇鑽凤級
+    fn remote_entry(key: &str, display: &str, factor: f64) -> Value {
+        json!({
+            "key": key,
+            "display_name": display,
+            "enable": true,
+            "is_vl": false,
+            "is_reasoning": true,
+            "price_factor": factor,
+            "max_input_tokens": 128000,
+            "source": "remote",
+        })
+    }
+
+    /// G4 纭畾鎬у垽瀹?remote 鎬侊細娉ㄥ叆鐙湁鍓嶇紑锛圱waG4锛夌殑鍙屽尯杩滅▼鐩綍锛?    /// 椤哄簭瑕嗙洊 entry_is_global_only 鐨勫叏閮ㄥ垎鏀€?    /// adopt_remote 鍐欒繘绋嬬骇鍏变韩鐩綍涓旇繙绋嬮潪绌烘椂浼氭浛鎹㈤潤鎬佸厹搴曗€斺€斿繀椤?    /// 鎸?catalog_test_guard 鐙崰骞跺湪閫€鍑猴紙鍚?panic锛夋椂鑷姩澶嶄綅鍥炶惤鍏滃簳锛?    /// 鍚﹀垯浼氭薄鏌撳苟琛岃繍琛岀殑鍏朵粬鐩綍娴嬭瘯锛堝 qoder_upstream 鐨?list 鍘婚噸锛夈€?    #[test]
+    fn entry_is_global_only_remote_states() {
+        let _catalog = qoder_upstream::catalog_test_guard();
+        // 鈶?CN 杩滅▼鐙湁锛歭ist 鏍囨敞 "cn"锛圙lobal 渚у畬鍏ㄦ棤姝?id锛夆啋 蹇呴潪涓撳睘
+        qoder_upstream::adopt_remote(
+            qoder_upstream::QoderRegion::Cn,
+            &json!({"statusCodeValue": 200,
+                    "chat": [remote_entry("twa4cn_key", "TwaG4CnOnly", 0.5)]}),
+        )
+        .unwrap();
+        let entry = qoder_upstream::resolve("TwaG4CnOnly", qoder_upstream::QoderRegion::Cn)
+            .expect("CN 杩滅▼鐩綍搴斿懡涓?);
+        assert!(!entry_is_global_only("TwaG4CnOnly", &entry));
+
+        // 鈶?Global 杩滅▼鐙湁锛圕N 渚ч浂鍙緱璇佹嵁锛夛細涓よ矾 resolve 鍚岃惤 Global 鏉＄洰
+        //    鈫?fail-closed 鍒や笓灞?        qoder_upstream::adopt_remote(
+            qoder_upstream::QoderRegion::Global,
+            &json!({"statusCodeValue": 200,
+                    "chat": [remote_entry("twa4g_key", "TwaG4GlobalOnly", 0.7)]}),
+        )
+        .unwrap();
+        let entry =
+            qoder_upstream::resolve("TwaG4GlobalOnly", qoder_upstream::QoderRegion::Cn)
+                .expect("鍙屽尯鍏滃簳搴斿懡涓?Global 鐙湁鏉＄洰");
+        assert!(entry_is_global_only("TwaG4GlobalOnly", &entry));
+
+        // 鈶?涓ゅ尯鍚屽悕浣嗗０鏄庝笉鍚岋紙Global 鍊嶇巼 0.7 / CN 鍊嶇巼 0.3锛夛細list 鏍囨敞琚?        //    Global 鍚炲苟涓?"global"锛屼絾涓よ矾 resolve 鍛戒腑涓嶅悓鏉＄洰 鈫?CN 杩滅▼
+        //    纭畾鍙緱 鈫?闈炰笓灞烇紙璇佹嵁鈶★紝涓嶅啀渚濊禆鍊煎叏绛夊亣璁剧殑鍙嶅悜鎺ㄦ柇锛?        qoder_upstream::adopt_remote(
+            qoder_upstream::QoderRegion::Global,
+            &json!({"statusCodeValue": 200,
+                    "chat": [remote_entry("twa4same_key", "TwaG4Same", 0.7)]}),
+        )
+        .unwrap();
+        qoder_upstream::adopt_remote(
+            qoder_upstream::QoderRegion::Cn,
+            &json!({"statusCodeValue": 200,
+                    "chat": [remote_entry("twa4same_key", "TwaG4Same", 0.3)]}),
+        )
+        .unwrap();
+        let entry = qoder_upstream::resolve("TwaG4Same", qoder_upstream::QoderRegion::Cn)
+            .expect("CN 杩滅▼鐩綍搴斿懡涓?);
+        assert!(!entry_is_global_only("TwaG4Same", &entry));
+
+        // 鈶?涓ゅ尯鍚屽悕涓斿悓鍊硷紙鏃с€屽悓鍚嶅繀寮傘€嶅亣璁捐鎵撶牬鐨勫満鏅級锛氱‘瀹氭€ц瘉鎹己澶?        //    鈫?绛栫暐鎬у垽涓撳睘锛坒ail-closed锛岃涓轰笌鏃х増涓€鑷淬€佷緷鎹敼涓烘樉寮忕瓥鐣ワ級
+        qoder_upstream::adopt_remote(
+            qoder_upstream::QoderRegion::Global,
+            &json!({"statusCodeValue": 200,
+                    "chat": [remote_entry("twa4same_key", "TwaG4Same", 0.3)]}),
+        )
+        .unwrap();
+        let entry = qoder_upstream::resolve("TwaG4Same", qoder_upstream::QoderRegion::Cn)
+            .expect("CN 杩滅▼鐩綍搴斿懡涓?);
+        assert!(entry_is_global_only("TwaG4Same", &entry));
+    }
+}

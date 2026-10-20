@@ -1,0 +1,461 @@
+//! 自定义模型上游执行路径（OpenAI 兼容直通）
+//!
+//! 与 WB 上游同策略：请求体强制 `stream:true`，上游只回 OpenAI 风格 SSE——
+//! - 流式：wb_sse::stream_forward 按客户端协议转发；
+//! - 非流式：wb_sse::aggregate 本地聚合为单个 OpenAI completion 后按协议转换。
+//!
+//! 与账号池路径的差异：无账号选取 / 无重试轮换 / 无脱敏 / 无粘性——
+//! 单上游单 Key，失败即错误直返（调度语义见 custom_models.rs）。
+//! 用量记账：独立 custom_days 桶（与 Trae/WB 侧分账，uid 固定 "custom"）。
+//!
+//! **上游组（合并增强）**：当该模型在 `upstream_pool` 里配了多端点时，请求先经
+//! SWRR 选点，**预流式**失败（连接/状态码阶段）按族退避记账并换下一个端点；
+//! 一旦开始下发 SSE 就不再切换（避免同一响应拼两段上游）。未配组 → 完全走原
+//! 单源语义，行为与旧版一致。
+//!
+//! **成本记账（合并增强）**：成功请求按 `pricing` 策略累加成本；无策略的模型
+//! 会在成本看板的「未定价」里显式列出（不静默记 0）。
+
+use std::path::Path;
+use std::time::Instant;
+
+use serde_json::{json, Value};
+
+use super::custom_models::{self, CustomModel};
+use super::routes::{anthropic_error, openai_error, send_stream_error, Protocol};
+use super::wb_sse;
+use super::wb_upstream;
+use super::{pricing, upstream_pool, ApiSharedState, InflightGuard};
+use axum::body::Body;
+use axum::http::StatusCode;
+use axum::response::Response;
+use std::io::Read;
+use std::sync::Arc;
+use tokio_stream::wrappers::ReceiverStream;
+
+/// 请求体准备：强制 stream:true（统一 SSE 处理）+ 模型名对齐自定义条目
+fn prep_body(body_vec: &[u8], cm: &CustomModel) -> Vec<u8> {
+    let mut v: Value = serde_json::from_slice(body_vec).unwrap_or_else(|_| json!({}));
+    v["stream"] = json!(true);
+    if !cm.name.is_empty() {
+        v["model"] = json!(cm.name);
+    }
+    v.to_string().into_bytes()
+}
+
+/// 单次上游请求（Bearer 鉴权；连接 10s / 空闲读 300s，复用 WB agent）
+fn send_once(
+    url: &str,
+    api_key: &str,
+    body: &[u8],
+) -> Result<Box<dyn Read + Send>, (u16, String)> {
+    let mut req = wb_upstream::wb_agent().post(url);
+    req = req.set("content-type", "application/json");
+    req = req.set("accept", "text/event-stream");
+    if !api_key.trim().is_empty() {
+        req = req.set("Authorization", &format!("Bearer {api_key}"));
+    }
+    match req.send_bytes(body) {
+        Ok(r) => Ok(Box::new(r.into_reader())),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body_text = resp.into_string().unwrap_or_default();
+            Err((code, body_text))
+        }
+        Err(e) => Err((502, format!("自定义上游传输错误: {e}"))),
+    }
+}
+
+/// 单源请求（旧语义；无上游组或组内端点全冷却时使用）
+fn make_custom_request(
+    cm: &CustomModel,
+    body: &[u8],
+) -> Result<Box<dyn Read + Send>, (u16, String)> {
+    send_once(&custom_models::chat_url(&cm.base_url), &cm.api_key, body)
+}
+
+/// 候选排序：SWRR 选中的端点排最前，其余按候选顺序作为回退
+fn ordered_targets(data_dir: &Path, cm: &CustomModel) -> Vec<upstream_pool::UpstreamEndpoint> {
+    let mut eps = upstream_pool::candidates(data_dir, &cm.name);
+    if eps.len() > 1 {
+        if let Some(first) = upstream_pool::pick(data_dir, &cm.name) {
+            if let Some(pos) = eps.iter().position(|e| e.id == first.id) {
+                let e = eps.remove(pos);
+                eps.insert(0, e);
+            }
+        }
+    }
+    eps
+}
+
+/// 带上游组的请求：预流式失败自动换端点（4xx 除 401/402/403/429 视为请求错误，不换）
+fn make_custom_request_pooled(
+    data_dir: &Path,
+    cm: &CustomModel,
+    body: &[u8],
+) -> Result<Box<dyn Read + Send>, (u16, String)> {
+    let targets = ordered_targets(data_dir, cm);
+    if targets.is_empty() {
+        return make_custom_request(cm, body);
+    }
+    let mut last: Option<(u16, String)> = None;
+    for ep in targets {
+        let url = custom_models::chat_url(&ep.base_url);
+        let key = if ep.api_key.trim().is_empty() {
+            cm.api_key.clone()
+        } else {
+            ep.api_key.clone()
+        };
+        match send_once(&url, &key, body) {
+            Ok(reader) => {
+                upstream_pool::record_success(&cm.name, &ep.id);
+                return Ok(reader);
+            }
+            Err((status, msg)) => {
+                let kind = upstream_pool::FailKind::from_status(Some(status));
+                upstream_pool::record_failure(&cm.name, &ep.id, kind, &msg);
+                let fatal = (400..500).contains(&status)
+                    && !matches!(status, 401 | 402 | 403 | 429);
+                last = Some((status, msg));
+                if fatal {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or((502, "上游组内无可用端点（全部冷却中）".to_string())))
+}
+
+/// 成本记账（无策略时静默跳过；未定价模型由成本看板列出）
+fn record_cost(state: &Arc<ApiSharedState>, model: &str, key_id: &str, pt: u64, ct: u64) {
+    let _ = pricing::record(&state.data_dir, model, key_id, pt, ct);
+}
+
+/// 连通性探活（custom_model_test 命令底层）：向自定义上游发一条最小 chat 请求
+/// （max_tokens=16 + stream:true，与网关同款 SSE 处理），返回成功摘要 / 失败原因。
+/// 阻塞调用——调用方需放入 spawn_blocking 并外加超时（命令层 30s）。
+pub fn probe(cm: &CustomModel) -> Result<String, String> {
+    let body = json!({
+        "model": cm.name,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 16,
+        "stream": true,
+    })
+    .to_string()
+    .into_bytes();
+    let reader = make_custom_request(cm, &body).map_err(|(status, resp_body)| {
+        let preview: String = resp_body.chars().take(200).collect();
+        if preview.is_empty() {
+            format!("上游返回 status {status}（无响应体；请检查 API 地址与 Key）")
+        } else {
+            format!("上游返回 status {status}：{preview}")
+        }
+    })?;
+    let lines = wb_upstream::lines_with_first_byte_timeout(reader)
+        .map_err(|_| "10 秒内未收到上游响应（首字超时）".to_string())?;
+    let (resp, error_info) = wb_sse::aggregate(lines, &format!("probe-{}", now_ts()));
+    match (resp, error_info) {
+        (Some(r), None) => {
+            let content = r
+                .pointer("/choices/0/message/content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let preview: String = content.chars().take(40).collect();
+            if preview.is_empty() {
+                Ok("连通成功（上游返回空内容）".to_string())
+            } else {
+                Ok(format!("连通成功：{preview}"))
+            }
+        }
+        (None, Some((code, msg))) => Err(format!("上游流内错误 code={code}：{msg}")),
+        _ => Err("上游返回为空（未产出任何 completion）".to_string()),
+    }
+}
+
+fn now_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn chat_id_for(proto: Protocol) -> String {
+    match proto {
+        Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
+        Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
+        Protocol::Anthropic => format!("msg_{}", now_ts()),
+        Protocol::Responses => format!("resp_{}", now_ts()),
+    }
+}
+
+fn set_last_error(state: &Arc<ApiSharedState>, msg: String) {
+    *state.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+}
+
+// ==================== 流式 ====================
+
+#[allow(clippy::too_many_arguments)]
+pub fn custom_stream_chat(
+    state: Arc<ApiSharedState>,
+    body_vec: Vec<u8>,
+    model: String,
+    cm: CustomModel,
+    start_ts: Instant,
+    proto: Protocol,
+    key_id: String,
+    guard: InflightGuard,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+    // 批次 D-1 线程隔离：流任务迁入专用阻塞池（见 mod.rs stream_runtime 注释）
+    super::stream_runtime().spawn_blocking(move || {
+        let _inflight = guard; // 随后台任务存续至流结束（§4.5）
+        let chat_id = chat_id_for(proto);
+        // 请求日志附带：API Key 展示名 + 自定义模型名（即"账号"，匿名 → "-"）
+        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+        let acct_name = cm.name.clone();
+
+        // SSE keep-alive 15s：防中间层回收长流（与 WB/solo 路径同策略）。
+        // P1 修复：与 routes.rs 同款 watch + DoneSignal 方案，替换旧 AtomicBool
+        // 15s 轮询（流终结最多被拖延 15s）；主任务结束（Drop，含 panic 展开）
+        // → ticker select! 退出 → sender 全部关闭 → 流正常终结
+        let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+        let _done = super::routes::DoneSignal(done_tx);
+        {
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            if tx2
+                                .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        // 主任务已结束：ticker 退出，放行流终结
+                        _ = done_rx.changed() => break,
+                    }
+                }
+            });
+        }
+
+        let prepared = prep_body(&body_vec, &cm);
+        match make_custom_request_pooled(&state.data_dir, &cm, &prepared) {
+            // 可中断行源：stream_forward 停滞期间周期性检查客户端断连
+            Ok(reader) => match wb_upstream::lines_with_first_byte_timeout_interruptible(reader) {
+                Ok(lines) => {
+                    // 自定义上游无 namespace 展平编码 → 空集合禁用编码名拆分（审查 F4）
+                    let (error_info, sent_any, up_usage) = wb_sse::stream_forward(
+                        lines, &tx, proto, &chat_id, &model, &std::collections::HashSet::new(),
+                    );
+                    let duration_ms = start_ts.elapsed().as_millis() as u64;
+                    {
+                        // 宽口径提取（别名 + 字符串数字形态，审查 P2）
+                        let (pt, ct) = up_usage.as_ref().map(wb_sse::u64_pair).unwrap_or((0, 0));
+                        // M4 审查修复：缓存读 tokens 旁路入账（未下发得 0 不入账）
+                        state.record_usage_cached(
+                            super::usage::UsageBucket::Custom,
+                            up_usage.as_ref().map(wb_sse::cached_tokens_of).unwrap_or(0),
+                        );
+                        state.record_usage_custom(
+                            &model, &key_id, error_info.is_none(), true,
+                            duration_ms, pt, ct,
+                        );
+                        // 合并增强：成本记账（无策略时静默跳过，未定价在成本看板列示）
+                        if error_info.is_none() {
+                            record_cost(&state, &model, &key_id, pt, ct);
+                        }
+                    }
+                    if let Some((code, msg)) = error_info {
+                        if !sent_any {
+                            send_stream_error(&tx, proto, code, &msg);
+                        }
+                        set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
+                        state.logger.log_request(
+                            "custom", "POST", proto.log_path(), &model, true, 200, "custom",
+                            duration_ms, &key_name, &acct_name, Some(&msg),
+                        );
+                    } else {
+                        state.logger.log_request(
+                            "custom", "POST", proto.log_path(), &model, true, 200, "custom",
+                            duration_ms, &key_name, &acct_name, None,
+                        );
+                    }
+                }
+                Err(()) => {
+                    // 首字超时（F-34 语义）：10s 内上游未产出任何字节
+                    let duration_ms = start_ts.elapsed().as_millis() as u64;
+                    state.record_usage_custom(&model, &key_id, false, true, duration_ms, 0, 0);
+                    state.logger.log_request(
+                        "custom", "POST", proto.log_path(), &model, true, 504, "custom",
+                        duration_ms, &key_name, &acct_name, Some("first byte timeout"),
+                    );
+                    send_stream_error(&tx, proto, 504, "自定义上游 10 秒内未响应（首字超时）");
+                }
+            },
+            Err((status, resp_body)) => {
+                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                state.record_usage_custom(&model, &key_id, false, true, duration_ms, 0, 0);
+                let preview: String = resp_body.chars().take(200).collect();
+                set_last_error(&state, format!("custom model={} status={} body={}", model, status, preview));
+                state.logger.log_request(
+                    "custom", "POST", proto.log_path(), &model, true, status, "custom",
+                    duration_ms, &key_name, &acct_name, Some(&format!("upstream status={}", status)),
+                );
+                let msg = format!("自定义上游错误（status {}）：{}", status, preview);
+                send_stream_error(&tx, proto, status as i64, &msg);
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal server error"))
+                .unwrap()
+        })
+}
+
+// ==================== 非流式 ====================
+
+#[allow(clippy::too_many_arguments)]
+pub async fn custom_aggregate_chat(
+    state: Arc<ApiSharedState>,
+    body_vec: Vec<u8>,
+    model: String,
+    cm: CustomModel,
+    stream: bool,
+    start_ts: Instant,
+    proto: Protocol,
+    key_id: String,
+    guard: InflightGuard,
+) -> Response {
+    // 闭包 move 后外层协议转换仍需模型名，提前克隆
+    let model_outer = model.clone();
+    // P2 修复：非流式聚合为长阻塞上游读取（首字超时 10s + 全量读入），
+    // 与 WB/solo 聚合同口径迁入 stream_runtime 专用阻塞池，不占主池短任务槽
+    let result = super::stream_runtime().spawn_blocking(move || {
+        let _inflight = guard; // 随聚合完成释放（§4.5）
+        // 请求日志附带：API Key 展示名 + 自定义模型名（即"账号"，匿名 → "-"）
+        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+        let acct_name = cm.name.clone();
+        let prepared = prep_body(&body_vec, &cm);
+        let reader = match make_custom_request_pooled(&state.data_dir, &cm, &prepared) {
+            Ok(r) => r,
+            Err((status, resp_body)) => {
+                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
+                let preview: String = resp_body.chars().take(200).collect();
+                set_last_error(&state, format!("custom model={} status={} body={}", model, status, preview));
+                state.logger.log_request(
+                    "custom", "POST", proto.log_path(), &model, stream, status, "custom",
+                    duration_ms, &key_name, &acct_name, Some(&format!("upstream status={}", status)),
+                );
+                return Err(format!("自定义上游错误（status {}）：{}", status, preview));
+            }
+        };
+        let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
+            Ok(l) => l,
+            Err(()) => {
+                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
+                state.logger.log_request(
+                    "custom", "POST", proto.log_path(), &model, stream, 504, "custom",
+                    duration_ms, &key_name, &acct_name, Some("first byte timeout"),
+                );
+                return Err("自定义上游 10 秒内未响应（首字超时）".into());
+            }
+        };
+        let (resp, error_info) = wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()));
+        let duration_ms = start_ts.elapsed().as_millis() as u64;
+        match (resp, error_info) {
+            (Some(mut r), None) => {
+                r["model"] = json!(model);
+                // 宽口径提取（别名 + 字符串数字形态，审查 P2）
+                let (pt, ct) = r.get("usage").map(wb_sse::u64_pair).unwrap_or((0, 0));
+                // M4 审查修复：缓存读 tokens 旁路入账（未下发得 0 不入账）
+                state.record_usage_cached(
+                    super::usage::UsageBucket::Custom,
+                    r.get("usage").map(wb_sse::cached_tokens_of).unwrap_or(0),
+                );
+                state.record_usage_custom(&model, &key_id, true, stream, duration_ms, pt, ct);
+                // 合并增强：成本记账（与用量记账同点位，避免两套口径漂移）
+                record_cost(&state, &model, &key_id, pt, ct);
+                state.logger.log_request(
+                    "custom", "POST", proto.log_path(), &model, stream, 200, "custom", duration_ms,
+                    &key_name, &acct_name, None,
+                );
+                Ok(r)
+            }
+            (None, Some((code, msg))) => {
+                state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
+                set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
+                state.logger.log_request(
+                    "custom", "POST", proto.log_path(), &model, stream, 200, "custom",
+                    duration_ms, &key_name, &acct_name, Some(&msg),
+                );
+                Err(msg)
+            }
+            _ => {
+                state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
+                state.logger.log_request(
+                    "custom", "POST", proto.log_path(), &model, stream, 502, "custom",
+                    duration_ms, &key_name, &acct_name, Some("empty response"),
+                );
+                Err("自定义上游返回为空".into())
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => {
+            let body = match proto {
+                Protocol::Anthropic => wb_sse::completion_to_anthropic(
+                    &resp,
+                    &format!("msg_{}", now_ts()),
+                    &model_outer,
+                ),
+                Protocol::OpenAiText => wb_sse::completion_to_text(&resp, &model_outer),
+                Protocol::Responses => super::wb_responses::completion_to_responses(
+                    &resp,
+                    &format!("resp_{}", now_ts()),
+                    &model_outer,
+                    // 自定义上游无 namespace 展平编码（Responses 分支为防御性兜底）
+                    &std::collections::HashSet::new(),
+                ),
+                Protocol::OpenAi => resp,
+            };
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from("internal server error"))
+                        .unwrap()
+                })
+        }
+        Ok(Err(msg)) => match proto {
+            Protocol::Anthropic => anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &msg),
+            _ => openai_error(StatusCode::BAD_GATEWAY, "upstream_error", &msg),
+        },
+        Err(e) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            &format!("task join error: {}", e),
+        ),
+    }
+}

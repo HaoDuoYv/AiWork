@@ -1,0 +1,2532 @@
+//! 统一调度器（unified-api-gateway-design §4）
+//!
+//! 资源化调度：Trae / Buddy 降级为两份"服务资源池"，请求按模型 ID 匹配可用
+//! 资源池集合（统一目录派生），按 `dispatch_policy.json` 配置的调度策略统一选池。
+//!
+//! 请求处理流程（§4.1）：
+//! ① 鉴权（auth 中间件，不变）→ ② 模型名归一化（wb_model_route 四段管线，
+//! 定位为"名字归一化层"全保留）→ ③ 查统一目录得 sources（剔除 enabled=false）
+//! → ④ 选池（会话池粘性 TTL 内优先沿用 → 否则 dispatch_policy 优先级序，
+//! per_model 覆盖）→ ⑤ 池内调度（沿用各池现有算法，由各执行路径自理）
+//! → ⑥ 池间故障转移（仅双源模型）→ ⑦ 记账 is_wb 分桶（不变）。
+//!
+//! 命名约定（v1.2 §2）：对外池标识统一 `trae` / `buddy`；内部实现 wb_* 前缀
+//! 保留不改名，本模块做标识映射（TargetPool::Buddy ↔ wb_* 数据）。
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::models_sync;
+use super::unified_catalog::canonical_id;
+use super::wb_model_route;
+use super::ApiSharedState;
+use crate::tasks::qoder_upstream;
+
+/// 池优先级默认序：显式化现状（Buddy 目录命中即 Buddy）。
+/// Qoder 追加尾部：双源/三源模型的默认命中顺序保持改造前行为
+///（Buddy → Trae），Qoder 池仅在前两者不可用或单源时接管（§9.1 零行为差异）
+pub fn default_priority() -> Vec<String> {
+    vec!["buddy".into(), "trae".into(), "qoder".into()]
+}
+
+/// 资源池标识（对外统一 `trae` / `buddy` / `qoder`；`custom` 仅供展示/日志，
+/// 不参与策略配置——parse("custom") 返回 None）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetPool {
+    Trae,
+    Buddy,
+    /// 自定义模型（custom_models.json 命中即直达，用户显式配置优先；
+    /// 不参与 dispatch_policy 优先级/回退——parse("custom") 返回 None）
+    Custom,
+    /// Qoder 上游（p3-3，gateway.qoder.com.cn 推理网关；Qoder 目录命中即源）
+    Qoder,
+}
+
+impl TargetPool {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TargetPool::Trae => "trae",
+            TargetPool::Buddy => "buddy",
+            TargetPool::Custom => "custom",
+            TargetPool::Qoder => "qoder",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "trae" => Some(TargetPool::Trae),
+            "buddy" => Some(TargetPool::Buddy),
+            "qoder" => Some(TargetPool::Qoder),
+            _ => None,
+        }
+    }
+}
+
+/// 解析池前缀模型 id（issue #90 修复③a）：`trae/xxx` / `buddy/xxx` / `qoder/xxx`
+/// → (锁定池, 裸模型名)。custom 不参与前缀（自定义模型走 custom_models 直达）。
+/// 前缀段/裸名均 trim + 小写比对；裸名为空视为无效前缀，原样透传（不误吞
+/// 斜杠模型名）。白名单准入（routes::whitelist_check）复用本函数剥离前缀。
+pub(crate) fn split_pool_prefix(model: &str) -> Option<(TargetPool, &str)> {
+    let (prefix, bare) = model.split_once('/')?;
+    if bare.trim().is_empty() {
+        return None;
+    }
+    Some((TargetPool::parse(prefix)?, bare.trim()))
+}
+
+// ==================== 调度策略配置（§4.2） ====================
+
+/// 池间调度策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchStrategy {
+    /// 智能调度（默认）：按请求模型对可用源池排序——
+    /// ① 池内最早积分到期优先（无到期数据视为最晚，后置）
+    /// ② 该模型倍率小者优先（0 = 免费最优；未声明视为最大，后置）
+    /// ③ 池内健康账号剩余积分总和多优先
+    /// 全并列时回退固定优先级序（Buddy 优先现状）；per_model 显式覆盖不受重排影响
+    #[default]
+    Smart,
+    /// 固定优先级（改造前现状）：严格按 priority/per_model 顺序取首个可用池
+    Priority,
+}
+
+/// `data/dispatch_policy.json`：池间策略 + 池优先级 + 模型级覆盖 + 回退开关。
+/// 优先级缺失回退默认 `["buddy","trae"]`（与现状路由行为一致，§9.1）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchPolicy {
+    /// 池间调度策略（缺省 smart）
+    #[serde(default)]
+    pub strategy: DispatchStrategy,
+    /// 池优先级顺序数组（取值 `trae` / `buddy`；priority 模式或 smart 并列时生效）
+    #[serde(default = "default_priority")]
+    pub priority: Vec<String>,
+    /// 模型级覆盖（键为 canonical_id，值同为优先级数组），优先于 priority；
+    /// 显式覆盖的模型不做智能重排（用户显式配置优先）
+    #[serde(default)]
+    pub per_model: HashMap<String, Vec<String>>,
+    /// 双源模型首选池不可用时按序回退；关闭后仅用首选池
+    #[serde(default = "default_true")]
+    pub fallback: bool,
+    /// 账号保留剩余积分（issue #91）：剩余 ≤ 该值的账号暂停调度（0 = 关闭），
+    /// 默认 50——防止账号积分被调度耗尽后连免费模型也不可用
+    #[serde(default = "default_reserve_credits")]
+    pub reserve_credits: f64,
+    /// /v1/models 为多源同名模型附带池前缀别名条目（issue #90 修复③a）：
+    /// `trae/xxx` / `buddy/xxx` / `qoder/xxx`——三家池同名模型倍率与效果不同，
+    /// 开启后客户端可按前缀点名指定池服务（resolve_target 按前缀锁定单池）。
+    /// 默认关（目录保持原形态，零行为差异）
+    #[serde(default)]
+    pub model_source_labels: bool,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_reserve_credits() -> f64 {
+    50.0
+}
+
+impl Default for DispatchPolicy {
+    fn default() -> Self {
+        DispatchPolicy {
+            strategy: DispatchStrategy::Smart,
+            priority: default_priority(),
+            per_model: HashMap::new(),
+            fallback: true,
+            reserve_credits: default_reserve_credits(),
+            model_source_labels: false,
+            updated_at: 0,
+        }
+    }
+}
+
+/// 读取调度策略：缺失/损坏回退默认（不落盘——首次 set 时才写，保持数据干净）。
+/// SQLite 化（P2）：kv 文档直读（单行 SELECT+解析 µs 级，替代原 mtime 解析缓存）。
+pub fn load_policy(data_dir: &Path) -> DispatchPolicy {
+    // 热路径缓存（批次 A）：resolve_target 每请求读取；写路径 save_policy 显式失效
+    super::config_cache::get_or_load(data_dir, "dispatch_policy", || load_policy_uncached(data_dir))
+}
+
+fn load_policy_uncached(data_dir: &Path) -> DispatchPolicy {
+    let mut p: DispatchPolicy = crate::store::db(data_dir).kv_get("dispatch_policy");
+    // 防御：优先级数组非法值过滤 + 空数组回退默认
+    let valid: Vec<String> = p
+        .priority
+        .iter()
+        .filter_map(|s| TargetPool::parse(s).map(|t| t.as_str().to_string()))
+        .collect();
+    p.priority = if valid.is_empty() { default_priority() } else { valid };
+    // 防御：保留积分阈值负值归零（0 = 关闭过滤）
+    p.reserve_credits = p.reserve_credits.max(0.0);
+    // per_model 键统一 canonical_id（与目录归并/元数据覆盖层同语义），
+    // 值过滤非法池名
+    p.per_model = p
+        .per_model
+        .drain()
+        .map(|(k, mut v)| {
+            v.retain(|s| TargetPool::parse(s).is_some());
+            (canonical_id(&k), v)
+        })
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    p
+}
+
+/// 保存调度策略（调用方负责校验后的最终形态落盘）
+pub fn save_policy(data_dir: &Path, policy: &DispatchPolicy) -> Result<(), String> {
+    let mut p = policy.clone();
+    p.updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    crate::store::db(data_dir).kv_set("dispatch_policy", &p)?;
+    // 写路径显式失效（批次 A）：策略改动即时生效
+    super::config_cache::invalidate(data_dir, "dispatch_policy");
+    Ok(())
+}
+
+// ==================== 选池决策（§4.3/§4.4） ====================
+
+/// 调度错误（错误矩阵 §4.3，由端点按客户端协议映射响应格式）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DispatchError {
+    /// 仅 Buddy 源模型且 wb_enabled=false（保持现有 wb_upstream_disabled 语义）
+    WbDisabled,
+    /// 仅 Qoder 源模型且 qoder_enabled=false（同 WbDisabled 语义镜像）
+    QoderDisabled,
+    /// 仅 Trae 源模型且 trae_enabled=false（同族镜像；Trae 开关默认开，
+    /// 关闭属用户显式动作，与"池耗尽 503"区分开）
+    TraeDisabled,
+    /// 模型级冷却中（单源显式 429；多源已在选池时回退）。
+    /// 携带目标池（移植自 3.8 加固）：此前类型不带池、响应层硬编码 "buddy"，
+    /// Qoder 的模型级 429 在请求日志与用量看板里被归因到 buddy 池——排障时
+    /// 「pool=buddy 但模型是 qoder-intl/x」直接误导方向（实机日志已踩到）。
+    ModelCooling(i64, TargetPool),
+    /// 前缀锁定池（`buddy/x` 等）活着但该池目录里没有这个模型：请求级 404 语义。
+    /// 与 NoHealthy 区分开——账号是好的，是模型名不属于该池（发错前缀 / 目录未同步）
+    ModelNotInPool(TargetPool),
+    /// 池内账号因积分维度全部不可选（余额 0 / 低于保留阈值 / 积分过期）：402 语义。
+    /// 与 NoHealthy 区分开——账号健康、配置正常，只是额度不够
+    InsufficientCredits(TargetPool),
+    /// 首选（唯一可用）池耗尽：无健康账号 / 全冷却
+    NoHealthy(TargetPool),
+}
+
+/// 选池结果
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    /// 实际服务的资源池
+    pub pool: TargetPool,
+    /// Buddy 池：四段管线归一化后的最终模型；Trae 池：后缀剥离后的基名
+    /// （issue #31 T3.1，无后缀/透传语义 = 原名）；Custom：原名
+    pub model: String,
+    /// 路由级 effort 提示（统一档位）：Buddy 池直接注入 reasoning_effort；
+    /// Trae 池由 routes 层转 wire 档位下发（efforts::trae_request_wire）
+    pub effort_hint: Option<String>,
+    /// Max Mode 入口标志（issue #31 T4.2）：请求模型带 `-max` 入口后缀且基名可由
+    /// Trae 服务时置位（整名命中列表的真模型不置位，见 trae_final 计算段守卫）；
+    /// 实际注入由 routes 层结合 efforts::TRAE_MAX_MODE_REF 门控，仅 Trae 池为 true
+    pub max_mode_hint: bool,
+    /// 跨池回退来源：Some(首选池) 表示发生了回退（warn 日志已在 resolve_target
+    /// 内部落 app_log；本字段供调度测试断言与 Phase 2 资源页展示预留）
+    #[allow(dead_code)]
+    pub fallback_from: Option<TargetPool>,
+}
+
+/// 回退原因（供 warn 日志）
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FallbackReason {
+    NoHealthyAccount,
+    ModelCooldown,
+    /// 池内账号因积分维度（余额 0 / 低于保留阈值 / 积分过期）全部不可选：
+    /// 账号是好的，额度不够——与「无账号」区分开（2026-10-19 实机：Trae 余额 0
+    /// 被报成 no healthy account，用户误以为账号丢失）
+    InsufficientCredits,
+}
+
+impl FallbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            FallbackReason::NoHealthyAccount => "no_healthy_account",
+            FallbackReason::ModelCooldown => "model_cooldown",
+            FallbackReason::InsufficientCredits => "insufficient_credits",
+        }
+    }
+}
+
+/// 单请求资源源集合：该模型可用的资源池（③ 统一目录查表结果）
+struct ModelSources {
+    /// Buddy 源：四段管线归一化命中（Some(最终模型, effort 提示)）
+    buddy: Option<(String, Option<String>)>,
+    /// Trae 源：api_models 命中；或模型不属于任何目录（透传语义，单源 Trae）
+    trae: bool,
+    /// Trae 侧最终模型 + effort 提示 + Max Mode 入口标志（issue #31 T3.1/T4.2：
+    /// Trae-only 模型带路由后缀时剥离为基名，effort 提示随池携带、由 routes 层转
+    /// wire 下发；带 `-max` 入口后缀时剥离为基名并置 max 标志、由 routes 层结合
+    /// efforts::TRAE_MAX_MODE_REF 门控注入 is_max_mode:true；透传语义为原名）
+    trae_final: (String, Option<String>, bool),
+    /// Qoder 源（p3-3）：Qoder 目录命中（Some(目录归一化 id)）；
+    /// upstreamKey/efforts 等请求素材由执行路径经 qoder_upstream::resolve 再查
+    qoder: Option<String>,
+}
+
+impl ModelSources {
+    /// 是否多源（≥2 个源存在，忽略开关状态）：跨池回退的前提。
+    /// 命名沿用 is_dual（历史上只有双源）；Qoder 加入后语义泛化为「多源」
+    fn is_dual(&self) -> bool {
+        let mut n = 0;
+        if self.buddy.is_some() {
+            n += 1;
+        }
+        if self.trae {
+            n += 1;
+        }
+        if self.qoder.is_some() {
+            n += 1;
+        }
+        n >= 2
+    }
+
+    /// 可用源计数（感知开关状态）：智能调度重排门槛用
+    fn available_count(&self, trae_enabled: bool, wb_enabled: bool, qoder_enabled: bool) -> usize {
+        let mut n = 0;
+        if self.trae && trae_enabled {
+            n += 1;
+        }
+        if self.buddy.is_some() && wb_enabled {
+            n += 1;
+        }
+        if self.qoder.is_some() && qoder_enabled {
+            n += 1;
+        }
+        n
+    }
+
+    /// 源是否可用（trae/buddy/qoder 各感知自己的池开关；custom 走 resolve_target
+    /// 顶部短路，不进入源集合判定——恒 false 仅为匹配穷尽）
+    fn available(&self, pool: TargetPool, trae_enabled: bool, wb_enabled: bool, qoder_enabled: bool) -> bool {
+        match pool {
+            TargetPool::Trae => self.trae && trae_enabled,
+            TargetPool::Buddy => self.buddy.is_some() && wb_enabled,
+            TargetPool::Qoder => self.qoder.is_some() && qoder_enabled,
+            TargetPool::Custom => false,
+        }
+    }
+}
+
+/// 跨池回退 warn 日志（§4.5）：
+/// `dispatch fallback: model=… pool=… preferred=… reason=…`（pool 即 actual）
+/// 审查修复（中等项）：60s 节流——同因回退逐请求落盘会刷爆 app 日志（上游
+/// 故障期间每个请求都触发）；二审细化：按 model|reason 分键限流，
+/// 不同模型/不同因的回退互不抑制，避免观测盲区
+fn log_fallback(state: &ApiSharedState, model: &str, preferred: TargetPool, actual: TargetPool, reason: FallbackReason) {
+    const FALLBACK_LOG_THROTTLE_MS: i64 = 60_000;
+    /// 键上限：模型组合再多也有限（按 model|reason 组合增长），
+    /// 超限整表清理，防极端场景下无界增长
+    const FALLBACK_LOG_MAX_KEYS: usize = 256;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let key = format!("{model}|{}", reason.as_str());
+    let mut last_map = state
+        .fallback_log_last_ms
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&last) = last_map.get(&key) {
+        if now_ms - last < FALLBACK_LOG_THROTTLE_MS {
+            return;
+        }
+    }
+    if last_map.len() >= FALLBACK_LOG_MAX_KEYS {
+        last_map.clear();
+    }
+    last_map.insert(key, now_ms);
+    drop(last_map);
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "dispatch fallback: model={} pool={} preferred={} reason={}",
+            model,
+            actual.as_str(),
+            preferred.as_str(),
+            reason.as_str(),
+        ),
+    );
+}
+
+/// 统一调度分流点（§4.1 ②~⑥）：替代原 `resolve_wb_target` 单向判定。
+///
+/// - `key_id`：命中 Key 条目 id（None = 匿名/未启用鉴权）；用于 Key 级资源池
+///   绑定（issue #25）。选池优先级：**Key 绑定池 > 会话池粘性 > 全局策略**
+///   （per_model > priority，smart 重排）。
+/// - 返回 `Ok(Resolved)`：按 pool 分发到对应执行路径（Buddy → wb_route，Trae → solo）；
+/// - 返回 `Err(DispatchError)`：错误矩阵处置，由端点按协议格式化响应。
+///
+/// 默认策略（无绑定 Key）下路由行为与改造前一致（§9.1 零行为差异）。
+pub fn resolve_target(
+    state: &Arc<ApiSharedState>,
+    model: &str,
+    body: &Value,
+    key_id: Option<&str>,
+) -> Result<Resolved, DispatchError> {
+    // 端点层 model 仅过滤非空未 trim：入口统一去空白（strip_route_suffix 后缀
+    // 匹配 / canonical 比对 / Custom 条目查找均依赖干净形态，错误信息同步受益）
+    let model = model.trim();
+    // issue #90 修复③a：池前缀模型 id（`trae/xxx` / `buddy/xxx` / `qoder/xxx`）
+    // 显式锁定服务池——单池候选、跳过粘性/per_model/smart 重排，不可用即显式
+    // 报错不跨池回退（用户点名的就是这一池；前缀语义 > Key 绑定与全局策略）
+    // 区域前缀先于池前缀剥离读取：`qoder/x` 同时是池前缀（split_pool_prefix）
+    // 与 CN 区前缀（normalize_model_id），前者会消费掉前缀段，需在此留存区域，
+    // 否则无前缀判断会落回默认区域（模型前缀 > 默认区域的三级分流断链）
+    let prefix_realm = crate::tasks::qoder_realm::normalize_model_id(model).0;
+    let (forced_pool, model) = match split_pool_prefix(model) {
+        Some((pool, bare)) => (Some(pool), bare),
+        None => (None, model),
+    };
+    // ⓪ 自定义模型直达（custom_models.json 命中 enabled 条目）：用户显式配置
+    // 优先于内置目录；单源无跨池回退，模型名原样透传（custom_route 按条目
+    // base_url/key 直连）。mtime 缓存读取，未配置时零开销跳过。
+    // issue #90 修复③a：池前缀锁定（trae/xxx 等）时跳过 custom 短路——否则
+    // 自定义模型与裸名同名时会劫持显式锁池请求到 Custom 池
+    if forced_pool.is_none() {
+        if let Some(cm) = super::custom_models::find_enabled(&state.data_dir, model) {
+            let _ = cm; // 命中信息由执行路径重新按 data_dir 读取（条目可能热更新）
+            return Ok(Resolved {
+                pool: TargetPool::Custom,
+                model: model.to_string(),
+                effort_hint: None,
+                max_mode_hint: false,
+                fallback_from: None,
+            });
+        }
+    }
+
+    // ② 模型名归一化（四段管线）+ Buddy 源判定：管线命中目录 → Buddy 源存在
+    let cfg = wb_model_route::load_config(&state.data_dir);
+    let catalog = super::wb_catalog::load(&state.data_dir);
+    let r = wb_model_route::resolve(&cfg, &catalog, model);
+    let buddy_hit = super::wb_catalog::find(&catalog, &r.model)
+            .map(|_| {
+                // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型
+                // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
+                let whitelist = super::unified_catalog::load_whitelist(&state.data_dir);
+                let in_wl = |m: &str| super::unified_catalog::whitelist_allows(&whitelist, m);
+                let final_model = if state
+                    .wb_bg_downgrade
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && wb_model_route::is_background_task(body)
+                {
+                    wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl)
+                        .unwrap_or_else(|| r.model.clone())
+                } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+                    // F-76④ 长上下文降档：输入粗估超阈值（默认 100k token）→ flash 档模型
+                    && wb_model_route::estimate_input_tokens(body)
+                        >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
+                {
+                    wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl)
+                        .unwrap_or_else(|| r.model.clone())
+                } else {
+                    r.model.clone()
+                };
+                (final_model, r.effort_hint.clone())
+            });
+
+    // ③ Trae 源判定：canonical_id 命中 Trae 模型列表；未命中任何目录时保持
+    // 透传语义（单源 Trae，与现状一致）。
+    // issue #31 T3.1 后缀剥离跨池：Trae-only 模型带路由后缀（如 "glm-5.3-thinking"，
+    // 基名仅在 Trae 源）时，Buddy 管线 ④ 段因基名不在 Buddy 目录直落 direct，
+    // 全名带后缀透传 Trae 上游会报模型不存在 → 剥离后缀以基名作为 Trae 侧模型，
+    // effort 提示随池携带。基名未命中 Trae 模型列表时保持原名透传（未知模型零行为差异）
+    // issue #31 T4.2 Max Mode 入口：`-max` 后缀同链路剥离（内置后缀最低优先），
+    // 剥离成功置 max 入口标志随池携带；整名以 -max/-thinking 结尾的真模型
+    // （如 qwen3.8-max）整名在列表时优先透传、不误剥（t47 固化；未请求 = 不注入，
+    // 保持零行为差异）。整名真模型开 Max 的逃生口：① 双后缀 "qwen3.8-max-max"
+    // （整名不在列表 → 剥外层 -max → 基名命中列表，正常注入）；② OpenAI 协议
+    // 请求直传 is_max_mode 字段（payload 层透传+增补不删未知字段，可存活到上游）；
+    // Anthropic 协议经 anthropic_to_openai 重建请求对象会丢弃直传字段，不可用
+    // Trae 模型列表一次加载（config_cache 缓存），③ 段剥离守卫与 trae_hit 判定共用
+    let trae_list = models_sync::load_models(&state.data_dir);
+    let in_trae = |n: &str| trae_list.iter().any(|m| canonical_id(&m.id) == canonical_id(n));
+    // ③⁻ Qoder 源判定（p3-3）前移：③ 段后缀剥离需先知道 Qoder 是否命中，防
+    // 「Qoder 目录收录形如 xxx-max 的模型、基名恰在 Trae 列表」时被 -max 剥离
+    // 劫持到 Trae 池（审查 m1）。resolve 按请求区域解析目录（CN 或 INTL），
+    // 未命中再以 CN 区兜底；区域三级分流见下方 req_realm 推导。final model 取目录归一化 id。
+    // v1 不做路由后缀剥离（-thinking/-max 是 WB/Trae 侧机制），请求素材由执行路径按条目再查
+    // 方案 C：模型名可带区域前缀（`qoder-intl/<model>` / `qoder/<model>`）。
+    // 目录解析用裸名 + 该区域目录；原始名继续向下传，由 qoder_route 再解析一次
+    // （两处同口径，避免 dispatch 与 route 对区域的判断不一致）。
+    let (req_realm, bare_model) = {
+        let (r, b) = crate::tasks::qoder_realm::normalize_model_id(model);
+        // 池前缀剥离已消费掉区前缀时按入口留存值补回（如 `qoder/x` → CN）
+        (r.or(prefix_realm), b)
+    };
+    // 无显式前缀 → 按设置项（`qoder_default_realm`）定区；国际版池关闭时回落国内版。
+    // 模型前缀 > Key bind_pool（由 routes 层投影成前缀）> 默认区域，三级同源。
+    let req_realm = {
+        let s: crate::models::Settings = crate::store::db(&state.data_dir).kv_get("app_settings");
+        let preferred = req_realm.unwrap_or_else(|| {
+            crate::tasks::qoder_realm::normalize(&s.qoder_default_realm)
+        });
+        if preferred == crate::tasks::qoder_realm::INTL && !s.qoder_intl_enabled {
+            crate::tasks::qoder_realm::CN
+        } else {
+            preferred
+        }
+    };
+    let qoder_hit = qoder_upstream::resolve(
+        &bare_model,
+        crate::tasks::qoder_realm::region(req_realm),
+    )
+    .or_else(|| qoder_upstream::resolve(&bare_model, qoder_upstream::QoderRegion::Cn))
+    .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string));
+    let trae_final = if buddy_hit.is_none() {
+        if in_trae(model) {
+            // 整名命中：真模型名透传，不做任何后缀剥离
+            (model.to_string(), None, false)
+        } else if qoder_hit.is_some() {
+            // Qoder 目录命中且整名未命中 Trae 列表：跳过后缀剥离，整名保留
+            // （剥离只服务 WB/Trae 侧机制，此处剥离会把 Qoder 专属模型改写为
+            // 基名误路由 Trae）
+            (model.to_string(), None, false)
+        } else if let Some((base, hint)) = wb_model_route::strip_route_suffix(model, &cfg)
+            .filter(|(base, _)| in_trae(base))
+        {
+            (base, hint, false)
+        } else if let Some(base) =
+            wb_model_route::strip_max_suffix(model).filter(|base| in_trae(base))
+        {
+            // 可观测性：基名在 Trae 列表但不在 Max Mode 支持表（efforts::
+            // TRAE_MAX_MODE_REF）→ 注入层将静默跳过 is_max_mode，落日志避免
+            // 「请求带 -max 却无 1M 行为」无从排查（零行为变更）
+            if !super::efforts::trae_max_mode_supported(&canonical_id(&base)) {
+                crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!(
+                        "dispatch max-mode unsupported: model={} base={} (-max suffix stripped, is_max_mode not injected)",
+                        model,
+                        base,
+                    ),
+                );
+            }
+            (base, None, true)
+        } else {
+            (model.to_string(), None, false)
+        }
+    } else {
+        (model.to_string(), None, false)
+    };
+    let canonical = canonical_id(&trae_final.0);
+    // Trae 透传语义收窄：Qoder 目录命中的模型不再默认透传 Trae（透传会让
+    // Trae 上游报「模型不存在」；显式在 Trae 列表中的仍按双源处理）
+    let trae_hit = (buddy_hit.is_none() && qoder_hit.is_none())
+        || trae_list.iter().any(|m| canonical_id(&m.id) == canonical);
+    let sources = ModelSources {
+        buddy: buddy_hit,
+        trae: trae_hit,
+        trae_final,
+        qoder: qoder_hit,
+    };
+
+    let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let qoder_enabled = state
+        .qoder_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let trae_enabled = state
+        .trae_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // 前缀锁定的一致性分流（bug 修复）：`buddy/x` / `trae/x` / `qoder/x` 是
+    // /v1/models 生成的来源别名。锁定一个「开关已关」或「目录里没有该模型」的池
+    // 时，旧实现只在选池循环外落到 NoHealthy(锁定池)，对外报成 503「no healthy
+    // account available」，而详情里又写着 healthy=2（池里确实有两个健康账号）——
+    // 用户看到的就是这句自相矛盾的报错，且「选哪个模型都失败」。
+    // 现在按真实原因分流：开关关 → 对应 *Disabled（400，可在设置里打开）；
+    // 目录无此模型 → ModelNotInPool（400，模型名/前缀不属于该池）。
+    if let Some(p) = forced_pool {
+        let pool_on = match p {
+            TargetPool::Buddy => wb_enabled,
+            TargetPool::Trae => trae_enabled,
+            TargetPool::Qoder => qoder_enabled,
+            // 不可达：custom 无前缀形态
+            TargetPool::Custom => true,
+        };
+        if !pool_on {
+            return Err(match p {
+                TargetPool::Buddy => DispatchError::WbDisabled,
+                TargetPool::Qoder => DispatchError::QoderDisabled,
+                TargetPool::Trae => DispatchError::TraeDisabled,
+                TargetPool::Custom => DispatchError::NoHealthy(p),
+            });
+        }
+        let has_source = match p {
+            TargetPool::Buddy => sources.buddy.is_some(),
+            TargetPool::Trae => sources.trae,
+            TargetPool::Qoder => sources.qoder.is_some(),
+            TargetPool::Custom => true,
+        };
+        if !has_source {
+            return Err(DispatchError::ModelNotInPool(p));
+        }
+    }
+    // 仅 Buddy 源模型 + wb_enabled=false → 显式报错（§4.3：保持现有
+    // wb_upstream_disabled 语义；"关闭"与"不可用"是两个概念）。
+    // 三源扩展（p3-3 审查修复）：Qoder 源可用时 Buddy 关闭不构成"无源可用"，
+    // 不早退、交由下方选池路由 Qoder（与下方镜像判定的 buddy.is_none() 守卫对称）
+    if sources.buddy.is_some()
+        && !sources.trae
+        && !wb_enabled
+        && !(sources.qoder.is_some() && qoder_enabled)
+    {
+        return Err(DispatchError::WbDisabled);
+    }
+    // 仅 Qoder 源模型 + qoder_enabled=false → 同语义镜像
+    if sources.qoder.is_some() && !sources.trae && sources.buddy.is_none() && !qoder_enabled {
+        return Err(DispatchError::QoderDisabled);
+    }
+    // 仅 Trae 源模型 + trae_enabled=false → 同族镜像（Trae 开关默认开，
+    // 关闭属用户显式动作，与"池耗尽 503"区分开）
+    if sources.trae && sources.buddy.is_none() && sources.qoder.is_none() && !trae_enabled {
+        return Err(DispatchError::TraeDisabled);
+    }
+
+    // ③⁻ Key 级资源池绑定（issue #25）：解析命中 Key 的约束快照。
+    // 绑定是「池偏好」而非模型过滤——绑定池无该模型源时仍路由到唯一可用池（D2）；
+    // 未绑定（""/非法值/无 Key）跟随全局调度，行为与改造前一致
+    let key_rk = key_id.and_then(|id| super::api_keys::constraints_for(&state.data_dir, id));
+    let bind = key_rk.as_ref().and_then(|rk| rk.bind_pool());
+    // 绑定 Key 的白名单健康预检（仅绑定池生效）：绑定池内若仅剩白名单外账号，
+    // 选池阶段即判不健康走全局 fallback，而非取号阶段才失败。
+    // issue #30 混合白名单：未绑定但带池前缀的 Key 同样预检感知（按前缀作用域
+    // 分池，零条目池 = 排除 → 预检不健康走 fallback）；旧未绑定 Key 维持现状——
+    // 预检不感知白名单，F-35 约束由执行路径取号时自理
+    let key_allowed_for = |pool: TargetPool| -> Option<HashSet<String>> {
+        let rk = key_rk.as_ref()?;
+        if bind.is_none() && !rk.is_mixed_whitelist() {
+            return None;
+        }
+        rk.pool_constraints(pool.as_str()).and_then(|c| c.allowed)
+    };
+
+    // 会话池粘性（§4.4 软粘，TTL 60s，内存态不落盘）：命中且池仍可用 → 直接沿用。
+    // Key 绑定池优先于粘性：粘性池 ≠ 绑定池时不沿用（重新按候选序选池）
+    let sticky_key = pool_session_key(body);
+    if let Some(sk) = &sticky_key {
+        // issue #90 修复③a：前缀锁定池时跳过粘性（粘住的是调度选择，显式点名优先）
+        let sticky_pool = if forced_pool.is_none() {
+            take_sticky(state, sk)
+        } else {
+            None
+        };
+        if let Some(pool) = sticky_pool {
+            if bind.map_or(true, |b| pool.as_str() == b)
+                && sources.available(pool, trae_enabled, wb_enabled, qoder_enabled)
+                && pool_healthy(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref(), req_realm)
+            {
+                record_sticky(state, sk, pool);
+                return Ok(Resolved {
+                    pool,
+                    model: final_model_for(pool, &sources, model),
+                    effort_hint: effort_for(pool, &sources),
+                    max_mode_hint: max_mode_for(pool, &sources),
+                    fallback_from: None,
+                });
+            }
+        }
+    }
+
+    // ④ 按策略优先级序选池：有绑定时强制 [绑定池, 另一池] 候选序，跳过
+    // per_model 与 smart 重排（用户 Key 级显式配置优先于全局策略）
+    let policy = load_policy(&state.data_dir);
+    let mut order: Vec<TargetPool> = if let Some(p) = forced_pool {
+        // issue #90 修复③a：单池候选（不追加其他池，无跨池回退）
+        vec![p]
+    } else if let Some(b) = bind {
+        // b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"/"qoder"，无需再 parse
+        if b == "trae" {
+            vec![TargetPool::Trae, TargetPool::Buddy]
+        } else if b == "qoder" {
+            // Qoder 绑定（审查修复：原先落 else 被当 Buddy 处理，「Key 绑定池 >
+            // 全局策略」对 Qoder 断链——多源模型先打 Buddy，仅回退才到 Qoder）
+            vec![TargetPool::Qoder, TargetPool::Buddy, TargetPool::Trae]
+        } else {
+            vec![TargetPool::Buddy, TargetPool::Trae]
+        }
+    } else {
+        policy
+            .per_model
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_else(|| policy.priority.clone())
+            .iter()
+            .filter_map(|s| TargetPool::parse(s))
+            .collect()
+    };
+    // per_model / 绑定序可能只写了部分池：其余可用源追加尾部，保证多源回退有序
+    // （issue #90 修复③a：前缀锁定 = 单池候选，不追加）
+    if forced_pool.is_none() {
+        for p in [TargetPool::Buddy, TargetPool::Trae, TargetPool::Qoder] {
+            if !order.contains(&p) {
+                order.push(p);
+            }
+        }
+    }
+    // ④+ 智能调度（strategy=smart）：可用源 ≥2 且无 per_model 显式覆盖时，
+    // 按请求模型对候选池重排（到期 → 倍率/免费 → 积分多；并列保持优先级序）。
+    // 有绑定/前缀锁定时跳过（绑定序/单池即最终候选序）
+    if forced_pool.is_none() && bind.is_none()
+        && policy.strategy == DispatchStrategy::Smart
+        && policy.per_model.get(&canonical).is_none()
+        && sources.available_count(trae_enabled, wb_enabled, qoder_enabled) >= 2
+    {
+        order = smart_pool_order(state, &order, &canonical, &catalog, &sources);
+    }
+
+    let preferred = order
+        .iter()
+        .copied()
+        .find(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled));
+
+    let mut fallback_from: Option<(TargetPool, FallbackReason)> = None;
+    for (i, pool) in order.iter().copied().enumerate() {
+        if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled) {
+            continue;
+        }
+        match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref(), req_realm) {
+            Ok(()) => {
+                // 首个可用池胜出；此前有可用池失败 → 跨池回退 warn 日志（§4.5）。
+                // 源剔除（如 wb_enabled=false）不算回退，不记日志
+                if let Some((pref, reason)) = fallback_from {
+                    log_fallback(state, model, pref, pool, reason);
+                }
+                // issue #99 ④：请求落池原因逐请求可观测——Key 绑定池生效或发生
+                // 跨池回退时，在请求日志流落 [SCHED] 行（紧邻该请求的请求日志行；
+                // log_fallback 另有 60s 节流的 app.log 运维行，此处为逐请求口径）
+                if bind.is_some() || fallback_from.is_some() {
+                    state.logger.log_sched_event(&format!(
+                        "落池: pool={} model={} bind={} fallback_from={}",
+                        pool.as_str(),
+                        model,
+                        bind.unwrap_or("-"),
+                        fallback_from.map(|p| p.0.as_str()).unwrap_or("-"),
+                    ));
+                }
+                if let Some(sk) = &sticky_key {
+                    record_sticky(state, sk, pool);
+                }
+                return Ok(Resolved {
+                    pool,
+                    model: final_model_for(pool, &sources, model),
+                    effort_hint: effort_for(pool, &sources),
+                    max_mode_hint: max_mode_for(pool, &sources),
+                    fallback_from: fallback_from.map(|(p, _)| p),
+                });
+            }
+            Err(reason) => {
+                // 首选池不可用：双源 + fallback 开 + 后续还有可用源 → 按序回退；
+                // 单源（或 fallback 关）→ 错误矩阵显式报错（§4.3，不静默换池）
+                let has_next = order[i + 1..]
+                    .iter()
+                    .any(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled));
+                // 回退门槛按**可用**源计数（移植自 3.8 加固）：`is_dual` 只看源
+                // 是否存在、不看池开关——上游关闭时源仍在集合里，会让"单可用源"
+                // 被误判为双源而尝试跨池回退（回退目标同样被剔除，徒增一次空转）。
+                let can_fallback = policy.fallback
+                    && sources.available_count(trae_enabled, wb_enabled, qoder_enabled) >= 2
+                    && has_next;
+                if !can_fallback {
+                    return Err(match (pool, reason) {
+                        (TargetPool::Buddy, FallbackReason::ModelCooldown) => {
+                            let secs = super::wb_route::model_cooling_remaining(state, &final_buddy_model(&sources))
+                                .unwrap_or(0);
+                            DispatchError::ModelCooling(secs, TargetPool::Buddy)
+                        }
+                        // Qoder 模型级冷却同构映射（审查修复）：单源排队冷却显式 429。
+                        // 冷却表按区（池标签）隔离，故按请求结论 req_realm 取键
+                        (TargetPool::Qoder, FallbackReason::ModelCooldown) => {
+                            let secs = super::qoder_route::model_cooling_remaining_secs(
+                                crate::tasks::qoder_realm::pool_tag(req_realm),
+                                &sources.qoder.clone().unwrap_or_default(),
+                            )
+                            .unwrap_or(0) as i64;
+                            DispatchError::ModelCooling(secs, TargetPool::Qoder)
+                        }
+                        // 池内账号仅因积分不可选 → 402 语义（不是「没有账号」）
+                        (p, FallbackReason::InsufficientCredits) => {
+                            DispatchError::InsufficientCredits(p)
+                        }
+                        (p, _) => DispatchError::NoHealthy(p),
+                    });
+                }
+                if fallback_from.is_none() {
+                    fallback_from = Some((pool, reason));
+                }
+            }
+        }
+    }
+    // 可用源全部耗尽（双源回退目标也不可用 / 源剔除后无源 / Key 白名单排除）：
+    // 落盘调度日志便于排查轮询异常（issue #30：凭证调度可观测，含 Key 展示名）
+    {
+        let key_label = key_id
+            .map(|id| super::api_keys::key_name_for(&state.data_dir, id))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "anonymous".to_string());
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "dispatch exhausted: model={} key={} preferred={}",
+                model,
+                key_label,
+                preferred.map(|p| p.as_str()).unwrap_or("none"),
+            ),
+        );
+    }
+    Err(DispatchError::NoHealthy(
+        // issue #90 修复③a：前缀锁定池不可用时错误指向该池（而非兜底 Trae，
+        // 否则「qoder/xxx 但 qoder 池耗尽」报成 Trae 无健康账号，误导排障）
+        forced_pool.or(preferred).unwrap_or(TargetPool::Trae),
+    ))
+}
+
+/// 会话池粘性键（§4.4：复用现有粘性会话键，conversation 维度）。
+/// 空指纹（无 messages / 无 conversation_id）不可粘 → None
+fn pool_session_key(body: &Value) -> Option<String> {
+    let key = super::wb_sticky::SessionKey::from_body(body).cache_key();
+    // 空指纹的 cache_key 为 "fp:"（无内容后缀）→ 不可粘
+    (!key.is_empty() && !key.ends_with(':')).then_some(key)
+}
+
+// ==================== 智能调度（§4.2 DispatchStrategy::Smart） ====================
+
+/// 智能调度排序键：①最早积分到期（升序，无到期数据 = i64::MAX 后置）
+/// ②模型倍率（升序，0 = 免费最优，未声明 = f64::MAX 后置）③健康积分总和多优先（负值升序）
+type SmartKey = (i64, f64, f64);
+
+/// 双源候选池按「到期 → 倍率/免费 → 积分多」复合键稳定排序；
+/// 全并列保持传入序（= priority/per_model 固定优先级，Buddy 优先现状）。
+fn smart_pool_order(
+    state: &Arc<ApiSharedState>,
+    order: &[TargetPool],
+    canonical: &str,
+    catalog: &[super::wb_catalog::WbModel],
+    sources: &ModelSources,
+) -> Vec<TargetPool> {
+    let trae_stats = state.pool.stats();
+    let wb_stats = state.wb_pool.stats();
+    // 双区 Qoder 池聚合（earliest 取更早者、total 求和）：Qoder 目标按区拆两池
+    // 后 smart 排序键需合并视角，否则国际区账号的到期/积分不参与复合键
+    let qoder_stats = {
+        let (cn_earliest, cn_total) = state.qoder_pool.stats();
+        let (intl_earliest, intl_total) = state.qoder_intl_pool.stats();
+        (
+            cn_earliest.into_iter().chain(intl_earliest).min(),
+            cn_total + intl_total,
+        )
+    };
+    // 倍率数据源：Buddy = wb 目录原始值（0 = 免费）；Trae = 官网同步声明值（None = 未声明）；
+    // Qoder = 目录 credits 文本解析（"x0.1 credits" → 0.1）。
+    // 各列表均为内存缓存，热路径零磁盘读
+    let trae_rate = models_sync::load_models(&state.data_dir)
+        .iter()
+        .find(|m| canonical_id(&m.id) == canonical)
+        .and_then(|m| m.rate);
+    let buddy_rate = sources
+        .buddy
+        .as_ref()
+        .and_then(|(m, _)| catalog.iter().find(|c| c.id == *m))
+        .map(|c| c.rate);
+    let qoder_rate = sources
+        .qoder
+        .as_ref()
+        .and_then(|id| {
+            // 免费活动覆盖同口径：开关开启时 Qwen3.8-Flash 按 0 倍率参与排序
+            //（免费最优），否则排序键与取号豁免口径分叉
+            qoder_upstream::list_overridden(
+                state
+                    .qoder_flash_free_rate
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .into_iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some(id.as_str()))
+        })
+        .and_then(|m| {
+            m.get("credits")
+                .and_then(Value::as_str)
+                .and_then(qoder_upstream::credits_rate_of)
+        });
+    let key_of = |p: TargetPool| -> SmartKey {
+        let ((earliest, total), rate) = match p {
+            TargetPool::Trae => (trae_stats, trae_rate),
+            TargetPool::Buddy => (wb_stats, buddy_rate),
+            TargetPool::Qoder => (qoder_stats, qoder_rate),
+            TargetPool::Custom => ((None, 0.0), None),
+        };
+        (
+            earliest.unwrap_or(i64::MAX),
+            rate.unwrap_or(f64::MAX),
+            -total,
+        )
+    };
+    let mut sorted = order.to_vec();
+    sorted.sort_by(|a, b| {
+        let (ka, kb) = (key_of(*a), key_of(*b));
+        ka.0.cmp(&kb.0)
+            .then_with(|| ka.1.partial_cmp(&kb.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| ka.2.partial_cmp(&kb.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    sorted
+}
+
+/// 模型级冷却的「尾巴宽松放行」阈值（秒）。
+///
+/// 语义：模型级冷却由排队/限流信号挂上，窗口通常只有几秒（排队建议值，钳制
+/// 1–30s）；窗口尾巴（剩余 ≤ 该阈值）再对客户端报 429 是净亏——客户端只能自己
+/// 猜退避（实测 4.3s，是剩余窗口的数倍），而真正消化窗口的路径本来就在执行侧：
+/// 排队/限流时 route 会 `sleep(retry_after)` 后同号重试，成功了还顺手清冷却。
+/// 所以尾巴窗口按「健康」放行，让一次真实请求把冷却吃掉；上游若仍在排队，
+/// route 内的退避重试继续等，不产生假的 429。
+pub(crate) const SHORT_COOLDOWN_GRACE_SECS: u64 = 3;
+
+/// 短冷却放行的可观测行（逐请求 SCHED 口径，便于回答"这次为什么没 429"）
+fn log_short_cooldown_pass(state: &Arc<ApiSharedState>, pool: TargetPool, model: &str, rem: u64) {
+    state.logger.log_sched_event(&format!(
+        "冷却尾巴宽松放行: pool={} model={} rem={}s（≤{}s，交执行路径排队退避消化）",
+        pool.as_str(),
+        model,
+        rem,
+        SHORT_COOLDOWN_GRACE_SECS
+    ));
+}
+
+/// 池内是否「仅因积分维度全不可选」（委派 pool.rs 的账号级判定）
+fn credit_blocked_only(pool: &super::pool::ApiPool, allowed: Option<&HashSet<String>>) -> bool {
+    let (in_scope, blocked) = pool.credit_blocked_stats_in(allowed);
+    in_scope > 0 && blocked == in_scope
+}
+
+/// Trae 侧模型是否零倍率（免费）：rate 缺失/读取失败按付费处理（保持既有严格口径）
+fn trae_model_is_free(state: &Arc<ApiSharedState>, model: &str) -> bool {
+    models_sync::load_models(&state.data_dir)
+        .iter()
+        .any(|m| m.id == model && m.rate.map_or(false, |r| r <= 0.0))
+}
+
+/// Buddy 侧模型是否零倍率（免费）：同 Trae 口径
+fn buddy_model_is_free(state: &Arc<ApiSharedState>, model: &str) -> bool {
+    let catalog = super::wb_catalog::load(&state.data_dir);
+    super::wb_catalog::find(&catalog, model).map_or(false, |m| m.rate <= 0.0)
+}
+
+/// 首选池健康检查：Buddy 池额外检查模型级冷却（优先级高于账号级）
+/// `allowed`：Key 绑定的白名单（仅绑定池生效），None = 不感知白名单
+/// `req_realm`：Qoder 请求区域（dispatch 侧三级路由结论，qoder 分支用）
+fn pool_health(
+    state: &Arc<ApiSharedState>,
+    pool: TargetPool,
+    sources: &ModelSources,
+    _wb_enabled: bool,
+    allowed: Option<&HashSet<String>>,
+    req_realm: &str,
+) -> Result<(), FallbackReason> {
+    match pool {
+        TargetPool::Buddy => {
+            let model = final_buddy_model(sources);
+            if let Some(rem) = super::wb_route::model_cooling_remaining(state, &model) {
+                // 冷却尾巴（≤ 阈值）不硬 429：见 SHORT_COOLDOWN_GRACE_SECS
+                let rem = rem.max(0) as u64;
+                if rem > SHORT_COOLDOWN_GRACE_SECS {
+                    return Err(FallbackReason::ModelCooldown);
+                }
+                log_short_cooldown_pass(state, TargetPool::Buddy, &model, rem);
+            }
+            // 零倍率（免费）模型豁免积分维度过滤：与取号路径同口径——预检比取号严
+            // 会让免费模型请求在预检即 NoHealthy（Qoder 侧早已对齐，Trae/Buddy 漏改）
+            let free = buddy_model_is_free(state, &model);
+            if !state.wb_pool.has_selectable_in(allowed, free) {
+                if credit_blocked_only(&state.wb_pool, allowed) {
+                    return Err(FallbackReason::InsufficientCredits);
+                }
+                return Err(FallbackReason::NoHealthyAccount);
+            }
+            Ok(())
+        }
+        TargetPool::Trae => {
+            let free = trae_model_is_free(state, &sources.trae_final.0);
+            if !state.pool.has_selectable_in(allowed, free) {
+                if credit_blocked_only(&state.pool, allowed) {
+                    return Err(FallbackReason::InsufficientCredits);
+                }
+                return Err(FallbackReason::NoHealthyAccount);
+            }
+            Ok(())
+        }
+        TargetPool::Qoder => {
+            // 模型级冷却预检（审查修复，与 Buddy 同构）：排队/超限类错误后窗口
+            // 内快速回退——多源交由后续池，单源在 resolve_target 显式 429。
+            // 键按请求区（req_realm → 池标签）取：CN / INTL 各自冷却，同名模型
+            // 在国内区排队时不得把国际区请求一起 429 掉
+            let qoder_model = sources.qoder.clone().unwrap_or_default();
+            if let Some(rem) = super::qoder_route::model_cooling_remaining_secs(
+                crate::tasks::qoder_realm::pool_tag(req_realm),
+                &qoder_model,
+            ) {
+                // 冷却尾巴（≤ 阈值）不硬 429：见 SHORT_COOLDOWN_GRACE_SECS
+                if rem > SHORT_COOLDOWN_GRACE_SECS {
+                    return Err(FallbackReason::ModelCooldown);
+                }
+                log_short_cooldown_pass(state, TargetPool::Qoder, &qoder_model, rem);
+            }
+            // 账号级健康预检（issue #111：免费模型豁免积分维度过滤，口径对齐取号路径——
+            // 预检比取号严会让免费模型请求在预检即 NoHealthy，白改）
+            let qoder_free = sources
+                .qoder
+                .as_deref()
+                .map(|m| {
+                    // 免费活动覆盖与取号同口径（resolve_overridden），否则开关开启时
+                    // Qwen3.8-Flash 预检仍按 0.1 目录价判非免费，零积分池被误挡。
+                    // 区域按请求结论 req_realm 取（双区目录免费模型不同，恒 CN 会
+                    // 误判国际区条目收费而把 INTL-only 池在预检挡死）
+                    qoder_upstream::resolve_overridden(
+                        m,
+                        crate::tasks::qoder_realm::region(req_realm),
+                        state
+                            .qoder_flash_free_rate
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                    .map(|e| qoder_upstream::entry_is_free(&e))
+                    .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            // 双区池预检：请求区域命中本区池即健康（另一区可不在——CN/INTL 账号
+            // 域名互不通用，另一区无账号不代表本请求无健康账号）
+            let selectable = if crate::tasks::qoder_realm::is_intl(req_realm) {
+                state.qoder_intl_pool.has_selectable_in(allowed, qoder_free)
+            } else {
+                state.qoder_pool.has_selectable_in(allowed, qoder_free)
+            };
+            if !selectable {
+                // 仅因积分维度不可选 → 402 语义（区分「账号没了」与「额度没了」）
+                let (cn, intl) = if crate::tasks::qoder_realm::is_intl(req_realm) {
+                    (None, Some(&state.qoder_intl_pool))
+                } else {
+                    (Some(&state.qoder_pool), None)
+                };
+                let pool_ref = cn.or(intl).expect("qoder 池必有一侧");
+                if credit_blocked_only(pool_ref, allowed) {
+                    return Err(FallbackReason::InsufficientCredits);
+                }
+                return Err(FallbackReason::NoHealthyAccount);
+            }
+            Ok(())
+        }
+        // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
+        TargetPool::Custom => Ok(()),
+    }
+}
+
+fn pool_healthy(
+    state: &Arc<ApiSharedState>,
+    pool: TargetPool,
+    sources: &ModelSources,
+    wb_enabled: bool,
+    allowed: Option<&HashSet<String>>,
+    req_realm: &str,
+) -> bool {
+    pool_health(state, pool, sources, wb_enabled, allowed, req_realm).is_ok()
+}
+
+fn final_buddy_model(sources: &ModelSources) -> String {
+    sources
+        .buddy
+        .as_ref()
+        .map(|(m, _)| m.clone())
+        .unwrap_or_default()
+}
+
+fn final_model_for(pool: TargetPool, sources: &ModelSources, request_model: &str) -> String {
+    match pool {
+        TargetPool::Buddy => final_buddy_model(sources),
+        // Trae：后缀剥离后的基名（issue #31 T3.1；无后缀/透传语义 = 原名）
+        TargetPool::Trae => sources.trae_final.0.clone(),
+        // Qoder：目录归一化 id（去空白形态，执行路径据此 resolve 请求素材）
+        TargetPool::Qoder => sources.qoder.clone().unwrap_or_default(),
+        TargetPool::Custom => request_model.to_string(),
+    }
+}
+
+fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
+    match pool {
+        TargetPool::Buddy => sources.buddy.as_ref().and_then(|(_, h)| h.clone()),
+        // Trae：路由级 effort 提示同样随池携带（routes 层统一档位 → wire 转换下发）
+        TargetPool::Trae => sources.trae_final.1.clone(),
+        // Qoder：v1 无路由级 effort 通道（思考档位由执行路径按目录条目解析）
+        TargetPool::Qoder => None,
+        TargetPool::Custom => None,
+    }
+}
+
+/// Max Mode 入口标志随池取值（issue #31 T4.2）：仅 Trae 池携带入口标志；实际注入
+/// 由 routes 层结合 efforts::TRAE_MAX_MODE_REF 门控，Buddy/Custom/Qoder 恒 false
+fn max_mode_for(pool: TargetPool, sources: &ModelSources) -> bool {
+    match pool {
+        TargetPool::Trae => sources.trae_final.2,
+        TargetPool::Buddy | TargetPool::Custom | TargetPool::Qoder => false,
+    }
+}
+
+// ==================== 会话池粘性（§4.4，内存态） ====================
+
+// 池粘性 TTL 兜底值（秒）：软粘防抖动，重启即清不落盘；
+// 实际 TTL 按胜出池读 ApiSharedState 三个 per-pool 原子量（trae/wb/qoder
+// _pool_sticky_ttl_secs，F-76② 可配置，默认 300s——上游对同上下文有
+// prefill 缓存收益，粘性命中 = 缓存命中）
+// （默认值由 default_pool_sticky_ttl_secs() 提供，无需独立常量）
+
+/// 取出池粘性绑定（命中后移除过期项；命中项由调用方决定是否续期）
+fn take_sticky(state: &Arc<ApiSharedState>, key: &str) -> Option<TargetPool> {
+    let now = now_ts();
+    let mut map = state.pool_sticky.lock().unwrap_or_else(|e| e.into_inner());
+    // 懒清理过期项
+    map.retain(|_, (_, exp)| *exp > now);
+    map.get(key).map(|(p, _)| *p)
+}
+
+/// 池粘性 TTL 按胜出池取值（per-pool 三参数，F-76② 拆分版）：
+/// Custom 为自定义模型直达变体（parse("custom") 返回 None，实际不会被记录），
+/// 兜底取 Trae 值
+///
+/// 命名区分（勿混淆，issue 复核）：`*_pool_sticky_ttl_secs` = 池粘性 TTL
+/// （本函数唯一消费方，内存态 state.pool_sticky，重启即清）；`*_sticky_ttl_secs`
+/// = 显式会话粘性 TTL（落库 sticky_bindings，经 set_explicit_ttl 热应用）——
+/// 两条链路独立，此处取 pool 变体是正确取值
+fn pool_sticky_ttl_secs(state: &ApiSharedState, pool: TargetPool) -> u64 {
+    let cell = match pool {
+        TargetPool::Trae | TargetPool::Custom => &state.trae_pool_sticky_ttl_secs,
+        TargetPool::Buddy => &state.wb_pool_sticky_ttl_secs,
+        TargetPool::Qoder => &state.qoder_pool_sticky_ttl_secs,
+    };
+    cell.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 记录/续期池粘性绑定（TTL 按胜出池的独立配置取值，F-76② per-pool）
+fn record_sticky(state: &Arc<ApiSharedState>, key: &str, pool: TargetPool) {
+    let ttl = pool_sticky_ttl_secs(state, pool).max(1) as i64;
+    let mut map = state.pool_sticky.lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(
+        key.to_string(),
+        (pool, now_ts() + ttl),
+    );
+}
+
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// ==================== 测试（调度矩阵 ≥18 用例，§10 Phase 1 验收） ====================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::AtomicBool;
+
+    /// 测试数据目录脚手架：写 api_models / wb_catalog / dispatch_policy
+    struct Fixture {
+        dir: std::path::PathBuf,
+        state: Arc<ApiSharedState>,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// `trae_models`：Trae 侧 api_models 条目 id；`wb_models`：Buddy 侧目录 id
+    /// （None 表示不写 wb_model_catalog.json → wb_catalog::load 会落盘内置 15 模型；
+    /// 注意 wb_catalog 语义"空文件=缺失"，显式空目录不可表达——
+    /// 需要"无 WB 干扰"时传一个不相关模型，如 Some(&["hy4"])）
+    fn fixture(trae_models: &[&str], wb_models: Option<&[&str]>, policy: Option<&DispatchPolicy>) -> Fixture {
+        let dir = std::env::temp_dir().join(format!(
+            "twa_dispatch_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        // SQLite 化（P2）：测试种子改走 kv（api_models / wb_model_catalog / dispatch_policy）
+        let st = crate::store::db(&dir);
+        let trae: Vec<Value> = trae_models
+            .iter()
+            .map(|id| json!({"id": id, "label": id}))
+            .collect();
+        st.kv_set("api_models", &trae).unwrap();
+        if let Some(wb) = wb_models {
+            let list: Vec<Value> = wb
+                .iter()
+                .map(|id| {
+                    json!({"id": id, "display": id, "context_length": 128000,
+                           "max_tokens": 64000, "supports_image": false,
+                           "supported_efforts": ["low","medium","high"], "rate": 0.5})
+                })
+                .collect();
+            st.kv_set("wb_model_catalog", &json!({"models": list})).unwrap();
+        }
+        if let Some(p) = policy {
+            st.kv_set("dispatch_policy", p).unwrap();
+        }
+        let state = Arc::new(ApiSharedState {
+            pool: super::super::pool::ApiPool::new(),
+            wb_pool: super::super::pool::ApiPool::new(),
+            fallback_log_last_ms: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wb_enabled: AtomicBool::new(true),
+            wb_sanitize: AtomicBool::new(true),
+            wb_default_thinking: AtomicBool::new(false),
+            wb_tool_exec: AtomicBool::new(false),
+            wb_bg_downgrade: AtomicBool::new(false),
+            wb_longctx_downgrade: AtomicBool::new(false),
+            wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            trae_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
+            wb_sticky: super::super::wb_sticky::StickyStore::default(),
+            model_cooldowns: std::sync::Mutex::new(HashMap::new()),
+            default_model: "deepseek-v4-flash".into(),
+            data_dir: dir.clone(),
+            total_requests: std::sync::atomic::AtomicU64::new(0),
+            inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            active_uid: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(None),
+            pool_sticky: std::sync::Mutex::new(HashMap::new()),
+            logger: super::super::ApiLogger::new(dir.join("logs")),
+            debug_enabled: AtomicBool::new(false),
+            usage: std::sync::Mutex::new(super::super::usage::UsageFile::default()),
+            usage_dirty: std::sync::Mutex::new(Vec::new()),
+            wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            trae_jwt_refresh: None,
+            trae_enabled: AtomicBool::new(true),
+            // 遗留调度矩阵测试编码 Buddy/Trae 契约（§9.1）：按「Qoder 未启用」
+            // 的部署形态构造；Qoder 参与调度的行为由 qoder 启用态的专属测试覆盖
+            qoder_pool: super::super::pool::ApiPool::new(),
+            qoder_intl_pool: super::super::pool::ApiPool::new(),
+            qoder_enabled: AtomicBool::new(false),
+            qoder_identity: None,
+            qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            qoder_sticky_enabled: AtomicBool::new(false),
+            qoder_sticky: super::super::wb_sticky::StickyStore::default(),
+            trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
+        });
+        Fixture { dir, state }
+    }
+
+    impl Fixture {
+        /// 带会话指纹的解析（messages 非空 → 粘性生效）
+        fn resolve(&self, model: &str) -> Result<Resolved, DispatchError> {
+            resolve_target(
+                &self.state,
+                model,
+                &json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}),
+                None,
+            )
+        }
+
+        /// 无会话键的解析（无 messages → 不粘性）
+        fn resolve_no_session(&self, model: &str) -> Result<Resolved, DispatchError> {
+            resolve_target(&self.state, model, &json!({"model": model}), None)
+        }
+
+        /// 带会话指纹 + Key 的解析（issue #25 资源池绑定用例）
+        fn resolve_key(&self, model: &str, key_id: &str) -> Result<Resolved, DispatchError> {
+            resolve_target(
+                &self.state,
+                model,
+                &json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}),
+                Some(key_id),
+            )
+        }
+
+        /// 种子一个启用的 Key 条目（store 直写，追加/替换式合并；
+        /// 须在首次 resolve_key 前调用——constraints_for 首读后缓存不可见后续直写）
+        fn seed_key(&self, id: &str, bind_pool: &str, allowed: &[&str]) {
+            self.seed_key_cfg(id, bind_pool, allowed, "", "")
+        }
+
+        /// 同上，可指定调度模式与专一账号（trae_pool_constraints 等用例用）
+        fn seed_key_cfg(&self, id: &str, bind_pool: &str, allowed: &[&str], mode: &str, dedicated: &str) {
+            let mut file = crate::store::docs::api_keys_load(&crate::store::db(&self.dir));
+            file.keys.retain(|k| k.id != id);
+            file.keys.push(super::super::api_keys::ApiKeyEntry {
+                id: id.into(),
+                name: id.into(),
+                key: format!("ck-{id}"),
+                enabled: true,
+                daily_limit: 0,
+                created_at: 0,
+                used_date: String::new(),
+                used_today: 0,
+                allowed_accounts: allowed.iter().map(|s| s.to_string()).collect(),
+                schedule_mode: mode.into(),
+                dedicated_account: dedicated.into(),
+                bind_pool: bind_pool.into(),
+                daily_stats: vec![],
+                allowed_groups: vec![],
+                allowed_tags: vec![],
+            });
+            crate::store::docs::api_keys_save(&crate::store::db(&self.dir), &file).unwrap();
+        }
+
+        fn set_wb_enabled(&self, on: bool) {
+            self.state
+                .wb_enabled
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// 往池里塞一个健康账号（credits=10）
+        fn seed_healthy(&self, trae: bool) {
+            let pool = if trae { &self.state.pool } else { &self.state.wb_pool };
+            pool.sync_from_wb(
+                &[super::super::pool::WbSyncAccount {
+                    uid: if trae { "t1" } else { "b1" }.into(),
+                    name: "acc".into(),
+                    token: "tk".into(),
+                    domain: if trae { String::new() } else { "d".into() },
+                    enterprise_id: String::new(),
+                    global_region: false,
+                    credits: Some(10.0),
+                    credits_expire_at: None,
+                    credits_fetched_at: None,
+                    needs_relogin: false,
+                    group_id: String::new(),
+                }],
+                &[if trae { "t1" } else { "b1" }.to_string()],
+            );
+        }
+
+        fn app_log_contains(&self, needle: &str) -> bool {
+            let log_dir = self.dir.join("logs");
+            let Ok(entries) = std::fs::read_dir(&log_dir) else {
+                return false;
+            };
+            for e in entries.flatten() {
+                if let Ok(text) = std::fs::read_to_string(e.path()) {
+                    if text.contains(needle) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+    }
+
+    fn policy_default() -> DispatchPolicy {
+        DispatchPolicy::default()
+    }
+
+    // ---------- issue #90 修复③a：池前缀模型 id ----------
+
+    /// split_pool_prefix：合法前缀解析（trim/大小写宽容）；custom、未知池名、
+    /// 空裸名、无前缀 → None（原样透传，不误吞斜杠模型名）
+    #[test]
+    fn t90_split_pool_prefix_parse() {
+        assert_eq!(
+            split_pool_prefix("trae/glm-5.3"),
+            Some((TargetPool::Trae, "glm-5.3"))
+        );
+        assert_eq!(
+            split_pool_prefix("Qoder/DeepSeek-Flash"),
+            Some((TargetPool::Qoder, "DeepSeek-Flash"))
+        );
+        assert_eq!(
+            split_pool_prefix(" buddy/ hy4 "),
+            Some((TargetPool::Buddy, "hy4"))
+        );
+        assert_eq!(split_pool_prefix("custom/m1"), None);
+        assert_eq!(split_pool_prefix("openai/gpt-4o"), None);
+        assert_eq!(split_pool_prefix("trae/"), None);
+        assert_eq!(split_pool_prefix("glm-5.3"), None);
+    }
+
+    /// 前缀锁定：默认策略 Buddy 优先，`trae/` 前缀强制 Trae 胜出、`buddy/` 维持
+    /// Buddy；Resolved.model 均剥为裸名（执行路径按裸名解析目录）
+    #[test]
+    fn t90_prefix_locks_pool_over_policy() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let r = f.resolve("trae/glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "glm-5.3");
+        let r = f.resolve("buddy/glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.model, "glm-5.3");
+    }
+
+    /// 回归锁（实机 2026-10-19 503 事故）：`buddy/deepseek-v4.1-flash` +
+    /// wb_enabled=false + 池内 2 个健康账号 → 必须报 **WbDisabled**（提示去开开关），
+    /// 而不是 503 "no healthy account available ... healthy=2"（自相矛盾、无从排查）
+    #[test]
+    fn t90_prefix_buddy_disabled_reports_disabled() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false); // wb_pool 有 1 个健康账号
+        f.set_wb_enabled(false);
+        assert_eq!(
+            f.resolve("buddy/glm-5.3").unwrap_err(),
+            DispatchError::WbDisabled
+        );
+        // 开关打开后同一请求正常锁定 Buddy 池（证明分流没把正常路径打死）
+        f.set_wb_enabled(true);
+        let r = f.resolve("buddy/glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+    }
+
+    /// 锁定池的三种失败分流（bug 修复）：旧实现一律 NoHealthy(锁定池)，把「上游
+    /// 开关关了」和「该池目录里没这个模型」都报成 503 无健康账号——与详情里
+    /// `healthy=2` 自相矛盾，用户看到「明明有两个健康账号却说没有，且选哪个模型
+    /// 都失败」。现在：① 开关关 → *Disabled（400）；② 开关开但目录无此模型 →
+    /// ModelNotInPool（404）；③ 开关开、有模型、池无账号 → NoHealthy（503）
+    #[test]
+    fn t90_prefix_unavailable_source_errors_locked_pool() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        // ① Qoder 上游未启用（fixture 默认 qoder_enabled=false）
+        assert_eq!(
+            f.resolve("qoder/glm-5.3").unwrap_err(),
+            DispatchError::QoderDisabled
+        );
+        // ② 池开着但该池目录无此模型 → 模型不属于该池（hy4-preview 只在 WB 目录，
+        // 不在 Trae api_models 列表里，故 `trae/hy4-preview` 是锁错池的典型）
+        let t = fixture(&["glm-5.3"], Some(&["hy4-preview"]), Some(&policy_default()));
+        t.seed_healthy(true);
+        assert_eq!(
+            t.resolve("trae/hy4-preview").unwrap_err(),
+            DispatchError::ModelNotInPool(TargetPool::Trae)
+        );
+        // ③ 启用 + 目录含该模型（MiniMax-M2.7 为 Qoder 独有）+ 池空 → 真无健康账号
+        let g = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        g.state
+            .qoder_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            g.resolve("qoder/MiniMax-M2.7").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Qoder)
+        );
+    }
+
+    /// 前缀锁池优先于 custom 短路：自定义模型与裸名同名（glm-5.3）时，
+    /// `trae/glm-5.3` 不得被 ⓪ 段 custom 直达劫持到 Custom 池
+    /// （issue #90 修复③a 审查修正回归）
+    #[test]
+    fn t90_prefix_lock_not_hijacked_by_same_name_custom() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let cm: super::super::custom_models::CustomModel = serde_json::from_value(json!({
+            "name": "glm-5.3",
+            "base_url": "https://custom.example.invalid",
+            "enabled": true
+        }))
+        .unwrap();
+        super::super::custom_models::upsert(&f.dir, cm).unwrap();
+        // 裸名仍走 custom 直达（原语义不变）
+        assert_eq!(f.resolve_no_session("glm-5.3").unwrap().pool, TargetPool::Custom);
+        // 前缀锁池不被劫持：显式点名 Trae 池服务
+        let r = f.resolve_no_session("trae/glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "glm-5.3");
+    }
+
+
+    /// 覆写 Buddy 目录为仅含 `keep` 的显式条目（builtin_rev 拉平退出内置重建）：
+    /// fixture 的 wb_model_catalog 写入缺 builtin_rev 会被 wb_catalog::load 重建为
+    /// 内置 15 模型（含 glm-5.3/kimi-k3），无法构造「基名不在 Buddy 目录」的
+    /// Trae-only 前提（issue #31 T3.1 测试专用）
+    fn catalog_only(dir: &Path, keep: &str) {
+        crate::store::db(dir)
+            .kv_set(
+                "wb_model_catalog",
+                &json!({
+                    "models": [{"id": keep, "display": keep, "context_length": 128000,
+                                "max_tokens": 64000, "supports_image": false,
+                                "supported_efforts": ["low","medium","high"], "rate": 0.5}],
+                    "builtin_rev": super::super::wb_catalog::BUILTIN_REV
+                }),
+            )
+            .unwrap();
+    }
+
+    // ---------- 维度一：优先级 ----------
+
+    /// 默认策略 ["buddy","trae"] + 双源 + 双池健康 → Buddy（与现状一致 §9.1）
+    #[test]
+    fn t01_default_policy_dual_source_healthy_goes_buddy() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let r = f.resolve("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.model, "glm-5.3");
+        assert!(r.fallback_from.is_none());
+    }
+
+    /// 策略 ["trae","buddy"] + 双源健康 → Trae（priority 模式验证）
+    #[test]
+    fn t02_trae_first_policy_goes_trae() {
+        let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
+        p.priority = vec!["trae".into(), "buddy".into()];
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Trae);
+    }
+
+    /// per_model 覆盖优先于全局 priority
+    #[test]
+    fn t03_per_model_override_beats_priority() {
+        let mut p = policy_default();
+        p.priority = vec!["trae".into(), "buddy".into()];
+        p.per_model.insert("glm-5.3".into(), vec!["buddy".into()]);
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
+    }
+
+    /// per_model 键大小写归一（canonical_id）匹配
+    #[test]
+    fn t04_per_model_key_canonicalized() {
+        let mut p = policy_default();
+        p.priority = vec!["trae".into(), "buddy".into()];
+        p.per_model.insert("GLM-5.3".into(), vec!["buddy".into()]);
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        assert_eq!(f.resolve("GLM-5.3").unwrap().pool, TargetPool::Buddy);
+    }
+
+    // ---------- 维度二：模型源 ----------
+
+    /// 仅 Buddy 源（hy4）→ Buddy
+    #[test]
+    fn t05_buddy_only_model_goes_buddy() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4", "glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        let r = f.resolve("hy4").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+    }
+
+    /// 仅 Trae 源（Doubao-Seed-Evolving 不在 WB 目录）→ Trae 透传
+    #[test]
+    fn t06_trae_only_model_goes_trae() {
+        let f = fixture(&["Doubao-Seed-Evolving"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let r = f.resolve("Doubao-Seed-Evolving").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "Doubao-Seed-Evolving");
+        assert!(r.effort_hint.is_none());
+    }
+
+    /// 不属于任何目录的未知模型 → Trae 透传（现状语义：未命中 WB 目录走 SOLO）
+    #[test]
+    fn t07_unknown_model_passthrough_trae() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let r = f.resolve("my-custom-model").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "my-custom-model");
+    }
+
+    // ---------- 维度三：池状态 ----------
+
+    /// 双源 + Buddy 池耗尽 → 跨池回退 Trae + fallback_from 记录
+    #[test]
+    fn t08_dual_buddy_exhausted_falls_back_trae() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        // wb_pool 空 = 无健康账号
+        let r = f.resolve("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.fallback_from, Some(TargetPool::Buddy));
+        assert!(f.app_log_contains("dispatch fallback: model=glm-5.3 pool=trae preferred=buddy reason=no_healthy_account"));
+    }
+
+    /// 双源 + Trae 池耗尽（priority 模式 trae 优先）→ 回退 Buddy
+    #[test]
+    fn t09_dual_trae_exhausted_falls_back_buddy() {
+        let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
+        p.priority = vec!["trae".into(), "buddy".into()];
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(false);
+        let r = f.resolve("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.fallback_from, Some(TargetPool::Trae));
+    }
+
+    /// 双源 + wb_enabled=false → Buddy 源剔除，走 Trae
+    #[test]
+    fn t10_dual_wb_disabled_goes_trae() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.set_wb_enabled(false);
+        let r = f.resolve("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert!(r.fallback_from.is_none(), "源剔除不算回退");
+    }
+
+    /// 仅 Buddy 源 + wb_enabled=false → 显式报错（保持 wb_upstream_disabled 语义）
+    #[test]
+    fn t11_buddy_only_wb_disabled_errors() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.set_wb_enabled(false);
+        assert_eq!(f.resolve("hy4").unwrap_err(), DispatchError::WbDisabled);
+    }
+
+    /// 回归锁（2026-10-19 实机 503）：Trae 池唯一账号余额 0（积分快照已刷新）→
+    /// 必须报 InsufficientCredits(402) 而不是 NoHealthy(503)——后者让用户以为账号丢了
+    #[test]
+    fn trae_zero_credit_reports_insufficient_credits() {
+        let f = fixture(&["deepseek-v4.1-flash"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.state.pool.set_reserve_credits(50.0);
+        // 真实积分回写：余额 0（对应实机 remaining_credits.credits = 0.0）
+        let mut snap = HashMap::new();
+        snap.insert("t1".to_string(), (0.0f64, Some(4_000_001_000i64)));
+        f.state.pool.update_credits_snapshot(&snap);
+        assert_eq!(
+            f.resolve("deepseek-v4.1-flash").unwrap_err(),
+            DispatchError::InsufficientCredits(TargetPool::Trae)
+        );
+        // 充值后同一请求恢复（证明判定只在额度维度上生效）
+        let mut snap = HashMap::new();
+        snap.insert("t1".to_string(), (500.0f64, Some(4_000_001_000i64)));
+        f.state.pool.update_credits_snapshot(&snap);
+        assert_eq!(f.resolve("deepseek-v4.1-flash").unwrap().pool, TargetPool::Trae);
+    }
+
+    /// 零倍率（免费）模型在余额 0 时仍应放行：预检与取号同口径（Qoder 早已如此，
+    /// Trae/Buddy 本轮补齐）——否则免费模型请求在预检即被 503 打死
+    #[test]
+    fn free_model_passes_precheck_with_zero_balance() {
+        let f = fixture(&["free-cat-model"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        // Trae 侧该模型 rate=0（免费）；余额 0
+        // 注：ModelOption.label 是非 Option 字段，缺了会导致整表反序列化失败、回落到内置目录
+        let models = serde_json::json!([{"id": "free-cat-model", "label": "free-cat-model", "rate": 0.0}]);
+        crate::store::db(&f.dir).kv_set("api_models", &models).unwrap();
+        // 热路径缓存（5s TTL）必须显式失效，否则读到的还是 fixture 种下的旧列表
+        super::super::config_cache::invalidate(&f.dir, "api_models");
+        let mut snap = HashMap::new();
+        snap.insert("t1".to_string(), (0.0f64, Some(4_000_001_000i64)));
+        f.state.pool.update_credits_snapshot(&snap);
+        assert_eq!(f.resolve("free-cat-model").unwrap().pool, TargetPool::Trae);
+    }
+
+    /// 仅 Buddy 源 + Buddy 池耗尽 → 503 语义（NoHealthy），不跨池回退
+    #[test]
+    fn t12_buddy_only_exhausted_errors() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true); // Trae 池健康但非双源，不得回退
+        assert_eq!(
+            f.resolve("hy4").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Buddy)
+        );
+    }
+
+    /// 仅 Buddy 源 + 模型级冷却 → 429 语义（ModelCooling）
+    #[test]
+    fn t13_buddy_only_model_cooldown_errors() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        super::super::wb_route::note_model_failure(&f.state, "hy4");
+        assert!(matches!(
+            f.resolve("hy4").unwrap_err(),
+            DispatchError::ModelCooling(_, TargetPool::Buddy)
+        ));
+    }
+
+    /// 冷却尾巴（剩余 ≤ SHORT_COOLDOWN_GRACE_SECS）不硬 429：单源 Buddy + 2s 冷却
+    /// → 照常选 Buddy（交执行路径排队退避消化）；长窗口（30s）仍走 429。
+    /// 根因场景：排队挂上的 1s 窗口把并发请求打成 429，客户端自猜退避 4.3s。
+    #[test]
+    fn t13b_short_model_cooldown_passes_through() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        for (offset, expect_cooling) in [(2i64, false), (30i64, true)] {
+            f.state
+                .model_cooldowns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert("hy4".into(), (now_ts() + offset, 1));
+            let r = f.resolve("hy4");
+            if expect_cooling {
+                assert!(matches!(r.unwrap_err(), DispatchError::ModelCooling(_, TargetPool::Buddy)));
+            } else {
+                assert_eq!(r.unwrap().pool, TargetPool::Buddy);
+                // SCHED 可观测行经异步写盘队列落当日日志：显式 flush 后校验
+                f.state.logger.flush();
+                assert!(
+                    f.app_log_contains("冷却尾巴宽松放行"),
+                    "尾巴放行应留 SCHED 可观测行"
+                );
+            }
+        }
+    }
+
+    /// 双源 + Buddy 模型级冷却 → 跨池回退 Trae（reason=model_cooldown）
+    #[test]
+    fn t14_dual_model_cooldown_falls_back_trae() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        super::super::wb_route::note_model_failure(&f.state, "glm-5.3");
+        let r = f.resolve("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert!(f.app_log_contains("reason=model_cooldown"));
+    }
+
+    /// 仅 Trae 源 + Trae 池耗尽 → 503 语义
+    #[test]
+    fn t15_trae_only_exhausted_errors() {
+        let f = fixture(&["Doubao-Seed-Evolving"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(false); // Buddy 池健康但非双源
+        assert_eq!(
+            f.resolve("Doubao-Seed-Evolving").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Trae)
+        );
+    }
+
+    /// fallback=false + 双源 + 首选池耗尽 → 不回退，显式报错
+    #[test]
+    fn t16_fallback_disabled_no_cross_pool() {
+        let mut p = policy_default();
+        p.fallback = false;
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true); // Trae 池健康，但 fallback 关闭
+        assert_eq!(
+            f.resolve("glm-5.3").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Buddy)
+        );
+    }
+
+    // ---------- 会话池粘性（§4.4） ----------
+
+    /// 粘性命中：上一轮 Buddy 服务成功后，策略改为 trae 优先仍在 TTL 内沿用 Buddy
+    #[test]
+    fn t17_pool_sticky_overrides_policy() {
+        let mut p = policy_default();
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        // 第一轮：默认策略 → Buddy，写入粘性
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
+        // 策略热改为 trae 优先
+        p.priority = vec!["trae".into(), "buddy".into()];
+        crate::store::db(&f.dir).kv_set("dispatch_policy", &p).unwrap();
+        // 批次 A：绕过 save_policy 的 kv 直写需手动失效缓存（与生产写路径语义对齐）
+        super::super::config_cache::invalidate(&f.dir, "dispatch_policy");
+        // 同一会话（消息指纹相同）→ 沿用 Buddy
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
+    }
+
+    /// 粘性池不可用（Buddy 耗尽）→ 实时回退，不卡死在粘性池
+    #[test]
+    fn t18_sticky_pool_unavailable_falls_back() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
+        // Buddy 池清空（模拟全冷却）：注入冷却使账号不可选
+        f.state.wb_pool.note_error("b1", super::super::ErrKind::SessionDead);
+        let r = f.resolve("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.fallback_from, Some(TargetPool::Buddy));
+    }
+
+    /// 不同会话不共享粘性：B 会话按策略走 Trae
+    #[test]
+    fn t19_sticky_is_per_session() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        // 会话 A（带 conversation_id）→ Buddy 并粘性
+        let a = resolve_target(
+            &f.state,
+            "glm-5.3",
+            &json!({"model": "glm-5.3", "conversation_id": "sessA", "messages": []}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(a.pool, TargetPool::Buddy);
+        // 会话 B（不同 conversation_id）→ 按策略仍 Buddy（默认序），但改动策略验证不粘连：
+        // 这里验证粘性键按会话隔离：仅会话 A 续期，B 不受 A 影响（两者池一致故对比 fallback）
+        // 直接改策略后 B 应走 trae（未被 A 的粘性污染）
+        let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
+        p.priority = vec!["trae".into(), "buddy".into()];
+        crate::store::db(&f.dir).kv_set("dispatch_policy", &p).unwrap();
+        // 批次 A：kv 直写后失效策略缓存（见 t17 注释）
+        super::super::config_cache::invalidate(&f.dir, "dispatch_policy");
+        let b = resolve_target(
+            &f.state,
+            "glm-5.3",
+            &json!({"model": "glm-5.3", "conversation_id": "sessB", "messages": []}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(b.pool, TargetPool::Trae);
+        // 会话 A 仍然粘 Buddy
+        let a2 = resolve_target(
+            &f.state,
+            "glm-5.3",
+            &json!({"model": "glm-5.3", "conversation_id": "sessA", "messages": []}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(a2.pool, TargetPool::Buddy);
+    }
+
+    /// 空消息体（无会话键）→ 不粘性，每请求按策略判定
+    #[test]
+    fn t20_no_session_key_no_sticky() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let r1 = resolve_target(&f.state, "glm-5.3", &json!({"model": "glm-5.3"}), None).unwrap();
+        assert_eq!(r1.pool, TargetPool::Buddy);
+        // 粘性表为空
+        assert!(f.state.pool_sticky.lock().unwrap().is_empty());
+    }
+
+    // ---------- 策略加载与合法性 ----------
+
+    /// 策略文件缺失 → 默认 ["buddy","trae","qoder"]；非法池名被过滤
+    #[test]
+    fn t21_policy_missing_and_invalid_values() {
+        let dir = std::env::temp_dir().join(format!("twa_policy_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        // 缺失
+        let p = load_policy(&dir);
+        assert_eq!(
+            p.priority,
+            vec!["buddy".to_string(), "trae".to_string(), "qoder".to_string()]
+        );
+        assert!(p.fallback);
+        // 非法值（kv 直写）
+        crate::store::db(&dir)
+            .kv_set("dispatch_policy", &json!({"priority": ["wb", "", "trae"], "fallback": false}))
+            .unwrap();
+        // 批次 A：kv 直写后失效缓存（生产路径经 save_policy 自动失效）
+        super::super::config_cache::invalidate(&dir, "dispatch_policy");
+        let p = load_policy(&dir);
+        assert_eq!(p.priority, vec!["trae".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// save → load 往返 + updated_at 落盘
+    #[test]
+    fn t22_policy_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("twa_policy_rt_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let mut p = DispatchPolicy::default();
+        p.per_model.insert("glm-5.3".into(), vec!["trae".into()]);
+        save_policy(&dir, &p).unwrap();
+        let loaded = load_policy(&dir);
+        assert_eq!(loaded.per_model.get("glm-5.3").unwrap(), &vec!["trae".to_string()]);
+        assert!(loaded.updated_at > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// canonical_id 三处键统一：目录归并 / per_model / meta 覆盖层同一语义
+    #[test]
+    fn t23_canonical_id_semantics() {
+        assert_eq!(canonical_id("  GLM-5.3 "), "glm-5.3");
+        assert_eq!(canonical_id("DeepSeek-V4-Flash"), "deepseek-v4-flash");
+        assert_eq!(canonical_id("glm-5.3"), canonical_id(" GLM-5.3"));
+    }
+
+    // ---------- 行为兼容（对比用例，§10 关键断言） ----------
+
+    /// 对比用例：默认策略下，WB 目录命中即 Buddy、未命中即 Trae——
+    /// 与改造前 resolve_wb_target 判定完全一致（含 -thinking 后缀四段管线）
+    #[test]
+    fn t24_default_routing_parity_with_pre_refactor() {
+        // hy4 仅 WB → Buddy（改前：resolve_wb_target Some → WB）
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        assert_eq!(f.resolve("hy4").unwrap().pool, TargetPool::Buddy);
+        // Doubao-Seed-Evolving 仅 Trae → Trae（改前：None → SOLO）
+        let f2 = fixture(&["Doubao-Seed-Evolving"], Some(&["hy4"]), Some(&policy_default()));
+        f2.seed_healthy(true);
+        assert_eq!(f2.resolve("Doubao-Seed-Evolving").unwrap().pool, TargetPool::Trae);
+        // glm-5.3 双源 → Buddy（改前：WB 优先）
+        let f3 = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f3.seed_healthy(true);
+        f3.seed_healthy(false);
+        assert_eq!(f3.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
+    }
+
+    /// 双源模型 wb_enabled=false 时走 Trae，恢复后回到 Buddy（开关热切换；
+    /// 无会话键请求不受粘性干扰）
+    #[test]
+    fn t25_wb_toggle_hot_switch() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        f.set_wb_enabled(false);
+        assert_eq!(f.resolve_no_session("glm-5.3").unwrap().pool, TargetPool::Trae);
+        f.set_wb_enabled(true);
+        assert_eq!(f.resolve_no_session("glm-5.3").unwrap().pool, TargetPool::Buddy);
+    }
+
+    /// 回退后软粘生效：同会话沿用实际服务的 Trae 池（TTL 内防抖动），
+    /// 新会话按策略回到恢复后的 Buddy
+    #[test]
+    fn t26_fallback_then_recovery() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        // Buddy 耗尽 → 回退 Trae
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Trae);
+        // 同会话：软粘沿用 Trae（池粘性设计语义 §4.4）
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Trae);
+        // Buddy 恢复（重新注入健康账号）后，新会话按策略走 Buddy
+        f.seed_healthy(false);
+        let fresh = resolve_target(
+            &f.state,
+            "glm-5.3",
+            &json!({"model": "glm-5.3", "conversation_id": "sess-new", "messages": []}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(fresh.pool, TargetPool::Buddy);
+    }
+
+    /// Trae 目标透传模型名且无 effort 提示；Buddy 目标携带归一化模型
+    #[test]
+    fn t27_resolved_payload_shape() {
+        let f = fixture(&["glm-5.3"], Some(["glm-5.3"].as_slice()), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let b = f.resolve("glm-5.3").unwrap();
+        assert_eq!(b.pool, TargetPool::Buddy);
+        assert_eq!(b.model, "glm-5.3");
+        // 仅 Trae：模型名原样透传
+        let f2 = fixture(&["Kimi-K3"], Some(&["hy4"]), Some(&policy_default()));
+        f2.seed_healthy(true);
+        let t = f2.resolve("Kimi-K3").unwrap();
+        assert_eq!(t.pool, TargetPool::Trae);
+        assert_eq!(t.model, "Kimi-K3");
+        assert!(t.effort_hint.is_none());
+    }
+
+    // ---------- 后缀剥离跨池（issue #31 T3.1） ----------
+
+    /// Trae-only 模型带 -thinking 后缀 → 剥离后以基名路由，effort 提示随池携带
+    /// （Buddy 管线 ④ 段因基名不在 Buddy 目录未命中，全名透传会报模型不存在）
+    #[test]
+    fn t42_trae_only_suffix_stripped_with_effort_hint() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        // 目录排除 glm-5.3 → "glm-5.3-thinking" 的基名仅在 Trae 源（T3.1 触发前提）
+        catalog_only(&f.dir, "hy4");
+        f.seed_healthy(true);
+        let r = f.resolve("glm-5.3-thinking").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "glm-5.3");
+        assert_eq!(r.effort_hint.as_deref(), Some("high"));
+    }
+
+    /// 无后缀 Trae-only 模型保持原名透传 + 无 effort 提示（零行为差异）
+    #[test]
+    fn t43_trae_only_no_suffix_unchanged() {
+        let f = fixture(&["Kimi-K3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let r = f.resolve("Kimi-K3").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "Kimi-K3");
+        assert!(r.effort_hint.is_none());
+    }
+
+    /// 未知模型带后缀但基名不在 Trae 模型列表 → 原名透传（不剥离，透传语义不变）
+    #[test]
+    fn t44_unknown_model_suffix_passthrough() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let r = f.resolve("ghost-model-thinking").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "ghost-model-thinking");
+        assert!(r.effort_hint.is_none());
+    }
+
+    /// 自定义后缀跨池剥离（effort 值取条目配置；基名命中 Trae 源即生效）
+    #[test]
+    fn t45_custom_suffix_stripped_cross_pool() {
+        let f = fixture(&["kimi-k3"], Some(&["hy4"]), Some(&policy_default()));
+        // 目录排除 kimi-k3 → "kimi-k3-deep" 的基名仅在 Trae 源（T3.1 触发前提）
+        catalog_only(&f.dir, "hy4");
+        crate::store::db(&f.dir)
+            .kv_set(
+                "wb_model_route",
+                &json!({"suffixes": [{"suffix": "-deep", "effort": "xhigh"}]}),
+            )
+            .unwrap();
+        f.seed_healthy(true);
+        let r = f.resolve("kimi-k3-deep").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "kimi-k3");
+        assert_eq!(r.effort_hint.as_deref(), Some("xhigh"));
+    }
+
+    // ---------- Max Mode 入口后缀（issue #31 T4.2） ----------
+
+    /// Trae-only 模型带 -max 入口后缀 → 剥离为基名 + max 入口标志置位（无 effort 提示）
+    #[test]
+    fn t46_trae_only_max_suffix_stripped() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        // 目录排除 glm-5.3 → "glm-5.3-max" 的基名仅在 Trae 源
+        catalog_only(&f.dir, "hy4");
+        f.seed_healthy(true);
+        let r = f.resolve("glm-5.3-max").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "glm-5.3");
+        assert!(r.max_mode_hint);
+        assert!(r.effort_hint.is_none());
+    }
+
+    /// 整名以 -max 结尾的真模型（qwen3.8-max）整名在列表 → 原名透传不误剥、
+    /// 不置 max 入口标志（整名优先守卫）
+    #[test]
+    fn t47_real_name_max_suffix_not_stripped() {
+        let f = fixture(&["qwen3.8-max"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let r = f.resolve("qwen3.8-max").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "qwen3.8-max");
+        assert!(!r.max_mode_hint);
+    }
+
+    /// -max 基名不在 Trae 模型列表 → 原名透传（透传语义不变、不置标志）
+    #[test]
+    fn t48_unknown_model_max_suffix_passthrough() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let r = f.resolve("ghost-model-max").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "ghost-model-max");
+        assert!(!r.max_mode_hint);
+    }
+
+    // ---------- 智能调度（DispatchStrategy::Smart） ----------
+
+    /// smart：Buddy 声明倍率 0.5 < Trae 未声明（后置）→ 即使 priority trae 优先也选 Buddy
+    #[test]
+    fn t28_smart_prefers_declared_rate() {
+        let mut p = policy_default();
+        p.priority = vec!["trae".into(), "buddy".into()];
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
+    }
+
+    /// smart：Trae 声明更低倍率 0.3 < Buddy 0.5 → Trae 胜出（倍率序反向验证）
+    #[test]
+    fn t29_smart_lower_rate_wins() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        // 给 Trae 侧 api_models 条目补 rate=0.3（fixture 默认不带 rate）
+        crate::store::db(&f.dir)
+            .kv_set("api_models", &json!([{"id": "glm-5.3", "label": "glm-5.3", "rate": 0.3}]))
+            .unwrap();
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Trae);
+    }
+
+    /// smart：per_model 显式覆盖不做智能重排（用户显式配置优先）
+    #[test]
+    fn t30_smart_skips_per_model_override() {
+        let mut p = policy_default();
+        p.per_model.insert("glm-5.3".into(), vec!["trae".into()]);
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Trae);
+    }
+
+    // ---------- Key 资源池绑定（issue #25） ----------
+
+    /// 绑定池 > 全局策略：默认策略 Buddy 优先 + smart 重排，Key 绑定 trae → Trae
+    #[test]
+    fn t31_bind_pool_overrides_policy_and_smart() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        // 先无 Key 请求：按全局策略走 Buddy 并写粘性（避免污染后续断言）
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
+        // 绑定 trae 的 Key 同会话请求：粘性池 ≠ 绑定池不沿用，绑定序覆盖全局策略
+        f.seed_key("k1", "trae", &[]);
+        assert_eq!(f.resolve_key("glm-5.3", "k1").unwrap().pool, TargetPool::Trae);
+    }
+
+    /// 绑定池 > 会话池粘性（双向）：粘性池 ≠ 当前 Key 绑定池时不沿用，
+    /// 每次都按当前 Key 的绑定序重新选池
+    #[test]
+    fn t32_bind_pool_beats_sticky() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        f.seed_key("k1", "trae", &[]);
+        f.seed_key("k2", "buddy", &[]);
+        // k1 → Trae，写粘性 Trae
+        assert_eq!(f.resolve_key("glm-5.3", "k1").unwrap().pool, TargetPool::Trae);
+        // 同会话 k2：粘性 Trae ≠ 绑定 Buddy → 不沿用 → Buddy
+        assert_eq!(f.resolve_key("glm-5.3", "k2").unwrap().pool, TargetPool::Buddy);
+        // 同会话 k1：粘性 Buddy ≠ 绑定 Trae → 不沿用 → Trae
+        assert_eq!(f.resolve_key("glm-5.3", "k1").unwrap().pool, TargetPool::Trae);
+    }
+
+    /// 绑定池不健康：fallback 开（默认）→ 回退另一池 + warn 日志（D1 优先非硬限制）
+    #[test]
+    fn t33_bind_pool_unhealthy_falls_back() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(false); // 仅 Buddy 健康，Trae 池耗尽
+        f.seed_key("k1", "trae", &[]);
+        let r = f.resolve_key("glm-5.3", "k1").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.fallback_from, Some(TargetPool::Trae));
+        assert!(f.app_log_contains("dispatch fallback: model=glm-5.3 pool=buddy preferred=trae reason=no_healthy_account"));
+
+        // fallback 关：绑定池不健康 → 显式报错（不回退）
+        let mut p = policy_default();
+        p.fallback = false;
+        let f2 = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f2.seed_healthy(false);
+        f2.seed_key("k1", "trae", &[]);
+        assert_eq!(
+            f2.resolve_key("glm-5.3", "k1").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Trae)
+        );
+    }
+
+    /// 绑定池白名单感知健康预检：绑定 buddy + 白名单 [b2]（池内仅 b1）→
+    /// Buddy 对该 Key 不健康 → 回退 Trae；fallback 关 → NoHealthy(Buddy)
+    #[test]
+    fn t34_bind_pool_whitelist_aware_health() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false); // 池内仅 b1，不在白名单
+        f.seed_key("k1", "buddy", &["b2"]);
+        assert_eq!(f.resolve_key("glm-5.3", "k1").unwrap().pool, TargetPool::Trae);
+
+        let mut p = policy_default();
+        p.fallback = false;
+        let f2 = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f2.seed_healthy(true);
+        f2.seed_healthy(false);
+        f2.seed_key("k1", "buddy", &["b2"]);
+        assert_eq!(
+            f2.resolve_key("glm-5.3", "k1").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Buddy)
+        );
+    }
+
+    /// D2 绑定是池偏好非模型过滤：绑定 trae + 模型仅 Buddy 源（hy4）→ 仍走 Buddy
+    #[test]
+    fn t35_bind_pool_is_preference_not_filter() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        f.seed_key("k1", "trae", &[]);
+        let r = f.resolve_key("hy4", "k1").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert!(r.fallback_from.is_none(), "唯一可用池不算回退");
+    }
+
+    /// 非法 bind_pool 值视为未绑定：跟随全局策略（默认 Buddy 优先）
+    #[test]
+    fn t36_bind_pool_invalid_value_follows_global() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        f.seed_key("k1", "openai", &[]);
+        assert_eq!(f.resolve_key("glm-5.3", "k1").unwrap().pool, TargetPool::Buddy);
+    }
+
+    /// routes::trae_pool_constraints 四种作用域（复用本模块 Fixture 构造状态）：
+    /// 未绑定/绑定 buddy → (None, None)；绑定 trae → 提取白名单 + 专一；未知 Key → 匿名
+    #[test]
+    fn t37_trae_pool_constraints_scopes() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), None);
+        // 先种满全部 Key 再断言：constraints_for 首读后走内存缓存，后续直写不可见
+        f.seed_key("k0", "", &["b1"]);
+        f.seed_key_cfg("k1", "trae", &["t1", "t2"], super::super::api_keys::MODE_DEDICATED, "t2");
+        f.seed_key("k2", "buddy", &["b1"]);
+        f.seed_key_cfg("k3", "trae", &["t1"], super::super::api_keys::MODE_EXPIRE_FIRST, "");
+
+        // 未绑定 Key：白名单历来只作用 WB 池，绝不波及 Trae 池（F-35 兼容红线）
+        let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "k0");
+        assert!(a.is_none() && d.is_none(), "未绑定 Key 的白名单不得作用于 Trae 池");
+
+        // 绑定 trae + 专一：白名单与 dedicated 均提取（dedicated 非空优先于 allowed 首个）
+        let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "k1");
+        let set = a.expect("绑定 trae 应提取白名单");
+        assert!(set.contains("t1") && set.contains("t2"));
+        assert_eq!(d.as_deref(), Some("t2"));
+
+        // 绑定 buddy：白名单指 Buddy 账号体系，Trae 侧不应用
+        let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "k2");
+        assert!(a.is_none() && d.is_none());
+
+        // 绑定 trae + 临期优先：只提取白名单，无 dedicated
+        let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "k3");
+        assert!(a.is_some() && d.is_none());
+
+        // 未知 Key（已注销/匿名）：不限制
+        let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "nope");
+        assert!(a.is_none() && d.is_none());
+    }
+
+    // ---------- issue #29 调度失败可观测性 ----------
+
+    /// NoHealthy 详情（修复2）：匿名/未知 Key 仅报池健康数，不编造约束细节
+    #[test]
+    fn t39_no_healthy_detail_anonymous_pool_only() {
+        let f = fixture(&[], None, None);
+        let msg = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "anonymous");
+        assert!(msg.starts_with("no healthy account available"), "{msg}");
+        assert!(msg.contains("pool=trae healthy=0"), "{msg}");
+        assert!(!msg.contains("key="), "匿名 Key 不应携带约束细节: {msg}");
+    }
+
+    /// NoHealthy 详情（修复2）：Key 约束细节（绑定池/白名单条数/作用域健康数）——
+    /// 白名单指向池外账号时 healthy_in_scope=0 直接暴露「约束排除致败」根因
+    #[test]
+    fn t40_no_healthy_detail_key_constraints() {
+        let f = fixture(&[], None, None);
+        f.seed_healthy(true); // trae 池健康账号 t1
+        // 先种满全部 Key 再断言：constraints_for 首读后走内存缓存，后续直写不可见
+        f.seed_key("k1", "trae", &["t9"]); // 白名单指向池外账号
+        f.seed_key("k2", "trae", &["t1"]); // 白名单命中池内健康账号
+
+        let msg = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "k1");
+        assert!(msg.contains("pool=trae healthy=1"), "{msg}");
+        assert!(msg.contains("key=k1"), "{msg}");
+        assert!(msg.contains("bind=trae"), "{msg}");
+        assert!(msg.contains("whitelist=1"), "{msg}");
+        assert!(msg.contains("healthy_in_scope=0"), "{msg}");
+
+        let msg2 = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "k2");
+        assert!(msg2.contains("healthy_in_scope=1"), "{msg2}");
+    }
+
+    /// 修复1 直测：调度阶段失败落 API 请求日志——NoHealthy → status=503、
+    /// uid="-"（未取号）、acct="-"、error 携带 no healthy 详情与约束根因
+    #[test]
+    fn t41_dispatch_error_logs_request() {
+        let f = fixture(&[], None, None);
+        f.seed_healthy(true); // trae 池健康账号 t1
+        // 先种满全部 Key 再断言：constraints_for 首读后走内存缓存，后续直写不可见
+        f.seed_key("k1", "trae", &["t9"]); // 白名单指向池外 → healthy_in_scope=0
+
+        let resp = super::super::routes::dispatch_error_response(
+            &f.state,
+            DispatchError::NoHealthy(TargetPool::Trae),
+            super::super::routes::Protocol::OpenAi,
+            "glm-5.3",
+            false,
+            "k1",
+            12,
+        );
+        assert_eq!(resp.status().as_u16(), 503);
+
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let content = f
+            .state
+            .logger
+            .read_log(&date)
+            .expect("调度失败应落 API 请求日志");
+        let line = content
+            .lines()
+            .find(|l| l.contains("pool=trae") && l.contains("model=glm-5.3"))
+            .expect("应存在 pool=trae model=glm-5.3 日志行");
+        assert!(line.contains("status=503"), "{line}");
+        assert!(line.contains("key=k1"), "{line}");
+        assert!(line.contains("uid=- "), "调度阶段未取号，uid 应为占位符: {line}");
+        assert!(line.contains(" acct=- "), "调度阶段无账号，acct 应为占位符: {line}");
+        assert!(line.contains("error=no healthy account available"), "{line}");
+        assert!(line.contains("healthy_in_scope=0"), "{line}");
+    }
+
+    // ---------- issue #26 全局模型白名单 ----------
+
+    /// 白名单感知后台任务降级（dispatch 白名单联动）：候选 ∩ 白名单非空 →
+    /// 取白名单内最低倍率；交集为空 → 跳过降级保持原模型（原模型已过端点准入）
+    #[test]
+    fn t38_whitelist_aware_bg_downgrade() {
+        // 内置目录（fixture 写入的 kv 因 builtin_rev=0 触发内置表重建）：
+        // 全局最低为 hy4-preview(0.00 免费档)，原模型 glm-5.3(0.78)
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        f.state
+            .wb_bg_downgrade
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 后台任务体：max_tokens ≤ 128 + 短文本（is_background_task = true）
+        let bg_body = || {
+            json!({"model": "glm-5.3", "max_tokens": 16,
+                   "messages": [{"role": "user", "content": "生成标题"}]})
+        };
+
+        // 白名单含 glm-5.3-flash(0.06) + glm-5.3 → 降级取白名单内最低倍率（跳过被禁的 0.00 免费档）
+        super::super::unified_catalog::save_whitelist(
+            &f.dir,
+            &["GLM-5.3-Flash".to_string(), "GLM-5.3".to_string()],
+        )
+        .unwrap();
+        let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.model, "glm-5.3-flash", "降级候选 ∩ 白名单 → 白名单内最低倍率");
+
+        // 白名单仅含原模型 → 候选集只剩 glm-5.3，不落入被禁模型
+        super::super::unified_catalog::save_whitelist(&f.dir, &["GLM-5.3".to_string()]).unwrap();
+        let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
+        assert_eq!(r.model, "glm-5.3", "降级候选不在白名单 → 跳过降级保持原模型");
+
+        // 白名单清空（不限）→ 正常降级到目录最低倍率 hy4-preview
+        super::super::unified_catalog::save_whitelist(&f.dir, &[]).unwrap();
+        let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
+        assert_eq!(r.model, "hy4-preview", "空白名单不限 → 后台任务降级取目录最低倍率");
+    }
+
+    // ==================== Qoder 源参与调度（p3-3） ====================
+
+    /// 启用 Qoder 并种一个健康账号
+    fn seed_qoder(f: &Fixture) {
+        f.state
+            .qoder_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        f.state.qoder_pool.sync_from_qoder(
+            &[super::super::pool::QoderSyncAccount {
+                uid: "q1".into(),
+                name: "qacc".into(),
+                access_token: "tk".into(),
+                machine_id: String::new(),
+                needs_relogin: false,
+                credits: None,
+                credits_expire_at: None,
+                credits_fetched_at: None,
+            }],
+            &["q1".to_string()],
+        );
+    }
+
+    /// 仅 Qoder 源模型（MiniMax-M2.7 为 Qoder 目录独有；Sonus 已按产品决策
+    /// 下线，见 qoder_upstream::REMOVED_MODEL_IDS）+ 池健康 → Qoder 接管
+    #[test]
+    fn t40_qoder_only_model_goes_qoder() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        seed_qoder(&f);
+        let r = f.resolve("MiniMax-M2.7").unwrap();
+        assert_eq!(r.pool, TargetPool::Qoder);
+        assert_eq!(r.model, "MiniMax-M2.7", "final model = 目录归一化 id");
+        assert!(r.fallback_from.is_none());
+    }
+
+    /// 仅 Qoder 源 + qoder_enabled=false → 显式报错（WbDisabled 镜像语义）
+    #[test]
+    fn t41_qoder_only_disabled_errors() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        assert_eq!(
+            f.resolve("MiniMax-M2.7").unwrap_err(),
+            DispatchError::QoderDisabled
+        );
+    }
+
+    /// 仅 Qoder 源 + 池耗尽 → 503 语义 NoHealthy(Qoder)，不回退 Buddy/Trae
+    #[test]
+    fn t42_qoder_only_exhausted_errors() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.state
+            .qoder_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 池空 = 无健康账号（单源不跨池回退）
+        assert_eq!(
+            f.resolve("MiniMax-M2.7").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Qoder)
+        );
+    }
+
+    /// buddy+qoder 双源模型（不在 Trae 列表）：wb_enabled=false 且 qoder_enabled=true
+    /// → 不误报 WbDisabled，路由 Qoder（三源早退对称性修复，审查 p3-3）
+    #[test]
+    fn t43_buddy_qoder_dual_source_wb_off_routes_qoder() {
+        // DeepSeek-V4-Pro 同在 WB 目录与 Qoder CN 兜底表、不在 Trae 列表
+        let f = fixture(
+            &["glm-5.3"],
+            Some(&["DeepSeek-V4-Pro"]),
+            Some(&policy_default()),
+        );
+        seed_qoder(&f);
+        f.state
+            .wb_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let r = f.resolve("DeepSeek-V4-Pro").unwrap();
+        assert_eq!(r.pool, TargetPool::Qoder);
+        assert_eq!(r.model, "DeepSeek-V4-Pro");
+    }
+
+    /// buddy+qoder 双源模型：wb 与 qoder 双双关闭 → 显式报错不静默（WbDisabled
+    /// 先命中：默认优先级 Buddy 居首，关闭侧语义以 Buddy 为准）
+    #[test]
+    fn t44_buddy_qoder_dual_source_both_off_errors() {
+        let f = fixture(
+            &["glm-5.3"],
+            Some(&["DeepSeek-V4-Pro"]),
+            Some(&policy_default()),
+        );
+        f.state
+            .wb_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            f.resolve("DeepSeek-V4-Pro").unwrap_err(),
+            DispatchError::WbDisabled
+        );
+    }
+
+    /// 仅 Trae 源模型 + trae_enabled=false → 显式报错（同族镜像；默认开不受影响）。
+    /// ghost-model = 未知模型透传形态（单源 Trae：WB 路由未命中 + Qoder 目录未收录，
+    /// t44 已固化其 buddy/qoder 双无源语义）
+    #[test]
+    fn t45_trae_only_disabled_errors() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.state
+            .trae_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            f.resolve("ghost-model").unwrap_err(),
+            DispatchError::TraeDisabled
+        );
+    }
+
+    /// trae+buddy 双源模型 + trae_enabled=false + wb 开 → Buddy 接管不报错
+    /// （开关关闭 = 源剔除语义，与 wb_enabled 关闭同族）
+    #[test]
+    fn t46_trae_disabled_falls_back_to_buddy() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        // 健康账号两侧各一：Trae 池健康但开关关，Buddy 池健康接管
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        f.state
+            .trae_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let r = f.resolve("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert!(r.fallback_from.is_none(), "源剔除不算回退");
+    }
+
+    // ==================== 方案 C 双区池（国际版就绪/入池） ====================
+
+    /// 种一个健康国际版账号（只进 qoder_intl_pool，CN 池保持空）
+    fn seed_qoder_intl(f: &Fixture) {
+        f.state
+            .qoder_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        f.state.qoder_intl_pool.sync_from_qoder(
+            &[super::super::pool::QoderSyncAccount {
+                uid: "qi1".into(),
+                name: "intlacc".into(),
+                access_token: "tk".into(),
+                machine_id: String::new(),
+                needs_relogin: false,
+                credits: None,
+                credits_expire_at: None,
+                credits_fetched_at: None,
+            }],
+            &["qi1".to_string()],
+        );
+    }
+
+    /// 写入 app_settings（区域分流设置源：默认区域 / 国际版池开关）
+    fn set_qoder_settings(f: &Fixture, default_realm: &str, intl_enabled: bool) {
+        let mut s: crate::models::Settings = Default::default();
+        s.qoder_default_realm = default_realm.to_string();
+        s.qoder_intl_enabled = intl_enabled;
+        crate::store::db(&f.dir).kv_set("app_settings", &s).unwrap();
+    }
+
+    /// 只有国际版池有账号时的分流（本 bug 的回归锁）：
+    /// ① 池访问器把两区标签映射到各自独立池实例（取号/回写/状态全经它分流）
+    /// ② `qoder-intl/<model>` 前缀 → 预检按 INTL 池判定通过并路由 Qoder
+    /// ③ 默认区域 = INTL 的无前缀请求同样命中
+    /// ④ `qoder/<model>`（显式国内区）→ 仍按 CN 池判定 → NoHealthy，跨区不借号
+    #[test]
+    fn t47_qoder_intl_pool_serves_intl_requests() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        seed_qoder_intl(&f);
+        set_qoder_settings(&f, crate::tasks::qoder_realm::INTL, true);
+
+        // ① 池访问器分流（INL 标签 → 国际池；CN/兼容别名 → 国内池）
+        assert!(std::ptr::eq(
+            f.state.qoder_pool_for("qoder_intl"),
+            &f.state.qoder_intl_pool
+        ));
+        assert!(std::ptr::eq(
+            f.state.qoder_pool_for("qoder_cn"),
+            &f.state.qoder_pool
+        ));
+        assert!(std::ptr::eq(
+            f.state.qoder_pool_for("qoder"),
+            &f.state.qoder_pool
+        ));
+        // 国际池就绪：有可选账号（旧实现 qoder_pool_status 只报 CN 池 → 页面恒 0 就绪）
+        assert_eq!(f.state.qoder_intl_pool.status_list().len(), 1);
+        assert_eq!(f.state.qoder_pool.status_list().len(), 0);
+
+        // ② 国际区前缀命中
+        let r = f.resolve("qoder-intl/MiniMax-M2.7").unwrap();
+        assert_eq!(r.pool, TargetPool::Qoder);
+        assert!(
+            r.model.ends_with("MiniMax-M2.7"),
+            "前缀剥离后应保留裸名，实际 {}",
+            r.model
+        );
+        // ③ 默认区域 INTL 的无前缀请求
+        let r = f.resolve("MiniMax-M2.7").unwrap();
+        assert_eq!(r.pool, TargetPool::Qoder);
+
+        // ④ 显式国内区不借国际号（区隔离）
+        assert_eq!(
+            f.resolve("qoder/MiniMax-M2.7").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Qoder)
+        );
+    }
+
+    /// 国际版池开关关闭 → 国际区请求回落国内区（dispatch 三级路由口径）：
+    /// 仅国际账号时回落后的 CN 池为空 → NoHealthy，而不是拿国际号硬打国内网关
+    #[test]
+    fn t48_qoder_intl_disabled_falls_back_to_cn() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        seed_qoder_intl(&f);
+        set_qoder_settings(&f, crate::tasks::qoder_realm::CN, false);
+        assert_eq!(
+            f.resolve("qoder-intl/MiniMax-M2.7").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Qoder)
+        );
+    }
+}

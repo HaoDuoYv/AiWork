@@ -1,0 +1,74 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches:
+      - feat/export-accounts-json
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app (NSIS + MSI)
+        run: npm run tauri build -- --bundles nsis,msi
+
+      # 审查 M15：CI 缺测试防线——产物未经测试验证即上传。放在 tauri build 之后：
+      # generate_context! 宏依赖 frontendDist（../dist，由 beforeBuildCommand 生成）
+      # 存在；任一用例失败则阻断产物上传
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --workspace
+
+      # portable zip：零依赖（Windows 自带 tar.exe），从 release 产物打包
+      - name: Package portable zip
+        run: node scripts/package_portable.mjs
+
+      # 审查 M15：统一命名 + 生成发布校验清单 latest.json（单一清单原则，
+      # updater.rs fail-closed 依赖：清单缺失/版本不符/哈希不匹配均拒绝更新）
+      - name: Rename release artifacts + generate latest.json
+        run: node scripts/rename_release.mjs --strict
+
+      - name: Stage artifacts (release/windows)
+        shell: bash
+        run: |
+          mkdir -p release/windows
+          cp release/*_x64-setup.exe release/windows/
+          cp release/*_x64_zh-CN.msi release/windows/
+          cp release/*_x64_portable.zip release/windows/
+          cp release/latest.json release/windows/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          # 审查 M15：产品已更名 AI Work 助手（mainBinaryName ai-work-assistant），
+          # artifact 名同步去除 trae-work-assistant 遗留
+          name: ai-work-assistant-windows
+          path: |
+            release/windows/*
+          if-no-files-found: error

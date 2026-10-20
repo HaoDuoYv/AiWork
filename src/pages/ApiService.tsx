@@ -1,0 +1,1186 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { RefreshCw, Activity, Eraser, Save, Layers, Pencil, Download, ToggleLeft, Gauge } from 'lucide-react';
+import PageHeader from '../components/PageHeader';
+import { Badge, Modal, Spinner, StatCard } from '../components/ui';
+import { useAppStore } from '../store';
+import { api } from '../lib/tauri';
+import { withMinDelay } from '../lib/delay';
+import { RefreshTokenBadge } from './accounts/RefreshTokenBadge';
+import { PoolHealthBadges } from '../components/api/PoolHealthBadges';
+import type {
+  ApiServiceStatus,
+  ApiPoolFile,
+  PoolStatus,
+  TagView,
+  TraeModelMeta,
+  UnifiedModel,
+  UsageDayView,
+  GroupView,
+} from '../types';
+
+/**
+ * Trae · 资源调度（unified-api-gateway-design §6.1，Phase 3）
+ * 页内仅保留本应用资源级内容（自上而下）：积分体系说明 / 池指标行 / 账号池选择 / 模型目录（Trae）。
+ * 模型目录数据源为统一目录聚合（api.apiServer.unifiedModels 过滤 Trae 源，§3.2 四层兜底），
+ * 行内「编辑」弹框维护 L1 人工覆盖层（trae_model_meta_set/clear），保存后聚合视图即时生效。
+ * 网关级功能（启停 / 接口配置 / API Keys / 生态接入 / 用量统计）已全部迁至
+ * 全局 API 管理弹窗（左侧栏 KeyRound 图标），页内不再出现网关级内容。
+ */
+
+/** 思考档位选项（编辑弹框多选，顺序固定） */
+const EFFORT_OPTIONS = ['low', 'medium', 'high'] as const;
+
+/** 表单数值解析：空串 → null（未设置）；非法数字返回 NaN 由调用方拦截 */
+const numOrNull = (s: string) => {
+  const t = s.trim();
+  if (t === '') return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : NaN;
+};
+
+export default function ApiService() {
+  const accounts = useAppStore((s) => s.accounts);
+  const refreshAccounts = useAppStore((s) => s.refreshAccounts);
+  const toast = useAppStore((s) => s.pushToast);
+
+  // ---- 池指标 / 账号池 ----
+  const [status, setStatus] = useState<ApiServiceStatus | null>(null);
+  const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
+  const [enabledUids, setEnabledUids] = useState<Set<string>>(new Set());
+  const [poolGroups, setPoolGroups] = useState<Set<string>>(new Set());
+  // 共享标签筛选（P2 需求④）：与分组筛选取交集（D5），空 = 不限标签
+  const [poolTags, setPoolTags] = useState<Set<string>>(new Set());
+  const [tagDefs, setTagDefs] = useState<TagView[]>([]);
+  // Trae 池参与调度开关（每池自管开关；默认开 = 历史恒可用行为）
+  const [traeEnabled, setTraeEnabled] = useState(true);
+  // per-pool 调度参数（Trae 池专属，与 Buddy/Qoder 互不共享）：并发 0 = 不限、池粘性 0 = 关
+  const [traeAccountConcurrencyLimit, setTraeAccountConcurrencyLimit] = useState(1);
+  const [traePoolStickyTtlSecs, setTraePoolStickyTtlSecs] = useState(300);
+  const [traeStickyTtlSecs, setTraeStickyTtlSecs] = useState(1800);
+  // Trae 池竞速对冲阈值毫秒（0 = 关闭；缺省对齐后端 serde default 8s）
+  const [traeHedgeThresholdMs, setTraeHedgeThresholdMs] = useState(8_000);
+  // 池文件（api_pool.json）：资源开关与调度参数面板的共用热参数只读透传取值源
+  const [poolFile, setPoolFile] = useState<ApiPoolFile | null>(null);
+  const [groups, setGroups] = useState<GroupView[]>([]);
+  const [savingPool, setSavingPool] = useState(false);
+  const [clearingCooldowns, setClearingCooldowns] = useState(false);
+  // 清除冷却二次确认（重置类操作需确认弹框，禁 window.confirm）
+  const [cooldownConfirm, setCooldownConfirm] = useState(false);
+  // 清除模型人工元数据二次确认（删除 L1 覆盖不可撤销）
+  const [metaClearConfirm, setMetaClearConfirm] = useState(false);
+  const [refreshingPool, setRefreshingPool] = useState(false);
+  // 当日活跃账号数据源（今日用量桶的账号维度计数）
+  const [usage, setUsage] = useState<UsageDayView[]>([]);
+
+  // ---- 模型目录（Trae 源） ----
+  const [models, setModels] = useState<UnifiedModel[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [syncingModels, setSyncingModels] = useState(false);
+  // 官网模型定时同步配置（trae_models_sync_enabled/hhmm 存 app Settings，独立部分保存）
+  const [modelsSyncCfg, setModelsSyncCfg] = useState({ enabled: true, hhmm: '05:40' });
+  const [savingModelsSyncCfg, setSavingModelsSyncCfg] = useState(false);
+  // 编辑弹框（null = 关闭；表单留空 = 未设置，交由下层自动来源兜底）
+  const [editing, setEditing] = useState<UnifiedModel | null>(null);
+  const [fLabel, setFLabel] = useState('');
+  const [fRate, setFRate] = useState('');
+  const [fEfforts, setFEfforts] = useState<Set<string>>(new Set());
+  const [fContext, setFContext] = useState('');
+  const [fMaxTokens, setFMaxTokens] = useState('');
+  const [fImage, setFImage] = useState<'' | 'true' | 'false'>('');
+  const [savingMeta, setSavingMeta] = useState(false);
+  const [clearingMeta, setClearingMeta] = useState(false);
+
+  useEffect(() => {
+    void refreshAccounts();
+    void loadPool();
+    void refreshStatus();
+    void loadGroups();
+    void loadTodayUsage();
+    void loadModels();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshAccounts]);
+
+  // 当日用量（query_recent 含今日；仅用于「活跃账号」指标）
+  const loadTodayUsage = useCallback(async () => {
+    try {
+      setUsage(await api.apiServer.usageStats(1));
+    } catch {
+      /* 加载失败按无数据处理 */
+    }
+  }, []);
+
+  // 统一模型目录：仅过滤 sources 含 Trae 池的条目（§5.5，聚合视图实时派生；
+  // Qoder 模型由 Qoder 页「模型目录（Qoder）」独立展示与同步，本页不再混入）
+  const loadModels = useCallback(
+    async (manual = false) => {
+      setLoadingModels(true);
+      try {
+        const list = await withMinDelay(api.apiServer.unifiedModels(), 250);
+        setModels(list.filter((m) => m.sources.some((s) => s.pool === 'trae')));
+      } catch {
+        // 初始化失败静默保留空列表；手动点击刷新失败需给出提示
+        if (manual) toast('error', '加载模型目录失败，请重试');
+      } finally {
+        setLoadingModels(false);
+      }
+    },
+    [toast],
+  );
+
+  // 同步官网模型（models_sync 沿用现有调用）；L1 人工覆盖层不受同步影响
+  const syncModels = async () => {
+    if (syncingModels) return;
+    setSyncingModels(true);
+    try {
+      await withMinDelay(api.apiServer.modelsSync(), 500);
+      toast('success', '官网模型已同步（人工维护值不受影响）');
+      await loadModels();
+    } catch (err) {
+      toast('error', `同步官网模型失败：${String(err).slice(0, 120)}`);
+    } finally {
+      setSyncingModels(false);
+    }
+  };
+
+  // 定时同步配置加载（app Settings；失败静默保留默认值）
+  useEffect(() => {
+    api.misc
+      .settingsGet()
+      .then((s) => setModelsSyncCfg({ enabled: s.trae_models_sync_enabled ?? true, hhmm: s.trae_models_sync_hhmm || '05:40' }))
+      .catch(() => {});
+  }, []);
+
+  // 定时同步配置保存：settings_set 真 patch 语义，只写本卡两个字段
+  const saveModelsSyncCfg = async () => {
+    setSavingModelsSyncCfg(true);
+    try {
+      await withMinDelay(
+        api.misc.settingsSet({
+          trae_models_sync_enabled: modelsSyncCfg.enabled,
+          trae_models_sync_hhmm: modelsSyncCfg.hhmm.trim() || '05:40',
+        }),
+        400,
+      );
+      toast(
+        'success',
+        modelsSyncCfg.enabled ? `已保存：每天 ${modelsSyncCfg.hhmm || '05:40'} 自动同步官网模型` : '已关闭定时同步（仅手动同步）',
+      );
+    } catch (err) {
+      toast('error', `保存失败：${String(err)}`);
+    } finally {
+      setSavingModelsSyncCfg(false);
+    }
+  };
+
+  // 轮询序号（审查 P2 竞态防护）：3s 轮询响应慢于间隔时两轮并发，后发先至的
+  // 陈旧响应会覆盖新状态——仅当本轮仍是最新发起时才写 state
+  const refreshSeq = useRef(0);
+  const refreshStatus = useCallback(async () => {
+    const seq = ++refreshSeq.current;
+    try {
+      const s = await api.apiServer.status();
+      if (seq !== refreshSeq.current) return;
+      setStatus(s);
+      if (s.running) {
+        try {
+          const ps = await api.apiServer.poolStatus();
+          if (seq === refreshSeq.current) setPoolStatus(ps);
+        } catch {
+          /* ignore */
+        }
+      } else if (seq === refreshSeq.current) {
+        setPoolStatus([]);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!status?.running) return;
+    const id = setInterval(() => void refreshStatus(), 3000);
+    return () => clearInterval(id);
+  }, [status?.running, refreshStatus]);
+
+  const loadPool = async (manual = false) => {
+    setRefreshingPool(true);
+    try {
+      const pool = await withMinDelay(api.apiServer.poolList());
+      setPoolFile(pool);
+      setEnabledUids(new Set(pool.enabled_uids));
+      setPoolGroups(new Set(pool.group_ids ?? []));
+      setPoolTags(new Set(pool.trae_tag_ids ?? []));
+      setTraeEnabled(pool.trae_enabled ?? true);
+      // per-pool 调度参数回显（缺省对齐后端 serde default：并发 1 / 池粘性 300s /
+      // 会话粘性 1800s / 对冲 8s）
+      setTraeAccountConcurrencyLimit(pool.trae_account_concurrency_limit ?? 1);
+      setTraePoolStickyTtlSecs(pool.trae_pool_sticky_ttl_secs ?? 300);
+      setTraeStickyTtlSecs(pool.trae_sticky_ttl_secs ?? 1800);
+      setTraeHedgeThresholdMs(pool.trae_hedge_threshold_ms ?? 8_000);
+    } catch {
+      // 初始化加载失败静默保留空列表；手动点击刷新失败需给出提示
+      if (manual) toast('error', '加载账号池失败，请重试');
+    } finally {
+      setRefreshingPool(false);
+    }
+  };
+
+  // 分组列表（供账号池分组筛选使用）+ 共享标签定义（标签筛选 chips）
+  const loadGroups = async () => {
+    try {
+      setGroups(await api.groups.list());
+    } catch {
+      /* 保留空列表 */
+    }
+    try {
+      setTagDefs(await api.tags.list());
+    } catch {
+      /* 保留空列表 */
+    }
+  };
+
+  // 分组筛选实时预览（T10）：按当前勾选 + 所选分组即时计算将纳入池中的账号，
+  // 让「点选分组」有立即可见的过滤反馈（保存后热重载即时生效，无需重启 API 服务）。
+  // P2 补齐：标签筛选与分组合取交集（D5），预览与灰显同后端装配语义一致
+  const groupUidSets = useMemo(
+    () => groups.map((g) => ({ id: g.id, uids: new Set(g.uids ?? []) })),
+    [groups],
+  );
+  const tagUidSets = useMemo(
+    () => tagDefs.map((t) => ({ id: t.id, uids: new Set(t.uids ?? []) })),
+    [tagDefs],
+  );
+  // 判断账号在当前分组∩标签筛选下是否参与调度（D5：组空=不限组，标签空=不限标签）
+  const inPoolFilter = (uid: string) =>
+    (poolGroups.size === 0 || groupUidSets.some((g) => poolGroups.has(g.id) && g.uids.has(uid))) &&
+    (poolTags.size === 0 || tagUidSets.some((t) => poolTags.has(t.id) && t.uids.has(uid)));
+  const poolPreview = useMemo(() => {
+    if (poolGroups.size === 0 && poolTags.size === 0) {
+      return { inPool: enabledUids.size, excluded: 0 };
+    }
+    let inPool = 0;
+    let excluded = 0;
+    for (const uid of enabledUids) {
+      if (inPoolFilter(uid)) inPool += 1;
+      else excluded += 1;
+    }
+    return { inPool, excluded };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabledUids, poolGroups, groupUidSets, poolTags, tagUidSets]);
+
+  const clearAllCooldowns = async () => {
+    setClearingCooldowns(true);
+    try {
+      const cleared = await withMinDelay(api.accounts.cooldownClearAll());
+      if (cleared > 0) {
+        toast('success', `已清除 ${cleared} 个账号的冷却状态`);
+        void refreshStatus();
+      } else {
+        toast('info', '当前无冷却中的账号');
+      }
+    } catch (err) {
+      toast('error', `清除冷却失败：${String(err)}`);
+    } finally {
+      setClearingCooldowns(false);
+    }
+  };
+
+  const toggleUid = (uid: string) => {
+    setEnabledUids((prev) => {
+      const next = new Set(prev);
+      if (next.has(uid)) next.delete(uid);
+      else next.add(uid);
+      return next;
+    });
+  };
+
+  const savePool = async () => {
+    // 池配置未加载时禁止保存：enabledUids/poolGroups/poolTags 依赖 poolList 快照，
+    // poolFile=null（加载失败）时 state 保持空集，保存会把 Trae 池成员与
+    // 分组/标签筛选全部清空（与 Buddy/Qoder 页同款防护）
+    if (!poolFile) {
+      toast('error', '池配置未加载，无法保存（请先刷新重试）');
+      return;
+    }
+    setSavingPool(true);
+    try {
+      // 调度策略已收口至全局 API 管理「调度策略中心」，本页只保存成员/分组/本池开关
+      // 与 Trae 池专属调度参数（未传字段后端保留原值，保存后运行中热生效）
+      await withMinDelay(
+        api.apiServer.poolSet([...enabledUids], undefined, [...poolGroups], {
+          traeEnabled,
+          traeTagIds: [...poolTags],
+          traeAccountConcurrencyLimit: traeAccountConcurrencyLimit,
+          traePoolStickyTtlSecs: traePoolStickyTtlSecs,
+          traeStickyTtlSecs,
+          traeHedgeThresholdMs,
+        }),
+      );
+      toast('success', `账号池已更新（Trae 池${traeEnabled ? '启用' : '停用'}，服务运行中即时生效）`);
+    } catch (err) {
+      toast('error', `保存账号池失败：${String(err)}`);
+    } finally {
+      setSavingPool(false);
+    }
+  };
+
+  // ---- 模型元数据编辑（L1 覆盖层） ----
+
+  // 打开弹框：回显 L1 人工值（metaGet 读取 data/trae_model_meta.json，跨会话可回显）；
+  // 读取失败时全表单留空 = 交由下层兜底（绝不把聚合值当人工值回填，区分 L1 与 L2-L4，§6.1）。
+  // editReqRef 令牌守卫：快速连点两个模型时仅让最后一次请求回填，防止慢响应覆盖新弹框。
+  const editReqRef = useRef('');
+  const openEdit = async (m: UnifiedModel) => {
+    editReqRef.current = m.id;
+    setEditing(m);
+    const known = await api.apiServer.metaGet(m.id).catch(() => null);
+    if (editReqRef.current !== m.id) return;
+    setFLabel(known?.label ?? '');
+    setFRate(known?.rate != null ? String(known.rate) : '');
+    setFEfforts(new Set(known?.efforts ?? []));
+    setFContext(known?.context_length != null ? String(known.context_length) : '');
+    setFMaxTokens(known?.max_tokens != null ? String(known.max_tokens) : '');
+    setFImage(
+      known?.supports_image === true ? 'true' : known?.supports_image === false ? 'false' : '',
+    );
+  };
+
+  const saveMeta = async () => {
+    if (!editing) return;
+    const rate = numOrNull(fRate);
+    const context = numOrNull(fContext);
+    const maxTokens = numOrNull(fMaxTokens);
+    if (Number.isNaN(rate) || Number.isNaN(context) || Number.isNaN(maxTokens)) {
+      toast('error', '数值字段格式不正确，请检查倍率 / 上下文 / max_tokens');
+      return;
+    }
+    const meta: TraeModelMeta = {
+      label: fLabel.trim() || null,
+      rate,
+      // 未勾选任何档位 = 未设置（交由下层推断），不落空数组
+      efforts: fEfforts.size > 0 ? EFFORT_OPTIONS.filter((e) => fEfforts.has(e)) : null,
+      context_length: context,
+      max_tokens: maxTokens,
+      supports_image: fImage === '' ? null : fImage === 'true',
+    };
+    setSavingMeta(true);
+    try {
+      await withMinDelay(api.apiServer.metaSet(editing.id, meta), 300);
+      toast('success', `已保存 ${editing.id} 人工元数据（L1 覆盖，聚合即时生效）`);
+      setEditing(null);
+      await loadModels();
+    } catch (err) {
+      toast('error', `保存失败：${String(err)}`);
+    } finally {
+      setSavingMeta(false);
+    }
+  };
+
+  // 清除人工值 → 恢复自动来源链（L2 官网同步 > L3 文档参考 > L4 名称推断）
+  const clearMeta = async () => {
+    if (!editing) return;
+    setClearingMeta(true);
+    try {
+      await withMinDelay(api.apiServer.metaClear(editing.id), 300);
+      toast('success', `已清除 ${editing.id} 人工元数据，恢复自动来源`);
+      setEditing(null);
+      await loadModels();
+    } catch (err) {
+      toast('error', `清除失败：${String(err)}`);
+    } finally {
+      setClearingMeta(false);
+    }
+  };
+
+  const running = status?.running ?? false;
+  const poolCount = enabledUids.size;
+
+  // 池指标（§6.1）：可用 = 健康且未冷却（仅运行中可得实时值）；活跃 = 当日被调度使用；池内 = enabled_uids
+  const todayKey = new Date().toLocaleDateString('sv-SE');
+  const availableCount = running
+    ? poolStatus.filter((p) => !p.cooling && !p.disabled).length
+    : null;
+  const activeToday =
+    usage.find((d) => d.date === todayKey)?.accounts.filter((a) => a.requests > 0).length ?? 0;
+
+  // 账号池仅展示/可选有通用积分的账号（本服务消耗通用积分，零积分账号无法服务请求）
+  const poolAccounts = useMemo(
+    () => accounts.filter((a) => (a.general_credits ?? 0) > 0),
+    [accounts],
+  );
+  const totalGeneral = useMemo(
+    () => accounts.reduce((s, a) => s + (a.general_credits ?? 0), 0),
+    [accounts],
+  );
+
+  // 输入框通用样式（沿用页面表单惯例）
+  const inputCls =
+    'h-7 w-full rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700 outline-none focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200';
+
+  return (
+    <div>
+      <PageHeader
+        title="Trae · 资源调度"
+        desc="服务资源池管理 · 账号调度与模型目录 · 资源提供给API网关使用"
+        actions={
+          <button className="btn-outline" onClick={() => void refreshStatus()}>
+            <RefreshCw size={15} /> 刷新
+          </button>
+        }
+      />
+
+      {/* 积分体系说明（资源级） */}
+      <div className="rounded-xl border border-amber-300/70 bg-amber-50/80 px-3.5 py-2.5 dark:border-amber-700/40 dark:bg-amber-900/10">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-semibold text-amber-800 dark:text-amber-200">积分体系说明</span>
+          <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-700/50 dark:text-amber-100">本服务消耗通用积分</span>
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500 dark:text-zinc-400">
+          <span>
+            Trae 通用积分（product_id 208）：签到 / 活动获取，各模型按倍率消耗；账号池轮换消耗各账号积分，冷却与禁用规则同现有实现。上游接口{' '}
+            <code className="font-mono text-amber-700 dark:text-amber-300">llm_utils_chat</code>，明文 JSON。
+          </span>
+          <span className="ml-auto">
+            当前全部账号通用积分总余额：
+            <span className="font-bold tabular-nums text-amber-700 dark:text-amber-300">
+              {totalGeneral.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}
+            </span>
+          </span>
+        </div>
+      </div>
+
+      {/* 池指标行 */}
+      <div className="mt-5 grid grid-cols-3 gap-3">
+        <StatCard
+          label="可用账号数"
+          value={availableCount ?? '—'}
+          tone="green"
+          hint={running ? '健康且未冷却，可被调度选中' : 'API 服务未运行，无实时池状态'}
+        />
+        <StatCard
+          label="活跃账号"
+          value={activeToday}
+          tone="blue"
+          hint="当日被调度使用过的账号"
+        />
+        <StatCard
+          label="池内账号"
+          value={poolCount}
+          tone="violet"
+          hint="已选入轮转池的账号数（enabled_uids）"
+        />
+      </div>
+
+      <div className="mt-5 grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
+        {/* 账号池选择（资源级，现有功能原样迁移） */}
+        <div className="card flex flex-col p-5">
+          <div className="mb-4 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Activity size={18} className="text-brand-500" />
+              <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">
+                账号池选择
+              </h2>
+            </div>
+            <div className="flex items-center gap-2">
+              {running && (
+                <button
+                  className="btn-ghost flex items-center gap-1 text-xs"
+                  onClick={() => setCooldownConfirm(true)}
+                  disabled={clearingCooldowns}
+                  title="清除所有账号的冷却状态"
+                >
+                  <Eraser size={13} className={clearingCooldowns ? 'animate-pulse' : ''} />
+                  {clearingCooldowns ? '清除中…' : '清除冷却'}
+                </button>
+              )}
+              <button
+                className="btn-ghost flex items-center gap-1 text-xs"
+                onClick={() => void loadPool(true)}
+                disabled={refreshingPool}
+              >
+                <RefreshCw size={13} className={refreshingPool ? 'animate-spin' : ''} />
+                {refreshingPool ? '刷新中…' : '刷新'}
+              </button>
+              {poolAccounts.length > 0 && (
+                <button
+                  className="btn-ghost flex items-center gap-1 text-xs"
+                  onClick={() => void savePool()}
+                  disabled={savingPool}
+                  title="保存账号池"
+                >
+                  <Save size={13} className={savingPool ? 'animate-pulse' : ''} />
+                  {savingPool ? '保存中…' : '保存'}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {poolAccounts.length === 0 ? (
+            <p className="flex-1 py-8 text-center text-sm text-slate-400">
+              暂无含通用积分的账号，请先签到或刷新积分后重试
+            </p>
+          ) : (
+            <>
+              {/* 分组筛选（T10，保存后热重载即时生效）；本池开关移入下方「资源开关与调度参数」面板；
+                  调度策略已收口至全局 API 管理调度策略中心 */}
+              <div className="mb-3 space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
+                {groups.length > 0 && (
+                  <div className="flex items-start gap-2">
+                    <label className="shrink-0 pt-1 text-xs text-slate-500 dark:text-zinc-400">
+                      分组筛选
+                    </label>
+                    <div className="flex flex-1 flex-wrap gap-1">
+                      {groups.map((g) => {
+                        const active = poolGroups.has(g.id);
+                        return (
+                          <button
+                            key={g.id}
+                            type="button"
+                            className={`rounded-full border px-2 py-0.5 text-xs transition ${
+                              active
+                                ? 'border-brand-400 bg-brand-50 text-brand-700 dark:border-brand-500 dark:bg-brand-500/15 dark:text-brand-300'
+                                : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-600'
+                            }`}
+                            onClick={() =>
+                              setPoolGroups((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(g.id)) next.delete(g.id);
+                                else next.add(g.id);
+                                return next;
+                              })
+                            }
+                          >
+                            {g.name}
+                          </button>
+                        );
+                      })}
+                      {(poolGroups.size > 0 || poolTags.size > 0) && (
+                        <>
+                          <span className="pt-0.5 text-xs text-slate-400">
+                            将纳入 {poolPreview.inPool} 个账号
+                            {poolPreview.excluded > 0 &&
+                              `，${poolPreview.excluded} 个筛选外账号不参与调度`}
+                          </span>
+                          {poolPreview.inPool === 0 && (
+                            <span className="pt-0.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+                              当前分组/标签组合展开为空集：保存后该池将无可取号账号
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+                <p className="text-xs text-slate-400 dark:text-zinc-500">
+                  分组筛选作用于网关取号范围，保存后即时生效；不选分组 = 全部参与。
+                  调度策略（池间 / 池内）请在全局 API 管理「资源总览 → 调度策略中心」配置。
+                </p>
+                {/* 标签筛选（P2 需求④）：与分组合取交集（D5）；标签在「账号管理 → 标签管理」维护 */}
+                {(tagDefs.length > 0 || poolTags.size > 0) && (
+                  <div className="flex items-start gap-2">
+                    <label className="shrink-0 pt-1 text-xs text-slate-500 dark:text-zinc-400">标签筛选</label>
+                    <div className="flex flex-1 flex-wrap gap-1">
+                      {tagDefs.map((t) => {
+                        const active = poolTags.has(t.id);
+                        return (
+                          <button
+                            key={t.id}
+                            type="button"
+                            className={`rounded-full border px-2 py-0.5 text-xs transition ${
+                              active
+                                ? 'border-teal-400 bg-teal-50 text-teal-700 dark:border-teal-500 dark:bg-teal-500/15 dark:text-teal-300'
+                                : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-600'
+                            }`}
+                            onClick={() =>
+                              setPoolTags((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(t.id)) next.delete(t.id);
+                                else next.add(t.id);
+                                return next;
+                              })
+                            }
+                          >
+                            {t.name}
+                          </button>
+                        );
+                      })}
+                      {poolTags.size > 0 && (
+                        <span className="pt-0.5 text-xs text-slate-400">
+                          与分组筛选取交集（同时满足分组与标签的账号才参与调度）
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="mb-3 flex items-center gap-2">
+                <button
+                  className="text-xs text-brand-600 hover:underline dark:text-brand-400"
+                  onClick={() =>
+                    setEnabledUids(new Set(poolAccounts.map((a) => a.user_id)))
+                  }
+                >
+                  全选
+                </button>
+                <span className="text-slate-300">|</span>
+                <button
+                  className="text-xs text-brand-600 hover:underline dark:text-brand-400"
+                  onClick={() => setEnabledUids(new Set())}
+                >
+                  清空
+                </button>
+                <span className="ml-auto text-xs text-slate-400">
+                  已选 {enabledUids.size} / {poolAccounts.length}
+                </span>
+              </div>
+
+              {/* 不用 flex-1：两列 items-stretch 下 flex-1 会吃掉剩余高度，
+                  账号少时列表与「资源开关与调度参数」之间被撑出大片空白；
+                  自然高度让参数区块紧贴列表，账号增多时随流式布局自然下移 */}
+              <div className="space-y-1">
+                {poolAccounts.map((a) => {
+                  const checked = enabledUids.has(a.user_id);
+                  const poolItem = poolStatus.find((p) => p.uid === a.user_id);
+                  const filteredOut = !inPoolFilter(a.user_id);
+                  return (
+                    <label
+                      key={a.user_id}
+                      className={`flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50 ${
+                        filteredOut ? 'opacity-50' : ''
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                        checked={checked}
+                        onChange={() => toggleUid(a.user_id)}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-medium text-slate-700 dark:text-zinc-200">
+                          {a.name}
+                        </div>
+                        <div className="truncate text-xs text-slate-400">
+                          {a.user_id}
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        {filteredOut && <Badge tone="slate">筛选外</Badge>}
+                        {(a.general_credits ?? 0) > 0 && (
+                          <span className="text-xs tabular-nums text-slate-500 dark:text-zinc-400">
+                            {(a.general_credits ?? 0).toFixed(0)} 通用积分
+                          </span>
+                        )}
+                        {/* F-78 批次 3：refresh_token 生命周期徽标（失效账号同时被调度禁用） */}
+                        <RefreshTokenBadge
+                          invalid={a.refresh_token_invalid}
+                          fails={a.refresh_token_fails}
+                          expiresAt={a.refresh_token_expires_at}
+                          savedAt={a.auth_saved_at}
+                        />
+                        {/* 运行时健康徽标：禁用/积分耗尽/冷却原因/零积分/在途·就绪（三池共用） */}
+                        <PoolHealthBadges
+                          s={poolItem}
+                          running={running}
+                          tokenInvalid={a.refresh_token_invalid}
+                        />
+                      </div>
+                    </label>
+                  );
+                })}
+              </div>
+
+              {/* 资源开关与调度参数（对齐 Buddy：与账号池选择同面板，共用右上角「保存」） */}
+              <div className="mt-4 border-t border-slate-100 pt-3 dark:border-zinc-800">
+                <div className="mb-2 flex items-center gap-2">
+                  <ToggleLeft size={16} className="text-brand-500" />
+                  <span className="text-sm font-medium">资源开关与调度参数</span>
+                </div>
+                <div className="mb-2">
+                  {traeEnabled ? (
+                    <Badge tone="green">上游已启用</Badge>
+                  ) : (
+                    <Badge tone="amber">上游未启用 — Trae 源模型将显式报错</Badge>
+                  )}
+                </div>
+                <div className="space-y-1.5">
+                  {/* 本池开关（自分组筛选盒移入；每池自管：Trae 页管 trae_enabled） */}
+                  <label className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                      checked={traeEnabled}
+                      onChange={(e) => setTraeEnabled(e.target.checked)}
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-xs text-slate-700 dark:text-zinc-200">启用 Trae 上游</span>
+                      <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                        Trae 目录模型路由到 Trae 账号池，消耗各账号通用积分；
+                        关闭后仅 Trae 源模型显式报错，Buddy/Qoder 不受影响
+                      </span>
+                    </span>
+                  </label>
+                </div>
+                {/* 调度参数（Trae 池专属，与 Buddy/Qoder 互不共享）：数值热参数，保存即热生效 */}
+                <div className="mt-4">
+                  <div className="mb-2 flex items-center gap-2">
+                    <Gauge size={15} className="text-brand-500" />
+                    <span className="text-sm font-medium">调度参数</span>
+                    <span className="text-xs text-slate-400">Trae 池专属 · 保存即热生效</span>
+                  </div>
+                  <div className="space-y-3 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          账号并发上限
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          单账号在途请求数达到上限即让位其他账号（全部 busy 时取负载最小者）；
+                          0 = 不限
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={32}
+                          step={1}
+                          value={traeAccountConcurrencyLimit}
+                          onChange={(e) =>
+                            setTraeAccountConcurrencyLimit(
+                              Math.max(0, Math.min(32, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">并发</span>
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          池粘性 TTL
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          TTL 内同会话落同一账号（上游 KV cache 复用）；0 = 关闭
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={3600}
+                          step={30}
+                          value={traePoolStickyTtlSecs}
+                          onChange={(e) =>
+                            setTraePoolStickyTtlSecs(
+                              Math.max(0, Math.min(3600, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">秒</span>
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          会话粘性 TTL
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          显式 conversationId / 消息指纹绑定账号的有效期
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={86400}
+                          step={60}
+                          value={traeStickyTtlSecs}
+                          onChange={(e) =>
+                            setTraeStickyTtlSecs(
+                              Math.max(0, Math.min(86400, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">秒</span>
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          竞速对冲阈值
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          流式首字节超过该时长即向第二账号发对冲请求，先出首字者胜；
+                          0 = 关闭（有效范围 1s–8s，与后端对齐）
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={8000}
+                          step={500}
+                          value={traeHedgeThresholdMs}
+                          onChange={(e) =>
+                            setTraeHedgeThresholdMs(
+                              Math.max(0, Math.min(8000, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">ms</span>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">
+                  上方勾选与分组筛选决定 Trae 池取号范围（保存后即时生效）；
+                  池间 / 池内调度策略在全局 API 管理「调度策略中心」配置。
+                </p>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* 模型目录（Trae）：统一目录聚合 Trae 源 + L1 人工元数据编辑 */}
+        <div className="card flex flex-col p-5">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Layers size={18} className="text-brand-500" />
+              <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">
+                模型目录（Trae）
+              </h2>
+              <span className="text-xs text-slate-400">{models.length} 个模型</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                className="btn-outline flex items-center gap-1 text-xs"
+                onClick={() => void syncModels()}
+                disabled={syncingModels}
+              >
+                <Download size={13} className={syncingModels ? 'animate-spin' : ''} />
+                {syncingModels ? '同步中…' : '同步官网模型'}
+              </button>
+              <button
+                className="btn-ghost flex items-center gap-1 text-xs"
+                onClick={() => void loadModels(true)}
+                disabled={loadingModels}
+              >
+                <RefreshCw size={13} className={loadingModels ? 'animate-spin' : ''} />
+                {loadingModels ? '刷新中…' : '刷新'}
+              </button>
+            </div>
+          </div>
+
+          <p className="mb-3 text-xs text-slate-400 dark:text-zinc-500">
+            四层来源聚合：人工维护 &gt; 官网同步 &gt; 内置参考 &gt; 名称推断；未确定字段显示 —，名称带{' '}
+            <span className="font-bold text-amber-500">*</span> 表示已人工维护（官网同步不覆盖）。
+          </p>
+
+          {/* 定时同步（app Settings）：应用内置调度器每日到点自动执行，无账号时静默跳过 */}
+          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 p-2.5 text-xs dark:border-zinc-800">
+            <label className="flex cursor-pointer items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={modelsSyncCfg.enabled}
+                onChange={(e) => setModelsSyncCfg((f) => ({ ...f, enabled: e.target.checked }))}
+              />
+              每日定时同步
+            </label>
+            <input
+              type="time"
+              value={modelsSyncCfg.hhmm}
+              onChange={(e) => setModelsSyncCfg((f) => ({ ...f, hhmm: e.target.value || '05:40' }))}
+              disabled={!modelsSyncCfg.enabled}
+              className="input h-8 !w-28 text-xs"
+            />
+            <button
+              className="btn-outline !px-2 !py-1"
+              disabled={savingModelsSyncCfg}
+              onClick={() => void saveModelsSyncCfg()}
+            >
+              {savingModelsSyncCfg ? <Spinner /> : <Save size={13} />} 保存
+            </button>
+            <span className="text-slate-400 dark:text-zinc-500">
+              {modelsSyncCfg.enabled
+                ? `应用运行期间每天 ${modelsSyncCfg.hhmm || '05:40'} 自动同步（无账号时静默跳过）`
+                : '已关闭定时同步，仅手动同步'}
+            </span>
+          </div>
+
+          {models.length === 0 ? (
+            <p className="flex-1 py-8 text-center text-sm text-slate-400">
+              暂无模型数据 — 点击「同步官网模型」或「刷新」拉取统一目录
+            </p>
+          ) : (
+            <div className="flex-1 overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
+                    <th className="pb-2 pr-3 font-medium">模型 ID</th>
+                    <th className="pb-2 pr-3 font-medium">展示名</th>
+                    <th className="pb-2 pr-3 font-medium">厂商</th>
+                    <th className="pb-2 pr-3 text-right font-medium">倍率</th>
+                    <th className="pb-2 pr-3 font-medium">思考档位</th>
+                    <th className="pb-2 pr-3 text-right font-medium">上下文</th>
+                    <th className="pb-2 pr-3 text-center font-medium">图片</th>
+                    <th className="pb-2 text-right font-medium">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {models.map((m) => (
+                    <tr
+                      key={m.id}
+                      className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
+                    >
+                      <td className="py-2 pr-3 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
+                        {m.id}
+                        {m.max_mode && (
+                          <sup
+                            className="ml-0.5 font-sans text-[9px] font-bold leading-none text-amber-500 dark:text-amber-400"
+                            title="支持 Max Mode（1M 上下文）"
+                          >
+                            Max
+                          </sup>
+                        )}
+                      </td>
+                      <td className="py-2 pr-3 text-slate-600 dark:text-zinc-300">
+                        {m.display || '—'}
+                        {m.manual && (
+                          <span
+                            className="ml-0.5 font-bold text-amber-500"
+                            title="已人工维护（L1 覆盖层）"
+                          >
+                            *
+                          </span>
+                        )}
+                      </td>
+                      {/* §6.2 厂商列：条目标注优先（如 Step 5 Preview → 阶跃星辰），未命中显示 — */}
+                      <td className="py-2 pr-3 text-xs text-slate-500 dark:text-zinc-400">
+                        {m.vendor || '—'}
+                      </td>
+                      <td className="py-2 pr-3 text-right tabular-nums text-amber-600 dark:text-amber-400">
+                        {m.rate != null ? m.rate.toFixed(2) : '—'}
+                      </td>
+                      <td className="py-2 pr-3 text-xs text-slate-500 dark:text-zinc-400">
+                        {m.efforts.length > 0 ? m.efforts.join(' / ') : '—'}
+                      </td>
+                      <td className="py-2 pr-3 text-right tabular-nums text-xs text-slate-500 dark:text-zinc-400">
+                        {m.context_length != null ? `${Math.round(m.context_length / 1000)}k` : '—'}
+                      </td>
+                      <td className="py-2 pr-3 text-center text-xs">
+                        {m.supports_image === true ? (
+                          <span className="font-semibold text-emerald-600 dark:text-emerald-400">✓</span>
+                        ) : m.supports_image === false ? (
+                          <span className="text-slate-400 dark:text-zinc-500">✗</span>
+                        ) : (
+                          <span className="text-slate-300 dark:text-zinc-600">—</span>
+                        )}
+                      </td>
+                      <td className="py-2 text-right">
+                        <button
+                          className="btn-ghost !p-2"
+                          title="编辑模型元数据"
+                          onClick={() => void openEdit(m)}
+                        >
+                          <Pencil size={14} />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 模型元数据编辑弹框（L1 覆盖层，§6.1）：字段全部可留空 = 交由下层自动来源兜底 */}
+      <Modal
+        open={editing !== null}
+        onClose={() => setEditing(null)}
+        title={`编辑模型元数据 · ${editing?.id ?? ''}`}
+        footer={
+          <>
+            {editing?.manual && (
+              <button
+                className="btn-outline mr-auto flex items-center gap-1"
+                onClick={() => setMetaClearConfirm(true)}
+                disabled={clearingMeta || savingMeta}
+                title="清除 L1 人工覆盖，恢复自动来源链（官网同步 > 内置参考 > 名称推断）"
+              >
+                <Eraser size={14} />
+                {clearingMeta ? '清除中…' : '清除人工值'}
+              </button>
+            )}
+            <button className="btn-ghost" onClick={() => setEditing(null)} disabled={savingMeta}>
+              取消
+            </button>
+            <button
+              className="btn-primary flex items-center gap-1"
+              onClick={() => void saveMeta()}
+              disabled={savingMeta}
+            >
+              {savingMeta ? <Spinner className="text-white" /> : <Save size={15} />}
+              {savingMeta ? '保存中…' : '保存'}
+            </button>
+          </>
+        }
+      >
+        <p className="mb-3 text-xs text-slate-400 dark:text-zinc-500">
+          人工维护为最高优先级（L1），官网同步不覆盖；<b>留空 = 未设置</b>，交由下层自动来源兜底。
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">展示名</label>
+            <input
+              className={inputCls}
+              value={fLabel}
+              onChange={(e) => setFLabel(e.target.value)}
+              placeholder="留空 = 自动来源"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">积分倍率</label>
+            <input
+              className={inputCls}
+              type="number"
+              step="0.01"
+              min="0"
+              value={fRate}
+              onChange={(e) => setFRate(e.target.value)}
+              placeholder="留空 = 自动来源"
+            />
+          </div>
+          <div className="col-span-2">
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">
+              思考档位（可多选；全不选 = 未设置）
+            </label>
+            <div className="flex items-center gap-4">
+              {EFFORT_OPTIONS.map((e) => (
+                <label key={e} className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-600 dark:text-zinc-300">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                    checked={fEfforts.has(e)}
+                    onChange={() =>
+                      setFEfforts((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(e)) next.delete(e);
+                        else next.add(e);
+                        return next;
+                      })
+                    }
+                  />
+                  {e}
+                </label>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">上下文长度</label>
+            <input
+              className={inputCls}
+              type="number"
+              step="1"
+              min="0"
+              value={fContext}
+              onChange={(e) => setFContext(e.target.value)}
+              placeholder="如 1000000"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">max_tokens</label>
+            <input
+              className={inputCls}
+              type="number"
+              step="1"
+              min="0"
+              value={fMaxTokens}
+              onChange={(e) => setFMaxTokens(e.target.value)}
+              placeholder="如 96000"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">图片支持</label>
+            <select
+              className={inputCls}
+              value={fImage}
+              onChange={(e) => setFImage(e.target.value as '' | 'true' | 'false')}
+            >
+              <option value="">未设置（自动来源）</option>
+              <option value="true">支持</option>
+              <option value="false">不支持</option>
+            </select>
+          </div>
+        </div>
+      </Modal>
+
+      {/* 清除冷却确认弹框（重置类操作，禁 window.confirm） */}
+      <Modal
+        open={cooldownConfirm}
+        onClose={() => setCooldownConfirm(false)}
+        title="清除全部账号冷却"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setCooldownConfirm(false)}>
+              取消
+            </button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              onClick={() => {
+                setCooldownConfirm(false);
+                void clearAllCooldowns();
+              }}
+              disabled={clearingCooldowns}
+            >
+              {clearingCooldowns ? '清除中…' : '确认清除'}
+            </button>
+          </>
+        }
+      >
+        <div className="text-sm">
+          确认清除所有账号的冷却状态？
+          <div className="mt-1 text-xs text-slate-400">
+            清除后冷却中的账号将立即重新参与调度（若故障未恢复可能再次失败冷却）。
+          </div>
+        </div>
+      </Modal>
+
+      {/* 清除模型人工元数据确认弹框（删除 L1 覆盖不可撤销） */}
+      <Modal
+        open={metaClearConfirm}
+        onClose={() => setMetaClearConfirm(false)}
+        title={`清除人工元数据 · ${editing?.id ?? ''}`}
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setMetaClearConfirm(false)}>
+              取消
+            </button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              onClick={() => {
+                setMetaClearConfirm(false);
+                void clearMeta();
+              }}
+              disabled={clearingMeta}
+            >
+              {clearingMeta ? '清除中…' : '确认清除'}
+            </button>
+          </>
+        }
+      >
+        <div className="text-sm">
+          确认清除模型「{editing?.id}」的 L1 人工覆盖？
+          <div className="mt-1 text-xs text-slate-400">
+            清除后恢复自动来源链（官网同步 &gt; 内置参考 &gt; 名称推断），人工值不可恢复。
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}

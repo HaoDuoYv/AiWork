@@ -1,0 +1,533 @@
+import { useEffect, useRef, useState } from 'react';
+import { Calendar, Trash2, Save, Search, RotateCcw, Fingerprint, Clock, AlertTriangle, SlidersHorizontal, ListChecks } from 'lucide-react';
+import PageHeader from '../components/PageHeader';
+import { Modal } from '../components/ui';
+import { useAppStore } from '../store';
+import { api } from '../lib/tauri';
+import { withMinDelay } from '../lib/delay';
+import type { Settings as SettingsType } from '../types';
+
+/**
+ * 环境配置页：应用安装路径、签到行为、定时任务与设备标识重置。
+ * 外观 / 语言 / 通用与通知 / 通知渠道（F-19，Trae 与 Buddy 共用）/ 代理配置位于左下角系统图标的「系统设置」弹框。
+ */
+export default function Settings() {
+  const settings = useAppStore((s) => s.settings);
+  const saveSettings = useAppStore((s) => s.saveSettings);
+  const refreshSettings = useAppStore((s) => s.refreshSettings);
+  const resetDeviceIds = useAppStore((s) => s.resetDeviceIds);
+  const deviceResetActive = useAppStore((s) => s.deviceResetActive);
+  const deviceResetProgress = useAppStore((s) => s.deviceResetProgress);
+  const toast = useAppStore((s) => s.pushToast);
+
+  const [taskInfo, setTaskInfo] = useState<string>('');
+  const [busyTask, setBusyTask] = useState(false);
+  const [querying, setQuerying] = useState(false);
+  const [detectingCn, setDetectingCn] = useState(false);
+
+  // 确认弹窗状态
+  const [confirmUnregister, setConfirmUnregister] = useState(false);
+  const [confirmResetDevice, setConfirmResetDevice] = useState(false);
+
+  // 本地表单状态：用户编辑后点击「保存」才持久化，避免每次按键都写文件
+  const [form, setForm] = useState<SettingsType | null>(null);
+  // form 与 store settings 的同步基线：form 等于基线（用户未编辑）时跟随外部变化回填，
+  // 防止挂载时旧快照把系统设置弹框等外部通道刚保存的值覆盖回滚
+  const baselineRef = useRef<SettingsType | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    void refreshSettings();
+    void query();
+  }, [refreshSettings]);
+
+  // settings 加载/变化时同步 form：仅初始化与「用户未编辑且与最新值有差异」两种情形
+  useEffect(() => {
+    if (!settings) return;
+    if (!form) {
+      setForm(settings);
+      baselineRef.current = settings;
+      return;
+    }
+    const unchanged = JSON.stringify(form) === JSON.stringify(baselineRef.current);
+    const drifted = JSON.stringify(form) !== JSON.stringify(settings);
+    if (unchanged && drifted) {
+      setForm(settings);
+      baselineRef.current = settings;
+    }
+  }, [settings, form]);
+
+  const dirty = form != null && settings != null && JSON.stringify(form) !== JSON.stringify(settings);
+
+  const update = <K extends keyof SettingsType>(key: K, val: SettingsType[K]) => {
+    setForm((prev) => (prev ? { ...prev, [key]: val } : prev));
+  };
+
+  const save = async () => {
+    if (!form) return;
+    setSaving(true);
+    try {
+      await withMinDelay(saveSettings(form));
+      baselineRef.current = form; // 保存成功后以提交内容为新基线，恢复对外部变化的跟随
+      toast('success', '配置已保存');
+    } catch {
+      /* toast 已发出 */
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const reset = () => {
+    if (settings) {
+      setForm({ ...settings });
+      baselineRef.current = settings;
+    }
+  };
+
+  // 注册时间复用应用内调度时刻（trae_checkin_hhmm）：schtasks 与调度器共用同一配置值。
+  // form 是编辑态：若时刻已改但未「保存设置」，schtasks 注册新值而内置调度器仍按
+  // 存储值运行（两执行器分叉），toast 需明示这一边界
+  const register = async () => {
+    const hhmm = form?.trae_checkin_hhmm || '09:00';
+    setBusyTask(true);
+    try {
+      await withMinDelay(api.misc.taskRegister(hhmm));
+      const unsaved =
+        form != null && settings != null && form.trae_checkin_hhmm !== settings.trae_checkin_hhmm;
+      toast(
+        'success',
+        unsaved
+          ? `已注册每日 ${hhmm} 签到（内置调度器在底部「保存设置」后才使用该时刻）`
+          : `已注册每日 ${hhmm} 自动签到`,
+      );
+      await query();
+    } catch (e) {
+      const msg = String(e);
+      // 长错误信息（含换行）在 taskInfo 区域展示，toast 只给简短提示
+      if (msg.includes('\n')) {
+        setTaskInfo(`❌ ${msg}`);
+        toast('error', '注册失败：权限不足，请查看下方详细解决方案');
+      } else {
+        toast('error', `注册失败：${msg}`);
+      }
+    } finally {
+      setBusyTask(false);
+    }
+  };
+
+  const unregister = async () => {
+    setConfirmUnregister(false);
+    setBusyTask(true);
+    try {
+      await withMinDelay(api.misc.taskUnregister());
+      toast('info', '计划任务已删除');
+      setTaskInfo('');
+    } catch (e) {
+      toast('error', `删除失败：${String(e)}`);
+    } finally {
+      setBusyTask(false);
+    }
+  };
+
+  const query = async () => {
+    setQuerying(true);
+    try {
+      const r = await withMinDelay(api.misc.taskStatus());
+      setTaskInfo(r);
+    } catch (e) {
+      setTaskInfo(`查询失败：${String(e)}`);
+      toast('error', `查询失败：${String(e)}`);
+    } finally {
+      setQuerying(false);
+    }
+  };
+
+  // F-01 探测来源中文标签
+  const LOCATE_SOURCE_LABEL: Record<string, string> = {
+    settings: '手动指定',
+    registry: '注册表',
+    default: '默认路径',
+    process: '运行进程',
+  };
+
+  const detectTraeCn = async () => {
+    setDetectingCn(true);
+    try {
+      const r = await withMinDelay(api.env.locate('trae'));
+      if (r.exe) {
+        update('trae_cn_path', r.exe);
+        toast('success', `已自动定位并填入 Trae 路径（${LOCATE_SOURCE_LABEL[r.source] ?? r.source}${r.version ? `，版本 ${r.version}` : ''}）`);
+      } else {
+        toast('info', '未检测到 Trae，请手动指定 exe 路径（自定义安装目录时常见，可右键快捷方式「打开文件所在位置」获取）');
+      }
+    } catch (e) {
+      toast('error', `检测失败：${String(e)}`);
+    } finally {
+      setDetectingCn(false);
+    }
+  };
+
+  const handleResetDeviceIds = async () => {
+    setConfirmResetDevice(false);
+    await resetDeviceIds('Trae');
+  };
+
+  if (!form) {
+    return (
+      <div className="animate-fade-in">
+        <PageHeader title="Trae · 环境配置" />
+        <div className="text-sm text-slate-500">加载中…</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="animate-fade-in">
+      <PageHeader
+        title="Trae · 环境配置"
+        desc="应用安装路径、签到行为、定时任务与设备标识"
+        actions={
+          dirty ? (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-amber-500">有未保存的更改</span>
+              <button onClick={reset} className="btn-outline">
+                <RotateCcw size={15} /> 撤销
+              </button>
+              <button onClick={save} disabled={saving} className="btn-primary">
+                <Save size={15} /> {saving ? '保存中…' : '保存'}
+              </button>
+            </div>
+          ) : (
+            <button onClick={save} disabled={saving || !dirty} className="btn-outline opacity-50">
+              <Save size={15} /> 已保存
+            </button>
+          )
+        }
+      />
+
+      <div className="grid items-start gap-4 md:grid-cols-2">
+        {/* 左列：通用配置（应用环境 + 签到行为 + 设备标识重置） */}
+        <section className="card p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <SlidersHorizontal size={16} className="text-emerald-500" />
+            <h2 className="font-medium">通用配置</h2>
+          </div>
+
+          <h3 className="mb-1 font-medium">应用环境</h3>
+          <p className="mb-3 text-xs text-slate-400">
+            Trae 客户端的安装路径，用于「打开应用」与「切换账号」时定位 exe；留空将自动探测。
+          </p>
+          <div className="space-y-3 text-sm">
+            <div>
+              <label className="label">Trae 安装路径</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={form.trae_cn_path ?? ''}
+                  onChange={(e) => update('trae_cn_path', e.target.value.trim() || null)}
+                  placeholder="默认 C:\Users\你\AppData\Local\Programs\Trae CN\Trae CN.exe"
+                  className="input flex-1"
+                />
+                <button onClick={detectTraeCn} disabled={detectingCn} className="btn-outline shrink-0">
+                  <Search size={15} /> {detectingCn ? '检测中…' : '自动检测'}
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-slate-400">Trae 客户端（Trae CN）的 exe 路径。</p>
+            </div>
+          </div>
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          <h3 className="mb-1 font-medium">签到行为</h3>
+          <p className="mb-3 text-xs text-slate-400">批量签到时的默认跳过策略与重试参数，对所有签到入口生效。</p>
+          <div className="space-y-3 text-sm">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.checkin_skip_checked}
+                onChange={(e) => update('checkin_skip_checked', e.target.checked)}
+              />
+              默认跳过今日已签账号
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.checkin_skip_expired}
+                onChange={(e) => update('checkin_skip_expired', e.target.checked)}
+              />
+              默认跳过 JWT 过期账号
+            </label>
+            <div>
+              <label className="label">失败重试次数（签到失败后的重试次数）</label>
+              <input
+                type="number"
+                value={form.retry}
+                onChange={(e) => update('retry', Math.min(5, Math.max(0, Number(e.target.value) || 0)))}
+                className="input w-24"
+                min={0}
+                max={5}
+              />
+            </div>
+          </div>
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          <h3 className="mb-1 font-medium">6 层设备标识重置</h3>
+          <p className="mb-3 text-xs text-slate-500">
+            一次性重置 Trae 应用的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④
+            TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭对应应用。
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => setConfirmResetDevice(true)}
+              disabled={deviceResetActive}
+              className="btn-outline"
+            >
+              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
+            </button>
+            {deviceResetActive && (
+              <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>
+            )}
+          </div>
+          {deviceResetProgress.length > 0 && (
+            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
+              {deviceResetProgress.join('\n')}
+            </pre>
+          )}
+        </section>
+
+        {/* 右列：任务配置（JWT 定时续期 + 每日定时签到） */}
+        <section className="card p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <ListChecks size={16} className="text-emerald-500" />
+            <h2 className="font-medium">任务配置</h2>
+          </div>
+
+          {/* JWT Token 定时调度续期（issue #27）：应用内调度器，无需管理员权限 */}
+          <h3 className="mb-1 flex items-center gap-1.5 font-medium">
+            JWT Token 定时续期
+            <label className="ml-auto flex cursor-pointer items-center gap-1.5 text-xs font-normal text-slate-500">
+              <input
+                type="checkbox"
+                checked={form.jwt_renew_enabled}
+                onChange={(e) => update('jwt_renew_enabled', e.target.checked)}
+              />
+              启用
+            </label>
+          </h3>
+          <p className="mb-3 text-xs text-slate-400">
+            应用运行期间每日到点自动续期临期账号（惰性判定：JWT 剩余 &le;48h 或 refresh_token 临期才真正刷新，
+            减少与 TRAE IDE 的双端互踢）。无 refresh_token 的账号自动跳过；刷新失败 30 分钟后自动重试。
+          </p>
+          <div className="flex items-center gap-2">
+            <label className="label !mb-0">每日触发时刻</label>
+            <div className="relative flex items-center">
+              <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
+              <input
+                type="time"
+                value={form.jwt_renew_hhmm}
+                onChange={(e) => update('jwt_renew_hhmm', e.target.value || '09:00')}
+                disabled={!form.jwt_renew_enabled}
+                className="input h-9 !w-32 pl-8 text-sm"
+              />
+            </div>
+            {form.jwt_renew_enabled && (
+              <span className="text-xs text-slate-400">每天 {form.jwt_renew_hhmm || '09:00'} 执行（应用关闭期间不执行）</span>
+            )}
+          </div>
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          <h3 className="mb-1 font-medium">每日定时签到</h3>
+          <p className="mb-3 text-xs text-slate-400">
+            应用内置 Rust 定时调度器：应用运行期间每日到点自动签到（晚于该时刻启动会自动补跑，无需管理员权限），
+            触发时刻随底部「保存设置」生效。下方可注册 Windows 计划任务作为兜底，注册时间复用同一时刻，
+            在应用未启动时直接运行签到（注册/删除需要管理员权限）。
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="label !mb-0">每日触发时刻</label>
+            <div className="relative flex items-center">
+              <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
+              <input
+                type="time"
+                value={form.trae_checkin_hhmm}
+                onChange={(e) => update('trae_checkin_hhmm', e.target.value || '09:00')}
+                className="input h-9 !w-32 pl-8 text-sm"
+              />
+            </div>
+            <span className="text-xs text-slate-400">
+              每天 {form.trae_checkin_hhmm || '09:00'} 执行（应用关闭期间不执行）
+            </span>
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <label className="label !mb-0">账号间隔</label>
+            <input
+              type="number"
+              min={0}
+              max={600}
+              value={form.trae_checkin_gap_secs ?? 3}
+              onChange={(e) => {
+                if (e.target.value === '') return; // 清空输入中间态不落值
+                const n = Math.min(600, Math.max(0, Math.floor(Number(e.target.value))));
+                update('trae_checkin_gap_secs', Number.isFinite(n) ? n : 3);
+              }}
+              className="input h-9 !w-24 text-sm"
+            />
+            <span className="text-xs text-slate-400">
+              秒（多账号串行签到的间隔，默认 3 秒防频控，0 = 关闭）
+            </span>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button onClick={register} disabled={busyTask} className="btn-outline">
+              <Calendar size={15} /> {busyTask ? '注册中…' : '注册任务'}
+            </button>
+            <button onClick={query} disabled={querying} className="btn-outline">
+              <Search size={15} /> {querying ? '查询中…' : '查询'}
+            </button>
+            <button onClick={() => setConfirmUnregister(true)} disabled={busyTask} className="btn-danger">
+              <Trash2 size={15} /> {busyTask ? '删除中…' : '取消'}
+            </button>
+          </div>
+          {taskInfo && (
+            <pre
+              className={`mt-3 overflow-auto whitespace-pre-wrap rounded-lg p-3 text-xs ${
+                taskInfo.startsWith('❌')
+                  ? 'max-h-80 border border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300'
+                  : 'max-h-40 bg-slate-50 dark:bg-zinc-950'
+              }`}
+            >
+              {taskInfo}
+            </pre>
+          )}
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          {/* 积分数据同步：应用内置调度器（模式/时刻随底部「保存设置」生效） */}
+          <h3 className="mb-1 font-medium">积分数据同步</h3>
+          <p className="mb-3 text-xs text-slate-400">
+            应用运行期间按所选模式自动拉取账号积分并刷新看板（含积分快照、到期数据与消耗明细）；无账号时静默跳过，
+            失败 30 分钟后自动重试。模式与时刻随底部「保存设置」生效。
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="label !mb-0">同步模式</label>
+            <select
+              className="input h-9 !w-32 text-sm"
+              value={form.trae_credits_sync_mode}
+              onChange={(e) => update('trae_credits_sync_mode', e.target.value)}
+            >
+              <option value="every_hours">每N小时</option>
+              <option value="daily">每日定时</option>
+              <option value="hourly">每小时</option>
+              <option value="off">关闭</option>
+            </select>
+            {form.trae_credits_sync_mode === 'every_hours' && (
+              <>
+                <input
+                  type="number"
+                  min={1}
+                  max={24}
+                  value={form.trae_credits_sync_hours}
+                  onChange={(e) => update('trae_credits_sync_hours', e.target.value)}
+                  onBlur={(e) => {
+                    // 手输可绕过 min/max（0/负数/超 24），失焦时归一到 1-24（与后端 clamp 口径一致）；
+                    // onChange 保留原始输入（清空为合法中间态），仅失焦时落归一值
+                    const n = Math.min(24, Math.max(1, Math.round(Number(e.target.value) || 2)));
+                    update('trae_credits_sync_hours', String(n));
+                  }}
+                  className="input h-9 !w-20 text-sm"
+                />
+                <span className="text-xs text-slate-400">
+                  小时（1-24）；距上次成功同步满 {form.trae_credits_sync_hours || '2'} 小时自动执行一次（含积分快照与消耗/会话明细）
+                </span>
+              </>
+            )}
+            {form.trae_credits_sync_mode === 'daily' && (
+              <>
+                <div className="relative flex items-center">
+                  <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
+                  <input
+                    type="time"
+                    value={form.trae_credits_sync_hhmm}
+                    onChange={(e) => update('trae_credits_sync_hhmm', e.target.value || '23:40')}
+                    className="input h-9 !w-32 pl-8 text-sm"
+                  />
+                </div>
+                <span className="text-xs text-slate-400">
+                  每天 {form.trae_credits_sync_hhmm || '23:40'} 执行（应用关闭期间不执行）
+                </span>
+              </>
+            )}
+            {form.trae_credits_sync_mode === 'hourly' && (
+              <span className="text-xs text-slate-400">应用运行期间每小时同步一次</span>
+            )}
+          </div>
+        </section>
+      </div>
+
+      {/* 底部悬浮保存条 */}
+      {dirty && (
+        <div className="mt-4 flex items-center justify-end gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 dark:border-amber-700 dark:bg-amber-900/20">
+          <span className="text-sm text-amber-600 dark:text-amber-400">有未保存的更改</span>
+          <button onClick={reset} className="btn-outline">
+            <RotateCcw size={15} /> 撤销更改
+          </button>
+          <button onClick={save} disabled={saving} className="btn-primary">
+            <Save size={15} /> {saving ? '保存中…' : '保存设置'}
+          </button>
+        </div>
+      )}
+
+      {/* 确认删除计划任务 */}
+      <Modal
+        open={confirmUnregister}
+        onClose={() => setConfirmUnregister(false)}
+        title="确认删除计划任务"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setConfirmUnregister(false)}>取消</button>
+            <button className="btn-danger" onClick={() => void unregister()}>确认删除</button>
+          </>
+        }
+      >
+        <div className="flex items-start gap-3">
+          <AlertTriangle size={20} className="mt-0.5 shrink-0 text-amber-500" />
+          <div>
+            <p>确认删除「AIWorkAssistant_DailyCheckin」计划任务？</p>
+            <p className="mt-2 text-xs text-slate-400">删除后将不再自动执行每日签到。</p>
+          </div>
+        </div>
+      </Modal>
+
+      {/* 确认执行设备标识重置 */}
+      <Modal
+        open={confirmResetDevice}
+        onClose={() => setConfirmResetDevice(false)}
+        title="确认执行 6 层设备标识重置"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setConfirmResetDevice(false)}>取消</button>
+            <button className="btn-primary" onClick={() => void handleResetDeviceIds()}>确认重置</button>
+          </>
+        }
+      >
+        <div className="flex items-start gap-3">
+          <AlertTriangle size={20} className="mt-0.5 shrink-0 text-amber-500" />
+          <div>
+            <p>
+              将重置 <span className="font-semibold">Trae（Trae CN）</span> 的以下全部设备标识层：
+            </p>
+            <ul className="mt-2 space-y-0.5 text-xs text-slate-400">
+              <li>① machineid</li>
+              <li>② storage.json telemetry</li>
+              <li>③ storage.json aha.device</li>
+              <li>④ TinyStorage</li>
+              <li>⑤ 注册表 MachineGuid</li>
+              <li>⑥ webview 追踪数据</li>
+            </ul>
+            <p className="mt-2 text-xs text-amber-500">建议先关闭 TRAE 再执行。</p>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}

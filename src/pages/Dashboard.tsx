@@ -1,0 +1,365 @@
+import { useMemo, useEffect, useState } from 'react';
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  ResponsiveContainer,
+  Tooltip,
+  CartesianGrid,
+  Cell,
+  LabelList,
+  Legend,
+} from 'recharts';
+import {
+  ShieldAlert,
+  ExternalLink,
+  RefreshCw,
+} from 'lucide-react';
+import PageHeader from '../components/PageHeader';
+import SetupGuide from '../components/SetupGuide';
+import CertManualGuide, { caCerExists } from '../components/CertManualGuide';
+import { StatCard } from '../components/ui';
+import { useAppStore } from '../store';
+import { api } from '../lib/tauri';
+import { useIsDark } from '../lib/useIsDark';
+import type { CheckinTrendPoint } from '../types';
+
+export default function Dashboard() {
+  const accounts = useAppStore((s) => s.accounts);
+  const env = useAppStore((s) => s.env);
+  const certInstalled = useAppStore((s) => s.certInstalled);
+  const localEntitlement = useAppStore((s) => s.localEntitlement);
+  const refreshLocalEntitlement = useAppStore((s) => s.refreshLocalEntitlement);
+  const toast = useAppStore((s) => s.pushToast);
+  const isDark = useIsDark();
+  // 近 30 天签到结果趋势（堆叠柱状图数据，T8）
+  const [trends, setTrends] = useState<CheckinTrendPoint[]>([]);
+  // 证书一键安装失败后展开手动导入指引（issue #12/#79）
+  const [showCertGuide, setShowCertGuide] = useState(false);
+  // F10：刷新防重入 + 按钮 loading 态
+  const [refreshing, setRefreshing] = useState(false);
+
+  const loadTrends = async () => {
+    try {
+      setTrends(await api.checkin.trends(30));
+    } catch {
+      /* 查询失败保持空态展示 */
+    }
+  };
+  useEffect(() => {
+    void loadTrends();
+  }, []);
+
+  const total = accounts.length;
+  const checkedToday = accounts.filter((a) => a.checked_today).length;
+  const totalCredits = useMemo(
+    () => accounts.reduce((s, a) => s + (a.remaining_credits ?? 0), 0),
+    [accounts],
+  );
+  const generalCredits = useMemo(
+    () => accounts.reduce((s, a) => s + (a.general_credits ?? 0), 0),
+    [accounts],
+  );
+  const workCredits = useMemo(
+    () => accounts.reduce((s, a) => s + (a.work_credits ?? 0), 0),
+    [accounts],
+  );
+  const fmt = (v: number) => v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+  const creditsHint = accounts.some((a) => a.general_credits != null || a.work_credits != null)
+    ? `通用 ${fmt(generalCredits)} 积分 · Work ${fmt(workCredits)} 积分`
+    : '总剩余可用积分';
+  const warned = accounts.filter(
+    (a) => a.jwt_exp_hours !== null && a.jwt_exp_hours <= 24,
+  ).length;
+
+  const top = useMemo(
+    () =>
+      [...accounts]
+        .filter((a) => a.remaining_credits != null && a.remaining_credits > 0)
+        .sort((a, b) => (b.remaining_credits ?? 0) - (a.remaining_credits ?? 0))
+        .slice(0, 10)
+        .map((a) => ({
+          name: a.name,
+          credits: a.remaining_credits as number,
+          general: a.general_credits,
+          work: a.work_credits,
+        })),
+    [accounts],
+  );
+
+  // Top 榜悬浮提示：展示通用/Work 积分明细（账号名作标题）
+  const TopTooltip = ({
+    active,
+    payload,
+  }: {
+    active?: boolean;
+    payload?: { payload: (typeof top)[number] }[];
+  }) => {
+    if (!active || !payload?.length) return null;
+    const p = payload[0].payload;
+    const fmt = (v: number) => v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+    return (
+      <div
+        style={{
+          fontSize: 12,
+          borderRadius: 10,
+          border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+          background: isDark ? '#18181b' : '#fff',
+          color: isDark ? '#e4e4e7' : '#1e293b',
+          boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+          padding: '8px 12px',
+        }}
+      >
+        <div className="font-medium">{p.name}</div>
+        <div>通用积分：{fmt(p.general ?? 0)}</div>
+        <div>Work积分：{fmt(p.work ?? 0)}</div>
+      </div>
+    );
+  };
+
+  const refresh = async () => {
+    // F10：防重入——连点会重复触发逐账号上游积分查询
+    if (refreshing) return;
+    setRefreshing(true);
+    toast('info', '刷新中…');
+    try {
+      const s = useAppStore.getState();
+      await Promise.all([
+        s.refreshEnv(),
+        s.refreshCert(),
+        s.refreshProxy(),
+        s.refreshApiStatus(),
+        s.refreshAccounts(),
+        s.refreshGroups(),
+        s.refreshCreditsHistory(),
+        s.refreshLocalEntitlement(),
+        loadTrends(),
+      ]);
+      // F10：「已刷新」提示移到积分查询完成后——原实现后台运行即提示，语义不准
+      try {
+        await api.accounts.refreshRemainingCredits();
+        await s.refreshAccounts();
+      } catch {
+        /* 积分刷新失败不阻断整体刷新提示 */
+      }
+      toast('success', '已刷新');
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  // 本机套餐徽标：Trae 客户端当前登录账号的套餐（storage.json 明文缓存）
+  const entHint = localEntitlement?.identity_str
+    ? localEntitlement.identity_str
+    : env?.installed
+      ? '本机应用未读取到套餐'
+      : undefined;
+  useEffect(() => {
+    void refreshLocalEntitlement();
+  }, [refreshLocalEntitlement]);
+
+  // 当前登录账号（账号池匹配名）：本机使用证据推导 uid → 反查账号池
+  const login = localEntitlement?.account_name ?? null;
+  // 告警提醒：JWT 24h 内将过期 + 积分 7 日内将过期（含已过期）的账号数
+  const nowSec = Math.floor(Date.now() / 1000);
+  const creditWarned = accounts.filter(
+    (a) => a.credits_expire_at != null && a.credits_expire_at <= nowSec + 7 * 86400,
+  ).length;
+  const alertCount = warned + creditWarned;
+
+  const openTrae = async () => {
+    await useAppStore.getState().openTrae();
+  };
+
+  return (
+    <div className="animate-fade-in">
+      <PageHeader
+        title="Trae · 概览"
+        desc="多账号签到与账号管理总览 · 登录账号 / 套餐 / 告警提醒 · 签到趋势与积分榜"
+        actions={
+          <button onClick={() => void refresh()} disabled={refreshing} className="btn-outline">
+            <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
+          </button>
+        }
+      />
+
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+        <StatCard label="账号总数" value={total} hint={`今日已签 ${checkedToday}`} tone="brand" />
+        <StatCard label="可用总积分" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint={creditsHint} tone="amber" />
+        <StatCard
+          label="登录账号"
+          value={login ?? (env?.installed ? '未登录' : '未安装')}
+          hint={env?.installed ? `Trae：${login ?? '未登录'}` : undefined}
+          tone="violet"
+        />
+        <StatCard
+          label="本机套餐"
+          value={localEntitlement?.identity_str ?? (env?.installed ? '—' : '未安装')}
+          hint={entHint}
+          tone="violet"
+        />
+        <StatCard
+          label="告警提醒"
+          value={alertCount}
+          hint={`JWT 24h 内过期 ${warned} · 积分 7 日内过期 ${creditWarned}`}
+          tone={alertCount > 0 ? 'red' : 'slate'}
+        />
+      </div>
+
+      {!env?.installed && (
+        <div className="mt-5 card flex items-center justify-between gap-4 p-4">
+          <div className="flex items-center gap-3">
+            <ShieldAlert className="text-amber-500" />
+            <div>
+              <div className="font-medium">未检测到 Trae 安装</div>
+              <div className="text-xs text-slate-500">代理捕获与账号切换基于 Trae 客户端，安装后即可开始。</div>
+            </div>
+          </div>
+          <button
+            onClick={() => void openTrae()}
+            className="btn-outline"
+          >
+            <ExternalLink size={15} /> 前往下载
+          </button>
+        </div>
+      )}
+      {!certInstalled && env?.installed && (
+        <div className="mt-3 card flex items-center justify-between gap-4 p-4">
+          <div className="flex items-center gap-3">
+            <ShieldAlert className="text-amber-500" />
+            <div>
+              <div className="font-medium">CA 证书尚未安装</div>
+              <div className="text-xs text-slate-500">代理已启动但 Trae 应用不信任代理证书将无法拦截签到接口。</div>
+            </div>
+          </div>
+          <button
+            onClick={async () => {
+              try {
+                await api.cert.install();
+                await useAppStore.getState().refreshCert();
+                toast('success', '证书安装成功（可在 certmgr「受信任的根证书颁发机构」中搜索 TraeDeviceProxyCA 验证）');
+              } catch (e) {
+                toast('error', `证书安装失败：${String(e)}`);
+                // ca.cer 已生成（安装阶段失败）才弹手动导入指引；ca.cer 未生成
+                // （ensure_ca 失败）时指引无意义，仅保留报错 toast
+                if (await caCerExists()) setShowCertGuide(true);
+              }
+            }}
+            className="btn-primary"
+          >
+            一键安装证书
+          </button>
+        </div>
+      )}
+      {showCertGuide && !certInstalled && (
+        <div className="mt-3 card overflow-hidden">
+          <CertManualGuide onClose={() => setShowCertGuide(false)} />
+        </div>
+      )}
+
+      {/* 近 30 天签到结果趋势（无数据显示空态，T8） */}
+      <div className="mt-5 card p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="font-medium">近 30 天签到结果</h3>
+          <span className="text-xs text-slate-400">按日汇总 · 成功 / 已签 / 失败</span>
+        </div>
+        {trends.length === 0 ? (
+          <div className="flex h-40 items-center justify-center text-sm text-slate-400">
+            暂无签到记录，完成一次签到后这里会显示趋势。
+          </div>
+        ) : (
+          <div className="h-64">
+            <ResponsiveContainer>
+              <BarChart data={trends} margin={{ top: 8, right: 16, left: 0, bottom: 4 }} barCategoryGap="24%">
+                <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
+                <XAxis
+                  dataKey="date"
+                  tickFormatter={(v: string) => v.slice(5)}
+                  tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                  axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
+                  tickLine={false}
+                />
+                <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={36} />
+                <Tooltip
+                  cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
+                  contentStyle={{
+                    fontSize: 12,
+                    borderRadius: 10,
+                    border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+                    background: isDark ? '#18181b' : '#fff',
+                    color: isDark ? '#e4e4e7' : '#1e293b',
+                    boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+                    padding: '8px 12px',
+                  }}
+                />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Bar dataKey="ok" name="成功" stackId="trend" fill="#10b981" maxBarSize={28} />
+                <Bar dataKey="already" name="已签" stackId="trend" fill="#0ea5e9" maxBarSize={28} />
+                <Bar dataKey="failed" name="失败" stackId="trend" fill="#f43f5e" maxBarSize={28} radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </div>
+
+      {top.length > 0 && (
+        <div className="mt-5 card p-5">
+          <div className="mb-4 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <h3 className="font-medium">积分榜 Top 榜</h3>
+              <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                Top {top.length}
+              </span>
+            </div>
+            <span className="text-xs text-slate-400">按可用积分排序</span>
+          </div>
+          <div className="h-72">
+            <ResponsiveContainer>
+              <BarChart data={top} margin={{ top: 24, right: 16, left: 0, bottom: 4 }} barCategoryGap="36%">
+                <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
+                <XAxis
+                  dataKey="name"
+                  tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                  interval={0}
+                  angle={-20}
+                  textAnchor="end"
+                  height={52}
+                  axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
+                  tickLine={false}
+                />
+                <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={48} />
+                <Tooltip
+                  cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
+                  content={<TopTooltip />}
+                />
+                <Bar dataKey="credits" radius={[8, 8, 0, 0]} maxBarSize={44}>
+                  {top.map((_, i) => {
+                    // Top 1-3 使用强调色，其余渐淡；暗色模式下反转明度
+                    const colors = isDark
+                      ? ['#fafafa', '#e4e4e7', '#d4d4d8']
+                      : ['#27272a', '#3f3f46', '#52525b'];
+                    const fill = i < 3 ? colors[i] : isDark
+                      ? `rgba(212,212,216,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`
+                      : `rgba(82,82,91,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`;
+                    return <Cell key={i} fill={fill} />;
+                  })}
+                  <LabelList
+                    dataKey="credits"
+                    position="top"
+                    formatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0)}
+                    style={{ fontSize: 10, fill: isDark ? '#a1a1aa' : '#94a3b8', fontWeight: 500 }}
+                  />
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-5">
+        <SetupGuide />
+      </div>
+    </div>
+  );
+}
