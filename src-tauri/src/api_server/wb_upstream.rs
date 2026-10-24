@@ -119,14 +119,49 @@ pub fn build_chat_headers(c: &WbCreds) -> Vec<(&'static str, String)> {
     h
 }
 
+/// 会话头三件套（移植自原仓库 3.8.1，dsh-xdpool#58 实证 2026-10-19）：
+/// 国际版网关**硬校验**这三个头，缺任一即 400 11128 "request illegal"；值不做校验
+/// 只查存在性，官方客户端每个 chat 请求都带。
+/// `X-Conversation-ID` 用调用方传入的 conv_id——与 `prepare_wb_chat_body` 注入请求体
+/// 的 `conversation_id` 是同一份，同会话稳定，上游前缀缓存（prompt_cache_key）不被打散；
+/// 空串兜底随机 uuid。另两个头每请求随机。
+/// 仅 chat 路径附带——生图/目录复用 build_chat_headers，非 chat 网关不校验，不扩散。
+fn conversation_headers(conv_id: &str) -> Vec<(&'static str, String)> {
+    let cid = if conv_id.is_empty() {
+        uuid::Uuid::new_v4().simple().to_string()
+    } else {
+        conv_id.to_string()
+    };
+    vec![
+        ("X-Conversation-ID", cid),
+        (
+            "X-Conversation-Request-ID",
+            uuid::Uuid::new_v4().simple().to_string(),
+        ),
+        (
+            "X-Conversation-Message-ID",
+            uuid::Uuid::new_v4().simple().to_string(),
+        ),
+    ]
+}
+
 /// 上游请求错误：(HTTP 状态 | 502 传输错误, body 摘要, Retry-After 秒)
 pub type UpstreamErr = (u16, String, Option<u64>);
 
-/// 发起 WB 对话请求，返回 SSE 流 reader
-pub fn make_wb_request(c: &WbCreds, body: &[u8]) -> Result<Box<dyn Read + Send>, UpstreamErr> {
+/// 发起 WB 对话请求，返回 SSE 流 reader。
+/// `conv_id` 为调用方 prepare 阶段注入请求体的同一份 conversation_id。
+pub fn make_wb_request(
+    c: &WbCreds,
+    conv_id: &str,
+    body: &[u8],
+) -> Result<Box<dyn Read + Send>, UpstreamErr> {
     let url = format!("{}{}", c.chat_base(), WB_CHAT_PATH);
     let mut req = wb_agent().post(&url);
     for (k, v) in build_chat_headers(c) {
+        req = req.set(k, &v);
+    }
+    // dsh-xdpool#58：X-Conversation 三头缺一即 11128（国际版硬校验）
+    for (k, v) in conversation_headers(conv_id) {
         req = req.set(k, &v);
     }
     match req.send_bytes(body) {
@@ -601,6 +636,50 @@ pub fn refresh_access_token(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// 回归锁（移植自 3.8.1，dsh-xdpool#58）：国际版网关硬校验会话头三件套，
+    /// 缺任一即 400 11128——三头必须齐全、X-Conversation-ID 用调用方 conv_id
+    /// （同会话稳定，上游前缀缓存不被打散）、另两头每请求随机
+    #[test]
+    fn conversation_headers_three_pieces() {
+        let h = conversation_headers("conv-abc");
+        let get = |name: &str| {
+            h.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(get("X-Conversation-ID"), "conv-abc");
+        assert!(!get("X-Conversation-Request-ID").is_empty());
+        assert!(!get("X-Conversation-Message-ID").is_empty());
+        assert_eq!(h.len(), 3);
+        // 另两头每请求随机（两次调用不同），conv_id 保持稳定
+        let h2 = conversation_headers("conv-abc");
+        let get2 = |name: &str| {
+            h2.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(get2("X-Conversation-ID"), "conv-abc");
+        assert_ne!(
+            get("X-Conversation-Request-ID"),
+            get2("X-Conversation-Request-ID")
+        );
+        assert_ne!(
+            get("X-Conversation-Message-ID"),
+            get2("X-Conversation-Message-ID")
+        );
+        // 空串兜底随机 uuid：不得产出空头值（空值等于缺头，照样 11128）
+        let h3 = conversation_headers("");
+        let cid = h3
+            .iter()
+            .find(|(k, _)| *k == "X-Conversation-ID")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(cid.len(), 32, "uuid::simple 应为 32 位 hex，实际 {cid}");
+        assert!(cid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 
     fn creds(global: bool, uid: &str, eid: &str, domain: &str) -> WbCreds {
         WbCreds {

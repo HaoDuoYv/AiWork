@@ -221,6 +221,13 @@ pub fn load_templates(state: &ApiSharedState) -> Vec<(String, String)> {
 /// message 关键词判定（积分耗尽标记词表集中维护，F-33）
 pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
     let lower = msg.to_lowercase();
+    // 11140 账号级风控（移植自原仓库 3.8.3，issue #136 反馈）：账号被上游限制使用
+    // → Forbidden 禁用待申诉（申诉成功后 UI 手动启用恢复）。优先于状态码口径：
+    // 该错误常以 400 到达，按 400 → Client 只会短冷却，受限账号会被持续调度每请求必败。
+    // 与 11128 渠道级相反——11128 按请求指纹拦截、换号无意义；11140 换号有意义。
+    if code == 11140 || super::retry::is_account_restricted_error(msg) {
+        return ErrKind::Forbidden;
+    }
     if code == 401 || lower.contains("unauthorized") || lower.contains("token expired") {
         return ErrKind::SessionDead;
     }
@@ -302,6 +309,7 @@ fn race_first_byte(
     state: &Arc<ApiSharedState>,
     primary_uid: &str,
     converted: &[u8],
+    conv_id: &str,
     reader: Box<dyn Read + Send>,
     tried: &HashSet<String>,
     allowed: Option<&HashSet<String>>,
@@ -323,6 +331,9 @@ fn race_first_byte(
     let allowed2 = allowed.cloned();
     let dedicated2 = dedicated.map(str::to_string);
     let body = converted.to_vec();
+    // 对冲请求沿用同一 conv_id：与国际版会话头三件套 + prompt_cache_key 同源，
+    // 换账号重发仍命中同一会话键（移植自原仓库 3.8.1）
+    let conv_id2 = conv_id.to_string();
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
         let (picked2, ev) = state2
             .wb_pool
@@ -342,7 +353,7 @@ fn race_first_byte(
             enterprise_id: picked2.enterprise_id.clone(),
             global_region: picked2.global_region,
         };
-        let reader2 = wb_upstream::make_wb_request(&creds2, &body).ok()?;
+        let reader2 = wb_upstream::make_wb_request(&creds2, &conv_id2, &body).ok()?;
         Some((reader2, lease))
     };
     match wb_upstream::lines_with_first_byte_hedged(reader, hedge_ms, spawn_backup) {
@@ -700,7 +711,7 @@ fn run_wb_stream(
                 return;
             }
             let ttfb_start = Instant::now();
-            match wb_upstream::make_wb_request(&creds, &converted) {
+            match wb_upstream::make_wb_request(&creds, &conv_id, &converted) {
                 Ok(reader) => {
                     // 首字超时 10s（T2.7/F-34）：超时视为上游故障 → 换号；
                     // F-76③ 慢请求竞速对冲：首字超阈值时向第二账号发对冲请求，
@@ -709,6 +720,7 @@ fn run_wb_stream(
                         state,
                         &picked.uid,
                         &converted,
+                        &conv_id,
                         reader,
                         &tried,
                         allowed_set.as_ref(),
@@ -1091,7 +1103,7 @@ pub async fn wb_aggregate_chat(
             let mut same_attempt: u32 = 0;
             loop {
                 let ttfb_start = Instant::now();
-                match wb_upstream::make_wb_request(&creds, &converted) {
+                match wb_upstream::make_wb_request(&creds, &conv_id, &converted) {
                     Ok(reader) => {
                         // 首字超时：非流式聚合同样适用（上游只回 SSE）；
                         // F-76③ 慢请求竞速对冲（对冲关闭时与纯首字超时语义一致）
@@ -1099,6 +1111,7 @@ pub async fn wb_aggregate_chat(
                             &state,
                             &picked.uid,
                             &converted,
+                            &conv_id,
                             reader,
                             &tried,
                             allowed_set.as_ref(),
@@ -1474,7 +1487,7 @@ pub async fn wb_tool_exec_chat(
 
                 // F-76① 各轮记首字耗时（最终轮即最终回复的 TTFT）
                 let ttfb_start = Instant::now();
-                match wb_upstream::make_wb_request(&creds, &converted) {
+                match wb_upstream::make_wb_request(&creds, &conv_id, &converted) {
                     Ok(reader) => {
                         let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
                             Ok(l) => l,

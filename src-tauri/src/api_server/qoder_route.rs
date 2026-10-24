@@ -56,11 +56,11 @@ const QUEUE_DEFAULT_BACKOFF_SECS: u64 = 5;
 /// 退避上限（上游建议值异常大时钳制）
 const QUEUE_BACKOFF_MAX_SECS: u64 = 30;
 
-/// 排队时等待关闭时的**快速失败预算**（秒；2026-10-19 实机修复）。
+/// 排队策略（对齐 qoder2api-hub issue #87）：`wait` 模式下的**快速失败预算**（秒）。
 ///
 /// 单账号池（`tried=1`）下，上游持续排队 + 每次钳制 ≤30s 的同号退避，会把请求拖到
 /// **94 秒**仍无任何 token 输出，最后还以 503 `no healthy account available` 收尾——既慢又
-/// 误导（账号是健康的，只是上游在排队）。预算到点即收尾 429（带上游建议退避秒数）。
+/// 误导（账号是健康的，只是上游在排队）。该预算只用于 `wait`（旧行为）模式。
 const QUEUE_WAIT_BUDGET_SECS: u64 = 20;
 
 /// 排队等待**上限**的运行时 clamp 区间与默认值（Qoder 调度页可设，
@@ -70,36 +70,123 @@ const QUEUE_WAIT_MAX_MIN_SECS: u64 = 30;
 const QUEUE_WAIT_MAX_MAX_SECS: u64 = 900;
 const QUEUE_WAIT_MAX_DEFAULT_SECS: u64 = 300;
 
+/// 排队策略取值（空串/未知值按 `visible` 归一，与 qoder2api-hub 同口径）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueMode {
+    /// 先发响应头 + 排队期间持续下发可见状态帧（默认）
+    Visible,
+    /// 不等：立刻收尾（429 + Retry-After + 中文原因），客户端自行重试
+    Fast,
+    /// 旧行为：内部静默 sleep（客户端零字节），仅兼容保留
+    Wait,
+}
+
+impl QueueMode {
+    fn parse(raw: &str) -> QueueMode {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "fast" => QueueMode::Fast,
+            "wait" => QueueMode::Wait,
+            _ => QueueMode::Visible,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            QueueMode::Visible => "visible",
+            QueueMode::Fast => "fast",
+            QueueMode::Wait => "wait",
+        }
+    }
+}
+
+/// 当前排队策略（热读，保存即生效）
+fn queue_mode(state: &ApiSharedState) -> QueueMode {
+    let raw = state
+        .qoder_queue_mode
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    QueueMode::parse(&raw)
+}
+
 /// 本次请求的排队总预算（秒）：
-/// - 「排队时等待」关闭（默认）→ 快速失败预算 20s，超时立刻 429，客户端按 Retry-After 重试；
-/// - 开启 → 等到 Qoder 调度页设置的等待上限（clamp 30–900，默认 300s），
-///   期间持续同号重试，只有到上限才收尾——单账号池排队时不会因为网关预算过短而失败。
+/// - `fast` → 0：不等待，首次排队即收尾（429 + Retry-After）；
+/// - `visible` / `wait` → Qoder 调度页设置的等待上限（clamp 30–900，默认 300s）。
 fn queue_budget_secs(state: &ApiSharedState) -> u64 {
     effective_queue_budget(
-        state
-            .qoder_queue_wait_enabled
-            .load(std::sync::atomic::Ordering::Relaxed),
+        queue_mode(state),
         state
             .qoder_queue_wait_max_secs
             .load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
-/// 预算决策纯函数（便于单测）：开关关 → 快速失败预算；开 → clamp 后的等待上限
-fn effective_queue_budget(enabled: bool, max_secs: u64) -> u64 {
-    if enabled {
-        max_secs.clamp(QUEUE_WAIT_MAX_MIN_SECS, QUEUE_WAIT_MAX_MAX_SECS)
-    } else {
-        QUEUE_WAIT_BUDGET_SECS
+/// 预算决策纯函数（便于单测）：fast → 0（不等待）；visible/wait → clamp 后的上限
+fn effective_queue_budget(mode: QueueMode, max_secs: u64) -> u64 {
+    match mode {
+        QueueMode::Fast => 0,
+        QueueMode::Visible | QueueMode::Wait => {
+            max_secs.clamp(QUEUE_WAIT_MAX_MIN_SECS, QUEUE_WAIT_MAX_MAX_SECS)
+        }
     }
 }
 
+/// 可见排队状态帧（issue #87 visible 模式，对齐 qoder2api-hub）。
+///
+/// 先在 SSE 上发一条注释心跳保活，再发一条**客户端可读**的排队状态：
+/// chat 走 `qoder_queue` 顶层字段；anthropic 走 `event: ping`（带 `qoder_queue`
+/// 附加字段，未知键会被客户端忽略）；responses 走 `response.qoder_queue` 事件。
+/// 文案明确「不是你的 Key / 账号 / 网络问题」，避免用户误判。
+fn queue_notice_frames(
+    proto: Protocol,
+    queued: bool,
+    waited: u64,
+    next_wait: u64,
+    budget: u64,
+    message: &str,
+) -> String {
+    let info = json!({
+        "queued": queued,
+        "waited_seconds": waited,
+        "wait_seconds": next_wait,
+        "budget_seconds": budget,
+        "message": message,
+    });
+    let mut out = String::from(": ping\n\n");
+    match proto {
+        Protocol::Anthropic => {
+            out.push_str(&format!(
+                "event: ping\ndata: {}\n\n",
+                json!({ "type": "ping", "qoder_queue": info })
+            ));
+        }
+        Protocol::Responses => {
+            out.push_str(&format!(
+                "event: response.qoder_queue\ndata: {}\n\n",
+                json!({ "type": "response.qoder_queue", "qoder_queue": info })
+            ));
+        }
+        // OpenAI chat / completions：顶层 qoder_queue 字段
+        Protocol::OpenAi | Protocol::OpenAiText => {
+            out.push_str(&format!("data: {}\n\n", info));
+        }
+    }
+    out
+}
+
+/// 排队等待中的中文状态文案（对齐 qoder2api-hub 措辞）
+fn queue_waiting_msg(model: &str, waited: u64) -> String {
+    format!(
+        "上游模型排队中（10605 / RESOURCE_LIMIT）：model {model} 已等待 {waited} 秒，仍在队列中——这不是你的 Key、账号或网络问题"
+    )
+}
+
 /// 排队预算内的收尾文案（流式/非流式共用，便于断言）
-/// `waiting_mode`：是否处于「排队时等待」模式——决定提示是「稍后重试」还是
+/// `waiting_mode`：是否处于等待模式——决定提示是「稍后重试」还是
 /// 「已达等待上限（可在 Qoder 调度页调大）」
 fn queue_budget_exhausted_msg(model: &str, waited: u64, next_wait: u64, waiting_mode: bool) -> String {
     let hint = if waiting_mode {
-        "已达等待上限，可在「Qoder 资源调度」页调大等待上限后重试"
+        "已达等待上限，可在「Qoder 资源调度」页调大等待上限后重试；这不是你的 Key、账号或网络问题"
     } else {
         "上游排队中，账号与凭证正常；请稍后重试或改用其它模型"
     };
@@ -826,9 +913,15 @@ fn run_qoder_stream(
     );
     // 排队预算（「排队时等待」开关决定：20s 快速失败 / 调度页设置的上限）
     let queue_budget = queue_budget_secs(&state);
-    let queue_wait_on = state
-        .qoder_queue_wait_enabled
-        .load(std::sync::atomic::Ordering::Relaxed);
+    // 排队策略热读（visible（默认）/ fast / wait）
+
+    let queue_mode = queue_mode(&state);
+
+    // 等待模式：非 fast 即为等待（visible 与 wait 都会持续重试，
+
+    // 差别在于是否下发可见状态帧）
+
+    let queue_wait_on = queue_mode != QueueMode::Fast;
 
     // 目录条目（upstreamKey/config）：调度命中后目录刷新导致条目消失时按 404 透传。
     // 区域边界（v1）：恒 CN 区解析 + CN 网关执行（QODER_CHAT_URL）——Global 区
@@ -1247,6 +1340,28 @@ fn run_qoder_stream(
                                             );
                                             return;
                                         }
+                                        // visible 模式：把「正在排队」变成客户端可见状态帧
+                                        // （先心跳保活再发 qoder_queue，对齐 issue #87）——
+                                        // 此前客户端在这段时间零字节，只会以为卡死
+                                        if queue_mode == QueueMode::Visible {
+                                            let frame = queue_notice_frames(
+                                                proto,
+                                                true,
+                                                queue_waited_secs,
+                                                secs,
+                                                queue_budget,
+                                                &queue_waiting_msg(model, queue_waited_secs),
+                                            );
+                                            if tx.blocking_send(Ok(bytes::Bytes::from(frame))).is_err() {
+                                                // 客户端已断连：按请求终局收尾
+                                                state.record_usage_qoder(
+                                                    model, &win_uid, key_id, false, true,
+                                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                                    None, None, None, &session_ctx(&peek),
+                                                );
+                                                return;
+                                            }
+                                        }
                                         // 冷却门：尾巴放行（睡完窗口继续同号重试）、
                                         // 长窗口才硬 429、断连即收尾
                                         match cooldown_gate(pool_tag, model, Some(tx)) {
@@ -1476,6 +1591,25 @@ fn run_qoder_stream(
                                     );
                                     return;
                                 }
+                                // visible 模式：下发可见排队状态帧（对齐 issue #87）
+                                if queue_mode == QueueMode::Visible {
+                                    let frame = queue_notice_frames(
+                                        proto,
+                                        true,
+                                        queue_waited_secs,
+                                        secs,
+                                        queue_budget,
+                                        &queue_waiting_msg(model, queue_waited_secs),
+                                    );
+                                    if tx.blocking_send(Ok(bytes::Bytes::from(frame))).is_err() {
+                                        state.record_usage_qoder(
+                                            model, &picked.uid, key_id, false, true,
+                                            start_ts.elapsed().as_millis() as u64, 0, 0,
+                                            None, None, None, &session_ctx(&peek),
+                                        );
+                                        return;
+                                    }
+                                }
                                 match cooldown_gate(pool_tag, model, Some(tx)) {
                                     CooldownGate::Waited => {
                                         queue_same += 1;
@@ -1609,9 +1743,15 @@ pub async fn qoder_aggregate_chat(
         );
         // 排队预算（「排队时等待」开关决定：20s 快速失败 / 调度页设置的上限）
         let queue_budget = queue_budget_secs(&state);
-        let queue_wait_on = state
-            .qoder_queue_wait_enabled
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // 排队策略热读（visible（默认）/ fast / wait）
+
+        let queue_mode = queue_mode(&state);
+
+        // 等待模式：非 fast 即为等待（visible 与 wait 都会持续重试，
+
+        // 差别在于是否下发可见状态帧）
+
+        let queue_wait_on = queue_mode != QueueMode::Fast;
 
         // 区域边界（v1）：恒 CN 区解析，同 run_qoder_stream 注释（Global 区未接线）
         let Some(entry) = qoder_upstream::resolve(
@@ -2377,21 +2517,67 @@ mod tests {
         assert!(msg.contains("账号与凭证正常"), "{msg}");
     }
 
-    /// 「排队时等待」开关决定预算：关 → 20s 快速失败；开 → 调度页上限（clamp 30–900）
+    /// 排队策略决定预算（对齐 issue #87）：fast → 0（不等待，首次排队即收尾）；
+    /// visible/wait → 调度页上限（clamp 30–900）
     #[test]
-    fn queue_wait_switch_selects_budget() {
-        assert_eq!(effective_queue_budget(false, 300), QUEUE_WAIT_BUDGET_SECS);
-        assert_eq!(effective_queue_budget(false, 900), QUEUE_WAIT_BUDGET_SECS);
-        assert_eq!(effective_queue_budget(true, 300), 300);
-        assert_eq!(effective_queue_budget(true, 600), 600);
+    fn queue_mode_selects_budget() {
+        // fast：预算 0，任何建议等待都会立刻超预算 → 走「立刻 429 + Retry-After」
+        assert_eq!(effective_queue_budget(QueueMode::Fast, 300), 0);
+        assert!(queue_budget_exceeded(0, 1, 0), "fast 模式首次排队即收尾");
+        // visible / wait：按上限等待
+        assert_eq!(effective_queue_budget(QueueMode::Visible, 300), 300);
+        assert_eq!(effective_queue_budget(QueueMode::Visible, 600), 600);
+        assert_eq!(effective_queue_budget(QueueMode::Wait, 300), 300);
         // 越界钳制：低于 30 抬到 30，高于 900 压到 900（防止无限挂起）
-        assert_eq!(effective_queue_budget(true, 0), QUEUE_WAIT_MAX_MIN_SECS);
-        assert_eq!(effective_queue_budget(true, 10), QUEUE_WAIT_MAX_MIN_SECS);
-        assert_eq!(effective_queue_budget(true, 99_999), QUEUE_WAIT_MAX_MAX_SECS);
+        assert_eq!(effective_queue_budget(QueueMode::Visible, 0), QUEUE_WAIT_MAX_MIN_SECS);
+        assert_eq!(effective_queue_budget(QueueMode::Visible, 10), QUEUE_WAIT_MAX_MIN_SECS);
+        assert_eq!(
+            effective_queue_budget(QueueMode::Visible, 99_999),
+            QUEUE_WAIT_MAX_MAX_SECS
+        );
         // 等待模式下的收尾提示应指向「调大上限」，而不是让用户去查账号
         let msg = queue_budget_exhausted_msg("qwen3.8-flash", 300, 30, true);
         assert!(msg.contains("已达等待上限"), "{msg}");
         assert!(msg.contains("Qoder 资源调度"), "{msg}");
+        assert!(msg.contains("不是你的 Key"), "{msg}");
+    }
+
+    /// 策略解析：空串/未知值一律归 visible（与 qoder2api-hub 同口径），大小写不敏感
+    #[test]
+    fn queue_mode_parsing_is_lenient() {
+        assert_eq!(QueueMode::parse(""), QueueMode::Visible);
+        assert_eq!(QueueMode::parse("  "), QueueMode::Visible);
+        assert_eq!(QueueMode::parse("unknown"), QueueMode::Visible);
+        assert_eq!(QueueMode::parse("VISIBLE"), QueueMode::Visible);
+        assert_eq!(QueueMode::parse("Fast"), QueueMode::Fast);
+        assert_eq!(QueueMode::parse(" fast "), QueueMode::Fast);
+        assert_eq!(QueueMode::parse("WAIT"), QueueMode::Wait);
+        assert_eq!(QueueMode::Visible.as_str(), "visible");
+        assert_eq!(QueueMode::Fast.as_str(), "fast");
+        assert_eq!(QueueMode::Wait.as_str(), "wait");
+    }
+
+    /// 可见状态帧（issue #87）：三种协议各自的载体——chat 顶层 qoder_queue、
+    /// anthropic `event: ping`、responses `response.qoder_queue`；均先发心跳保活，
+    /// 且带「已等待 Ns」与中文原因（客户端据此可显示排队进度）
+    #[test]
+    fn queue_notice_frames_per_protocol() {
+        let chat = queue_notice_frames(Protocol::OpenAi, true, 12, 5, 300, "排队中");
+        assert!(chat.starts_with(": ping\n\n"), "必须先发心跳保活");
+        assert!(chat.contains("\"queued\":true"), "{chat}");
+        assert!(chat.contains("\"waited_seconds\":12"), "{chat}");
+        assert!(chat.contains("\"wait_seconds\":5"), "{chat}");
+        assert!(chat.contains("\"budget_seconds\":300"), "{chat}");
+        assert!(!chat.contains("event:"), "chat 走裸 data 帧");
+
+        let anth = queue_notice_frames(Protocol::Anthropic, true, 7, 5, 300, "排队中");
+        assert!(anth.contains("event: ping"), "{anth}");
+        assert!(anth.contains("\"type\":\"ping\""), "{anth}");
+        assert!(anth.contains("qoder_queue"), "{anth}");
+
+        let resp = queue_notice_frames(Protocol::Responses, true, 9, 5, 300, "排队中");
+        assert!(resp.contains("event: response.qoder_queue"), "{resp}");
+        assert!(resp.contains("qoder_queue"), "{resp}");
     }
     // ==================== issue #90 修复①：Server 渐进模型级冷却 ====================
 

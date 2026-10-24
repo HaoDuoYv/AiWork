@@ -696,8 +696,13 @@ pub fn resolve_target(
         .find(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled));
 
     let mut fallback_from: Option<(TargetPool, FallbackReason)> = None;
+    // issue #136（移植自原仓库 3.8.3）：候选序逐池失败原因（pool=reason）——
+    // 「白名单把池整体排除」与「账号不健康」在日志里直接可辨，不再需要复现猜因
+    let mut pool_reasons: Vec<String> = Vec::new();
     for (i, pool) in order.iter().copied().enumerate() {
         if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled) {
+            // 源不可用（模型不在该池目录 / 上游开关关闭）同样是失败原因，必须入归因
+            pool_reasons.push(format!("{}=unavailable", pool.as_str()));
             continue;
         }
         match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref(), req_realm) {
@@ -731,6 +736,7 @@ pub fn resolve_target(
                 });
             }
             Err(reason) => {
+                pool_reasons.push(format!("{}={}", pool.as_str(), reason.as_str()));
                 // 首选池不可用：双源 + fallback 开 + 后续还有可用源 → 按序回退；
                 // 单源（或 fallback 关）→ 错误矩阵显式报错（§4.3，不静默换池）
                 let has_next = order[i + 1..]
@@ -743,6 +749,10 @@ pub fn resolve_target(
                     && sources.available_count(trae_enabled, wb_enabled, qoder_enabled) >= 2
                     && has_next;
                 if !can_fallback {
+                    // issue #136：提前终止（无更多回退目标）同样落逐池归因——实证
+                    // 「白名单排除 + 单/末位可用池」走的是本提前 return，仅零可用源
+                    // 才会自然走到循环末尾的 exhausted 块，两处都必须落日志
+                    log_dispatch_exhausted(state, model, key_id, preferred, &pool_reasons);
                     return Err(match (pool, reason) {
                         (TargetPool::Buddy, FallbackReason::ModelCooldown) => {
                             let secs = super::wb_route::model_cooling_remaining(state, &final_buddy_model(&sources))
@@ -772,28 +782,42 @@ pub fn resolve_target(
             }
         }
     }
-    // 可用源全部耗尽（双源回退目标也不可用 / 源剔除后无源 / Key 白名单排除）：
-    // 落盘调度日志便于排查轮询异常（issue #30：凭证调度可观测，含 Key 展示名）
-    {
-        let key_label = key_id
-            .map(|id| super::api_keys::key_name_for(&state.data_dir, id))
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "anonymous".to_string());
-        crate::fs_utils::app_log(
-            &state.data_dir,
-            &format!(
-                "dispatch exhausted: model={} key={} preferred={}",
-                model,
-                key_label,
-                preferred.map(|p| p.as_str()).unwrap_or("none"),
-            ),
-        );
-    }
+    // 可用源全部耗尽（零可用源 / 双源回退目标也不可用 / Key 白名单排除）：
+    // 落盘调度日志便于排查轮询异常（issue #30：凭证调度可观测，含 Key 展示名；
+    // issue #136：追加逐池失败归因 candidates，跨池错位一行日志即可定位）
+    log_dispatch_exhausted(state, model, key_id, preferred, &pool_reasons);
     Err(DispatchError::NoHealthy(
         // issue #90 修复③a：前缀锁定池不可用时错误指向该池（而非兜底 Trae，
         // 否则「qoder/xxx 但 qoder 池耗尽」报成 Trae 无健康账号，误导排障）
         forced_pool.or(preferred).unwrap_or(TargetPool::Trae),
     ))
+}
+
+/// dispatch 耗尽/提前终止的逐池归因日志（issue #30 可观测 + issue #136 逐池
+/// candidates）：候选序中每个池的失败原因（unavailable / no_healthy_account /
+/// model_cooldown / insufficient_credits）一行落盘，「白名单把池排除」与
+/// 「账号不健康」直接可辨
+fn log_dispatch_exhausted(
+    state: &Arc<ApiSharedState>,
+    model: &str,
+    key_id: Option<&str>,
+    preferred: Option<TargetPool>,
+    reasons: &[String],
+) {
+    let key_label = key_id
+        .map(|id| super::api_keys::key_name_for(&state.data_dir, id))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "anonymous".to_string());
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "dispatch exhausted: model={} key={} preferred={} candidates={}",
+            model,
+            key_label,
+            preferred.map(|p| p.as_str()).unwrap_or("none"),
+            reasons.join(","),
+        ),
+    );
 }
 
 /// 会话池粘性键（§4.4：复用现有粘性会话键，conversation 维度）。
@@ -1204,7 +1228,7 @@ mod tests {
             wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
-            qoder_queue_wait_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_queue_mode: std::sync::Mutex::new("visible".to_string()),
             qoder_queue_wait_max_secs: std::sync::atomic::AtomicU64::new(300),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(HashMap::new()),

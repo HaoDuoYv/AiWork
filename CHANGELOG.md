@@ -6,6 +6,49 @@
 
 ---
 
+## [4.0.9] · 2026-10-24 · 排队可见化 + 模型目录可诊断（对齐 qoder2api-hub 1.6.13/1.6.7）
+
+### 新增
+
+- **Qoder 排队可见化（对齐 qoder2api-hub issue #87）**：排队策略升级为三模式，资源调度页可切：
+  - **可见等待 `visible`（默认）**：流式请求先发响应头，排队期间**持续下发可被客户端读到的状态帧**（先 `: ping` 心跳保活，再 `qoder_queue`：已等待秒数 / 本次建议等待 / 预算上限 / 中文原因），客户端能看到「上游排队中（已等待 N 秒）」。此前这段时间客户端**零字节**——正是「卡死」体感的来源。三种协议各自载体：chat 走顶层 `qoder_queue`、anthropic 走 `event: ping` 附字段、responses 走 `response.qoder_queue` 事件。
+  - **快速失败 `fast`**：首次排队立即收尾，不发状态帧，由客户端自行重试（预算 0）。
+  - **静默等待 `wait`（旧）**：保留原行为（内部 sleep，不发声），仅兼容用。
+  - 收尾文案统一点明「这不是你的 Key、账号或网络问题」，避免用户误判。
+
+### 增强
+
+- **`/v1/models` 补可诊断性字段（对齐 qoder2api-hub 的 `catalog_source`）**：响应体新增 ① `realm`（当前 Qoder 默认解析区）② `catalog_source`（`remote` 远程目录生效 / `builtin` 正在用内置兜底表 / `disabled` 上游关闭）③ `catalog_source_detail`（两区各自来源，定位「只同步成功一个区」）④ `model_count`。此前目录同步失败会静默回落到兜底表，列表比上游旧时**无法自查**，最容易被误判成「模型没了」。
+
+### 排查结论（未改代码）
+
+- **跨区 failover 死循环（qoder2api-hub issue #83）我方不存在**：该 bug 源于 `"intl" if realm == "cn" else "cn"` 在 `realm=None` 时把「另一区」判成自己，造成 cn↔cn 无限切区直到超时。本实现 `region()` / `pool_tag()` 是 `realm` 的**全函数纯映射**，没有「取另一区」的推导；两处 `or_else(resolve(Cn))` 只是**目录条目查找兜底**（找 upstreamKey），不重发请求、不改池、不改网关地址。已加回归锁 `region_resolution_is_total_and_never_self_referential` 钉死该契约。
+
+验证：`cargo test --bins` → 1037 passed / 0 failed / 14 ignored；`npx tsc --noEmit` → 0。新增回归锁 `queue_mode_selects_budget`、`queue_mode_parsing_is_lenient`、`queue_notice_frames_per_protocol`（三协议载体 + 心跳先行）、`catalog_source_tracks_remote_vs_builtin`（分区来源可辨）。
+
+---
+
+## [4.0.8] · 2026-10-24 · 对齐原仓库 3.8.1~3.8.3（11140 风控 / 会话头 / 归因分流）
+
+### 修复
+
+- **11140 账号级风控零识别，受限账号被持续调度每请求必败**（issue #136）：上游「账号存在异常行为，已被限制使用」此前无识别，按 HTTP 400 归 Client 只做短冷却，受限账号被反复取号、每请求必吃 400，且空占并发槽。现按账号级风控精确识别（中文关键词 + `code:11140` 数字边界双口径），归类 `Forbidden` 禁用待申诉——**换号接替**，申诉成功后 UI 手动启用即恢复。与 11128 渠道级风控**语义相反**：11128 按请求指纹拦截、换号无意义（处置是清洗指纹后同号重试），两者双向不误报。
+- **国际版 WB 网关硬校验会话头，缺任一即 400 11128「request illegal」**（dsh-xdpool#58 实证）：chat 请求现统一附带 `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID` 三件套。`X-Conversation-ID` 取 `prepare` 阶段注入请求体 `conversation_id` 的同一份——同会话稳定，上游前缀缓存（`prompt_cache_key`）不被打散；另两头每请求随机，空串兜底随机 uuid（空值等同缺头）。仅 chat 路径附带，生图/目录不扩散。
+- **「无可用账号」提示把「白名单指向其他池」误报成「账号不健康」**（issue #136）：`healthy_in_scope=0` 时按根因分流——① 白名单/专一账号全指向其他池（本池被整体排除，调度优先级对该 Key 形同虚设）→ 列出约束实际涉及的池并点明「本次请求由本池提供」；② 白名单指向的本池账号均不可用 → 提示查账号状态。两种根因用户动作不同，混用同一文案会把排障方向带偏。
+- **调度耗尽日志看不出「哪个池为什么失败」**（issue #136）：`dispatch exhausted` 行追加 `candidates=` 服务逐池归因（`trae=no_healthy_account,buddy=unavailable` 这类），候选序中「模型不在该池 / 上游开关关闭（unavailable）」「池内无健康账号」「模型冷却」「额度不足」逐池可辨；且**提前终止出口**（无更多回退目标）同样落盘——实测该场景走的是循环内提前 return，原实现只有零可用源才会走到循环末尾那块日志，导致最常见的失败反而没有归因行。
+
+### 未移植（评估结论）
+
+原仓库 3.8.3 其余改动经评估暂不适配本版本：
+
+- **启动早期 `0xc0000142` 崩溃修复**（issue #137，reg.exe/netstat/certutil 改进程内 API）：本版本 `certutil` 已带 `CREATE_NO_WINDOW`，且 `reg`/`netstat` 只在用户主动操作（查找安装路径、查端口占用）时触发，不走登录早期自动路径——问题前提不成立，改动面大（Cargo 依赖 + 3 个底层模块）收益低。
+- **续期前置判活 / AuthRejected 永久冷却**（#126/#128）：作用于 Trae 签到链，不影响网关可用性。
+- **指纹样本环形缓冲 / 清洗档位分区**（#122/#125/#129）：依赖原仓库新增的 `wb_payload::empty_sample_note` 等一批基础设施，宜整体移植而非碎片摘取。
+
+验证：`cargo test --bins` → 1034 passed / 0 failed / 14 ignored；新增回归锁 `account_restricted_11140_vs_channel_11128`（双向不误报）、`conversation_headers_three_pieces`（三头齐全 + conv 稳定 + 空串兜底）、`t90c_dispatch_exhausted_logs_per_pool_reasons`（逐池归因落盘）。
+
+---
+
 ## [4.0.7] · 2026-10-19 · Qoder「排队时等待」开关 + 对冲败者记账移植
 
 ### 新增

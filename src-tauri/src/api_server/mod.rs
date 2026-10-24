@@ -88,10 +88,10 @@ pub struct ApiSharedState {
     /// 倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游活动结束后关闭恢复
     /// 官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
     pub qoder_flash_free_rate: std::sync::atomic::AtomicBool,
-    /// 排队时等待开关（2026-10-19，资源调度页可设）：开启后上游排队不再在默认
-    /// 20s 预算处 429，而是持续等到 `qoder_queue_wait_max_secs` 上限；
-    /// 关闭时保持「20s 内出结果 / 超时 429」的快速失败语义
-    pub qoder_queue_wait_enabled: std::sync::atomic::AtomicBool,
+    /// 排队策略（2026-10-24，资源调度页可设；对齐 qoder2api-hub issue #87）：
+    /// `visible`（默认，先发响应头 + 持续状态帧）/ `fast`（立即 429 + Retry-After）/
+    /// `wait`（旧行为：内部静默 sleep，客户端零字节）
+    pub qoder_queue_mode: Mutex<String>,
     /// 排队等待上限秒数（运行时 clamp 30–900，默认 300）
     pub qoder_queue_wait_max_secs: std::sync::atomic::AtomicU64,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
@@ -577,6 +577,12 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
     if is_credit_exhausted_error(body) {
         return ErrKind::HardCredit;
     }
+    // 11140 账号级风控（移植自原仓库 3.8.3，issue #136 反馈）：账号被上游限制使用
+    // → Forbidden 禁用待申诉。优先于状态码口径：该错误常以 HTTP 400 到达，按 400 →
+    // Client 仅短冷却，账号会被持续调度每请求必败（申诉成功后 UI 手动启用恢复）
+    if retry::is_account_restricted_error(body) {
+        return ErrKind::Forbidden;
+    }
     // 1005：精确匹配 JSON 键 + plan limit 短语（避免任意 "1005"/"plan" 字样误判）
     let lower_body = body.to_lowercase();
     if (body.contains("\"code\":1005") || body.contains("\"code\": 1005"))
@@ -773,7 +779,7 @@ mod inflight_tests {
             wb_pool_sticky_ttl_secs: AtomicU64::new(0),
             qoder_pool_sticky_ttl_secs: AtomicU64::new(0),
             qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
-            qoder_queue_wait_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_queue_mode: Mutex::new(crate::models::default_qoder_queue_mode()),
             qoder_queue_wait_max_secs: AtomicU64::new(
                 crate::models::default_qoder_queue_wait_max_secs(),
             ),

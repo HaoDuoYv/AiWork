@@ -754,9 +754,9 @@ export interface ApiPoolFile {
   qoder_sticky_enabled?: boolean;
   /** Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：目录倍率按 0 处理 + 取号豁免零积分过滤 */
   qoder_flash_free_rate?: boolean;
-  /** 排队时等待（2026-10-19，默认关）：开启后上游排队持续等待到上限，而非 20s 就 429 */
-  qoder_queue_wait_enabled?: boolean;
-  /** 排队等待上限秒数（默认 300，clamp 30–900；仅排队时等待开启时生效） */
+  /** 排队策略（2026-10-24，默认 visible）：visible=先发响应头+可见状态帧 / fast=立即 429 / wait=静默等待（旧） */
+  qoder_queue_mode?: string;
+  /** 排队等待上限秒数（默认 300，clamp 30–900；fast 模式不生效） */
   qoder_queue_wait_max_secs?: number;
   /** Qoder 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
   qoder_account_concurrency_limit?: number;

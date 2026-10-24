@@ -350,4 +350,27 @@ mod tests {
         // 前缀后为空：视为裸名，避免产生空模型
         assert_eq!(normalize_model_id("qoder/"), (None, "qoder/".into()));
     }
+
+    /// 回归锁（P2 防跨区 failover 死循环）：区域判定是**纯函数映射**，不存在
+    /// 「取另一区」的推导——qoder2api-hub 曾因 `"intl" if realm == "cn" else "cn"`
+    /// 在 realm=None 时误判「另一区 = 自己」，导致 cn↔cn 无限切换直到超时。
+    /// 本实现的 region()/pool_tag() 只由输入 realm 决定，天然无此退化路径，
+    /// 此测试把该契约钉死：任何输入（含空串/未知值）都映射到确定的一区。
+    #[test]
+    fn region_resolution_is_total_and_never_self_referential() {
+        for input in ["cn", "intl", "", "  ", "Global", "international", "unknown-zone"] {
+            let r = normalize(input);
+            // 归一结果只能落在 CN / INTL 两者之一（全函数，无 Option 悬空）
+            assert!(r == CN || r == INTL, "normalize({input:?}) = {r}");
+            // pool_tag 与 region 同源同区：不可能出现「另一区 = 本区」的歧义
+            let tag = pool_tag(r);
+            assert_eq!(realm_of_pool(tag), r, "pool_tag/realm_of_pool 必须互逆");
+            // region 取 realm（不是 pool_tag）作为输入：由 realm 唯一决定网关区域
+            assert_eq!(
+                region(r),
+                if r == INTL { QoderRegion::Global } else { QoderRegion::Cn },
+                "region 必须由 realm 唯一决定"
+            );
+        }
+    }
 }

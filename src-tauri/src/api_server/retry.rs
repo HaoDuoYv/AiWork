@@ -30,22 +30,38 @@ pub fn is_thinking_signature_error(body: &str) -> bool {
 pub fn is_illegal_channel_error(body: &str) -> bool {
     body.contains("Illegal API invocation")
         || body.contains("unapproved channel")
-        || contains_code_11128(body)
+        || contains_code_value(body, "11128")
 }
 
-/// `"code": 11128` 宽松匹配：容忍键/冒号/值之间的序列化空白差异
-/// （Go encoding/json 紧凑无空格，但报文可能经中间层重序列化）；
+/// 11140 账号级风控识别（移植自原仓库 3.8.3，issue #136 反馈）：上游判定
+/// 「账号存在异常行为，已被限制使用」——账号整体受限、需申诉恢复。
+///
+/// 与 11128 **语义相反**，不可混淆：
+/// - 11128 渠道级：按请求指纹判定、与账号无关 → 换号无意义，处置是清洗指纹后同号重试；
+/// - 11140 账号级：换号有意义 → 处置是禁用该账号（Forbidden，待申诉成功后手动恢复），
+///   由池内其它账号接替。
+///
+/// 该错误常以 HTTP 400 形态到达，若按状态码口径默认归 Client 只会短冷却，账号会被
+/// 持续调度、每请求必败；故在 classify 中优先于状态码判定。
+/// 中文关键词 + code 数字边界双口径（报文可能只带关键词或只带 code）。
+pub fn is_account_restricted_error(body: &str) -> bool {
+    body.contains("账号存在异常")
+        || body.contains("已被限制使用")
+        || contains_code_value(body, "11140")
+}
+
+/// `"code": <code>` 宽松匹配（通用版，11128/11140 共用）：容忍键/冒号/值之间的
+/// 序列化空白差异（Go encoding/json 紧凑无空格，但报文可能经中间层重序列化）；
 /// 值须带数字边界（`111280`/`111289` 不误撞），键名引号边界天然排除
 /// `some_code` 等字段名
-fn contains_code_11128(body: &str) -> bool {
+fn contains_code_value(body: &str, code: &str) -> bool {
     const KEY: &str = "\"code\"";
-    const CODE: &str = "11128";
     let mut rest = body;
     while let Some(pos) = rest.find(KEY) {
         let after_key = rest[pos + KEY.len()..].trim_start();
         if let Some(after_colon) = after_key.strip_prefix(':') {
             let after_colon = after_colon.trim_start();
-            if let Some(tail) = after_colon.strip_prefix(CODE) {
+            if let Some(tail) = after_colon.strip_prefix(code) {
                 if !tail.starts_with(|c: char| c.is_ascii_digit()) {
                     return true;
                 }
@@ -228,5 +244,28 @@ mod tests {
         // 关键词兜底仍有效
         assert!(is_illegal_channel_error("Illegal API invocation from channel"));
         assert!(!is_illegal_channel_error("normal upstream error"));
+    }
+
+    /// 回归锁（移植自 3.8.3，issue #136）：11140 账号级风控与 11128 渠道级风控
+    /// 必须双向不误报——前者换号有意义（禁用账号待申诉），后者换号无意义（清洗指纹）
+    #[test]
+    fn account_restricted_11140_vs_channel_11128() {
+        // 11140：中文关键词 / code 数字 / 空白形态
+        assert!(is_account_restricted_error("账号存在异常行为，已被限制使用"));
+        assert!(is_account_restricted_error(r#"{"code":11140}"#));
+        assert!(is_account_restricted_error(r#"{"code": 11140, "msg":"x"}"#));
+        assert!(is_account_restricted_error(r#"{ "code"
+        : 11140}"#));
+        // 数字边界：111400/111409 不误撞
+        assert!(!is_account_restricted_error(r#"{"code":111400}"#));
+        assert!(!is_account_restricted_error(r#"{"code":111409}"#));
+        // 键名边界：some_code 不误撞
+        assert!(!is_account_restricted_error(r#"{"some_code":11140}"#));
+        // 双向不误报：11128 报文不得被判成 11140，反之亦然
+        assert!(!is_account_restricted_error(r#"{"code":11128}"#));
+        assert!(!is_account_restricted_error("Illegal API invocation"));
+        assert!(!is_illegal_channel_error(r#"{"code":11140}"#));
+        assert!(!is_illegal_channel_error("账号存在异常行为，已被限制使用"));
+        assert!(!is_account_restricted_error("normal upstream error"));
     }
 }

@@ -756,10 +756,11 @@ export const api = {
         qoderStickyEnabled?: boolean;
         /** Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；null/未传 = 保留原值 */
         qoderFlashFreeRate?: boolean;
-        /** 排队时等待开关（2026-10-19）：开启后上游排队不再在 20s 预算处 429，
-         *  而是等到 qoderQueueWaitMaxSecs 上限；null/未传 = 保留原值 */
-        qoderQueueWaitEnabled?: boolean;
-        /** 排队等待上限秒数（clamp 30–900，默认 300）；null/未传 = 保留原值 */
+        /** 排队策略（2026-10-24，对齐 issue #87）：
+         *  `visible`=先发响应头 + 持续下发可见状态帧（默认）/ `fast`=立即 429 + Retry-After /
+         *  `wait`=旧行为（内部静默 sleep）；null/未传 = 保留原值 */
+        qoderQueueMode?: string;
+        /** 排队等待上限秒数（clamp 30–900，默认 300；fast 模式不生效）；null/未传 = 保留原值 */
         qoderQueueWaitMaxSecs?: number;
         /** Qoder 池入池白名单（qd- 账号 id）；null/未传 = 保留原值 */
         qoderUids?: string[];
@@ -804,7 +805,7 @@ export const api = {
         qoderHedgeThresholdMs: wbFlags?.qoderHedgeThresholdMs ?? null,
         qoderStickyEnabled: wbFlags?.qoderStickyEnabled ?? null,
         qoderFlashFreeRate: wbFlags?.qoderFlashFreeRate ?? null,
-        qoderQueueWaitEnabled: wbFlags?.qoderQueueWaitEnabled ?? null,
+        qoderQueueMode: wbFlags?.qoderQueueMode ?? null,
         qoderQueueWaitMaxSecs: wbFlags?.qoderQueueWaitMaxSecs ?? null,
         qoderUids: wbFlags?.qoderUids ?? null,
         qoderGroupIds: wbFlags?.qoderGroupIds ?? null,

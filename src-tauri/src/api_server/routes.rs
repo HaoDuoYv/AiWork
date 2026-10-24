@@ -513,8 +513,48 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
                 Some(s) => s.len().to_string(),
             };
             let ded = c.dedicated.as_deref().unwrap_or("-");
+            // issue #136（移植自原仓库 3.8.3）：hint 按根因分流——
+            // A) allowed=Some(空集)：约束条目全指向其他池（或专一锁他池），本池被整体
+            //    排除，调度优先级对该 Key 形同虚设；列出约束实际涉及的池
+            // B) allowed=Some(非空) 但作用域内 0 健康：白名单指向的本池账号均不可用
+            let hint = if healthy_scope == 0 && healthy_total > 0 {
+                if matches!(&c.allowed, Some(s) if s.is_empty()) {
+                    let mut pools: Vec<&'static str> = Vec::new();
+                    for u in &rk.allowed_accounts {
+                        let (p, _) = super::api_keys::split_pool_tagged(u);
+                        let p = p.unwrap_or("buddy");
+                        if !pools.contains(&p) {
+                            pools.push(p);
+                        }
+                    }
+                    if rk.schedule_mode == super::api_keys::MODE_DEDICATED {
+                        let (p, _) = super::api_keys::split_pool_tagged(&rk.dedicated_account);
+                        if let Some(p) = p {
+                            if !pools.contains(&p) {
+                                pools.push(p);
+                            }
+                        }
+                    }
+                    if pools.is_empty() {
+                        format!(
+                            " hint=该 Key 的账号约束未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号后重试",
+                            pool = pool.as_str(),
+                        )
+                    } else {
+                        format!(
+                            " hint=该 Key 的账号约束均指向其他资源池（{pools}），未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号纳入 {pool} 池，或检查约束目标池的账号健康度后重试",
+                            pools = pools.join("/"),
+                            pool = pool.as_str(),
+                        )
+                    }
+                } else {
+                    " hint=约束排除了池内全部健康账号（池内尚有 {healthy_total} 个）：白名单/专一指向的本池账号均不可用，请检查这些账号状态或编辑该 Key 的账号白名单/专一账号后重试".to_string()
+                }
+            } else {
+                String::new()
+            };
             format!(
-                "{base} key={name} bind={bind} whitelist={wl} dedicated={ded} healthy_in_scope={healthy_scope}"
+                "{base} key={name} bind={bind} whitelist={wl} dedicated={ded} healthy_in_scope={healthy_scope}{hint}"
             )
         }
     }
@@ -760,10 +800,14 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // Qoder 源旗标（p3-3）：条目始终入表（开关关闭时徽章置灰）；双区池口径
     // 与 /healthz 一致（CN ∨ INTL 任一可选，INTL 受 qoder_intl_enabled 约束）
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
-    let qoder_intl_enabled = {
+    // Qoder 默认解析区 + 国际池开关（同一次读，供 intl 别名与响应诊断字段共用）
+    let (qoder_default_realm, qoder_intl_enabled) = {
         let s: crate::models::Settings =
             crate::store::db(&state.data_dir).kv_get("app_settings");
-        s.qoder_intl_enabled
+        (
+            crate::tasks::qoder_realm::normalize(&s.qoder_default_realm).to_string(),
+            s.qoder_intl_enabled,
+        )
     };
     let qoder_ok = state.qoder_pool.has_selectable()
         || (qoder_intl_enabled && state.qoder_intl_pool.has_selectable());
@@ -898,7 +942,29 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             }));
         }
     }
-    Json(json!({ "object": "list", "data": data }))
+    Json(json!({
+        "object": "list",
+        "data": data,
+        // 可诊断性（移植自 qoder2api-hub 的 /v1/models 响应头字段）：
+        // `realm` = 当前 Qoder 默认解析区；`catalog_source` = Qoder 目录来源
+        // （`remote` 远程同步生效 / `builtin` 正在用内置兜底表——后者说明同步未跑成，
+        //  列表可能比上游实际可用的旧，排障时最容易被误判成「模型没了」）；
+        // `catalog_source_detail` 给出两区各自来源，便于定位「只同步成功了一个区」
+        "realm": qoder_default_realm,
+        "catalog_source": if qoder_enabled {
+            crate::tasks::qoder_upstream::catalog_source_merged()
+        } else {
+            // Qoder 上游关闭时列表不含 Qoder 条目，来源无意义
+            "disabled"
+        },
+        "catalog_source_detail": if qoder_enabled {
+            let (cn, intl) = crate::tasks::qoder_upstream::catalog_source();
+            json!({ "cn": cn, "intl": intl })
+        } else {
+            json!({})
+        },
+        "model_count": data.len(),
+    }))
 }
 
 pub async fn chat_completions(
@@ -3333,7 +3399,7 @@ mod tests {
             wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
-            qoder_queue_wait_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_queue_mode: std::sync::Mutex::new("visible".to_string()),
             qoder_queue_wait_max_secs: std::sync::atomic::AtomicU64::new(300),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),

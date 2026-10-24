@@ -416,6 +416,37 @@ fn catalog_for(state: &CatalogState, region: QoderRegion) -> Vec<Value> {
     }
 }
 
+/// 目录来源标注（移植自 qoder2api-hub 的 `catalog_source`，供 /v1/models 自查）：
+/// - `remote`：内存里有远程同步结果（正常态）；
+/// - `builtin`：远程为空、正在用内置兜底表（同步未跑过 / 全部失败——此时模型列表
+///   可能比上游实际可用的旧，排障时最容易误判成「模型没了」）。
+///
+/// 返回 (cn 来源, intl 来源)；两者可能不同（某区同步成功、另一区失败）。
+pub fn catalog_source() -> (&'static str, &'static str) {
+    let state = read_state();
+    let of = |remote: &Vec<Value>| {
+        if remote.is_empty() {
+            "builtin"
+        } else {
+            "remote"
+        }
+    };
+    (
+        of(&state.cn),
+        of(&state.global),
+    )
+}
+
+/// 合并视图下的总体来源：任一区为 remote 即 `remote`，两区皆兜底才 `builtin`
+pub fn catalog_source_merged() -> &'static str {
+    let (cn, intl) = catalog_source();
+    if cn == "remote" || intl == "remote" {
+        "remote"
+    } else {
+        "builtin"
+    }
+}
+
 /// 接收远程目录响应（`model/list` 的信封 JSON）：解析并替换对应地区缓存。
 ///
 /// 网络请求由接线层的刷新器发起（带 COSY 签名的 GET），本函数只做
@@ -3022,9 +3053,34 @@ mod tests {
         assert!(!in_region_catalog("NoSuchModelXyz", QoderRegion::Global));
     }
 
+    /// 回归锁（P1 可诊断性）：`catalog_source` 必须如实区分「远程同步生效」与
+    /// 「正在用内置兜底表」——后者是排障时最容易误判成「模型没了」的状态
     #[test]
-    fn adopt_remote_parses_and_resolves() {
-        // 采纳会写进程级目录：持测试锁独占，丢弃时自动复位回落兜底
+    fn catalog_source_tracks_remote_vs_builtin() {
+        let _catalog = catalog_test_guard();
+        // 复位后两区都是兜底
+        assert_eq!(catalog_source(), ("builtin", "builtin"));
+        assert_eq!(catalog_source_merged(), "builtin");
+        // 只采纳 CN：cn=remote、intl=builtin（分区来源可辨）
+        let payload = json!({
+            "statusCodeValue": 200,
+            "chat": [{
+                "key": "src_key",
+                "display_name": "Src Model",
+                "enable": true,
+                "price_factor": 0.5,
+                "max_input_tokens": 128000,
+                "source": "remote",
+            }],
+        });
+        adopt_remote(QoderRegion::Cn, &payload).expect("应采纳 CN");
+        assert_eq!(catalog_source(), ("remote", "builtin"));
+        // 任一区 remote → 合并视图 remote
+        assert_eq!(catalog_source_merged(), "remote");
+    }
+
+    #[test]
+    fn adopt_remote_parses_and_resolves() {        // 采纳会写进程级目录：持测试锁独占，丢弃时自动复位回落兜底
         let _catalog = catalog_test_guard();
         let payload = json!({
             "statusCodeValue": 200,

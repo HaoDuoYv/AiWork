@@ -790,18 +790,24 @@ pub struct ApiPoolFile {
     /// 上游活动结束后关闭即恢复官方同步倍率
     #[serde(default = "default_true")]
     pub qoder_flash_free_rate: bool,
-    /// 排队时等待开关（2026-10-19，资源调度页可设）：
-    /// 开启后上游排队（10605/`queued`）不再在默认 20s 预算处报 429，而是持续
-    /// 等到 `qoder_queue_wait_max_secs` 上限——单账号池排队期间客户端只需要等，
-    /// 不会因为网关侧预算过短而失败；关闭时保持「20s 内出结果，超时 429」的
-    /// 快速失败语义。默认关闭（不改变既有行为）
-    #[serde(default)]
-    pub qoder_queue_wait_enabled: bool,
-    /// 排队等待上限秒数（`qoder_queue_wait_enabled=true` 时生效，默认 300；
-    /// 运行期 clamp 30–900）。到达上限仍收尾 429 并提示「已达等待上限」，
-    /// 避免客户端无限挂起（并发槽与连接都需要有界）
+    /// 排队策略（2026-10-24，资源调度页可设，对齐 qoder2api-hub issue #87）：
+    /// - `visible`（默认）：流式请求**先发响应头**，排队期间持续发心跳 + 可见状态帧
+    ///   （`qoder_queue`：已等待秒数 / 本次建议等待 / 预算上限 / 中文原因），
+    ///   客户端能看到「上游排队中（已等待 Ns）」而不是静默卡住；超预算发中文错误帧；
+    /// - `fast`：不等，立即 429 + Retry-After + 中文原因，客户端自己重试；
+    /// - `wait`：旧行为（内部静默 sleep，客户端零字节——正是「卡住」的来源，仅兼容保留）。
+    /// 空串/未知值一律按 `visible` 处理
+    #[serde(default = "default_qoder_queue_mode")]
+    pub qoder_queue_mode: String,
+    /// 排队等待上限秒数（默认 300；运行期 clamp 30–900）。到达上限仍收尾并提示
+    /// 「已达等待上限」，避免客户端无限挂起（并发槽与连接都需要有界）
     #[serde(default = "default_qoder_queue_wait_max_secs")]
     pub qoder_queue_wait_max_secs: u64,
+}
+
+/// 排队策略默认 `visible`（开箱即符合「排队不静默卡住」）
+pub fn default_qoder_queue_mode() -> String {
+    "visible".to_string()
 }
 
 /// 排队等待上限默认 300s（5 分钟：覆盖上游常见排队窗口，又不至于无限挂起）
@@ -866,7 +872,7 @@ impl Default for ApiPoolFile {
             qoder_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             qoder_sticky_ttl_secs: default_sticky_ttl_secs(),
             qoder_flash_free_rate: true,
-            qoder_queue_wait_enabled: false,
+            qoder_queue_mode: default_qoder_queue_mode(),
             qoder_queue_wait_max_secs: default_qoder_queue_wait_max_secs(),
             qoder_strategy: String::new(),
             qoder_enabled_uids: Vec::new(),

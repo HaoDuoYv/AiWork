@@ -384,10 +384,8 @@ pub async fn do_start(
             pool_file.qoder_hedge_threshold_ms,
         ),
         qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(pool_file.qoder_sticky_enabled),
-        // 排队时等待开关 + 上限（2026-10-19）：启动即按持久化配置生效
-        qoder_queue_wait_enabled: std::sync::atomic::AtomicBool::new(
-            pool_file.qoder_queue_wait_enabled,
-        ),
+        // 排队策略 + 上限（2026-10-24，对齐 issue #87）：启动即按持久化配置生效
+        qoder_queue_mode: std::sync::Mutex::new(pool_file.qoder_queue_mode.clone()),
         qoder_queue_wait_max_secs: std::sync::atomic::AtomicU64::new(
             pool_file.qoder_queue_wait_max_secs.clamp(30, 900),
         ),
@@ -997,7 +995,7 @@ fn merge_pool_set(
     // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111）；None = 保留原值
     qoder_flash_free_rate: Option<bool>,
     // 排队时等待开关 + 等待上限秒数（2026-10-19）；None = 保留原值
-    qoder_queue_wait_enabled: Option<bool>,
+    qoder_queue_mode: Option<String>,
     qoder_queue_wait_max_secs: Option<u64>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值，
     // Some(list) = 覆盖（Qoder 页账号池勾选保存；空数组 = fail-open 全量入池）
@@ -1064,8 +1062,7 @@ fn merge_pool_set(
             .unwrap_or(existing.qoder_hedge_threshold_ms),
         qoder_sticky_enabled: qoder_sticky_enabled.unwrap_or(existing.qoder_sticky_enabled),
         qoder_flash_free_rate: qoder_flash_free_rate.unwrap_or(existing.qoder_flash_free_rate),
-        qoder_queue_wait_enabled: qoder_queue_wait_enabled
-            .unwrap_or(existing.qoder_queue_wait_enabled),
+        qoder_queue_mode: qoder_queue_mode.unwrap_or_else(|| existing.qoder_queue_mode.clone()),
         qoder_queue_wait_max_secs: qoder_queue_wait_max_secs
             .unwrap_or(existing.qoder_queue_wait_max_secs),
         qoder_enabled_uids: qoder_uids.unwrap_or_else(|| existing.qoder_enabled_uids.clone()),
@@ -1123,7 +1120,7 @@ pub fn pool_set(
     // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；None = 保留原值
     qoder_flash_free_rate: Option<bool>,
     // 排队时等待开关 + 等待上限秒数（2026-10-19，资源调度页可设）；None = 保留原值
-    qoder_queue_wait_enabled: Option<bool>,
+    qoder_queue_mode: Option<String>,
     qoder_queue_wait_max_secs: Option<u64>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值
     qoder_uids: Option<Vec<String>>,
@@ -1173,7 +1170,7 @@ pub fn pool_set(
         qoder_hedge_threshold_ms,
         qoder_sticky_enabled,
         qoder_flash_free_rate,
-        qoder_queue_wait_enabled,
+        qoder_queue_mode,
         qoder_queue_wait_max_secs,
         qoder_uids,
         qoder_group_ids,
@@ -1293,11 +1290,11 @@ pub fn pool_set(
             pool_file.qoder_flash_free_rate,
             std::sync::atomic::Ordering::Relaxed,
         );
-        // 排队时等待开关 + 上限热应用（2026-10-19）：保存即生效，无需重启服务
-        rt.shared.qoder_queue_wait_enabled.store(
-            pool_file.qoder_queue_wait_enabled,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        // 排队策略热应用（2026-10-24，对齐 issue #87）：保存即生效，无需重启服务
+
+        *rt.shared.qoder_queue_mode.lock().unwrap_or_else(|e| e.into_inner()) =
+
+            pool_file.qoder_queue_mode.clone();
         rt.shared.qoder_queue_wait_max_secs.store(
             pool_file.qoder_queue_wait_max_secs.clamp(30, 900),
             std::sync::atomic::Ordering::Relaxed,
@@ -2031,7 +2028,7 @@ mod pool_merge_tests {
             qoder_hedge_threshold_ms: 4000,
             qoder_sticky_enabled: true,
             qoder_flash_free_rate: true,
-            qoder_queue_wait_enabled: false,
+            qoder_queue_mode: "visible".into(),
             qoder_queue_wait_max_secs: 300,
             qoder_account_concurrency_limit: 3,
             qoder_pool_sticky_ttl_secs: 900,

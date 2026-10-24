@@ -42,9 +42,10 @@ export default function QoderApiService() {
   // 取号豁免零积分过滤；上游活动结束后关闭恢复官方同步倍率
   const [flashFreeRate, setFlashFreeRate] = useState(true);
   const [savingFlashFree, setSavingFlashFree] = useState(false);
-  // 排队时等待（2026-10-19）：开启后上游排队不再 20s 就报 429，而是等到上限秒数；
-  // 上限 clamp 30–900（后端同口径），默认 300s
-  const [queueWaitEnabled, setQueueWaitEnabled] = useState(false);
+  // 排队策略（2026-10-24，对齐 qoder2api-hub issue #87）：
+  // visible（默认）= 先发响应头 + 排队期间持续下发可见状态帧（客户端能看到「已等待 Ns」）；
+  // fast = 不等，立即 429 + Retry-After；wait = 旧行为（内部静默 sleep，客户端零字节）
+  const [queueMode, setQueueMode] = useState<'visible' | 'fast' | 'wait'>('visible');
   const [queueWaitMaxSecs, setQueueWaitMaxSecs] = useState(300);
   // per-pool 调度参数（Qoder 池专属，与 Trae/Buddy 互不共享）：并发 0 = 不限、池粘性 0 = 关
   const [qoderAccountConcurrencyLimit, setQoderAccountConcurrencyLimit] = useState(1);
@@ -109,7 +110,10 @@ export default function QoderApiService() {
         // Qwen3.8-Flash 免费活动倍率覆盖（issue #111，缺省对齐后端 serde default：开）
         setFlashFreeRate(pf.qoder_flash_free_rate ?? true);
         // 排队时等待回显（缺省对齐后端 serde default：关 / 300s）
-        setQueueWaitEnabled(pf.qoder_queue_wait_enabled ?? false);
+        // 排队策略回显（缺省对齐后端 serde default：visible / 300s）
+        setQueueMode(
+          (pf.qoder_queue_mode as 'visible' | 'fast' | 'wait' | undefined) ?? 'visible',
+        );
         setQueueWaitMaxSecs(pf.qoder_queue_wait_max_secs ?? 300);
         // per-pool 调度参数回显（缺省对齐后端 serde default：并发 1 / 池粘性 300s / 会话粘性 1800s）
         setQoderAccountConcurrencyLimit(pf.qoder_account_concurrency_limit ?? 1);
@@ -193,7 +197,7 @@ export default function QoderApiService() {
           qoderPoolStickyTtlSecs,
           qoderStickyTtlSecs,
           // 排队时等待（2026-10-19）：开关 + 上限秒数（后端 clamp 30–900）
-          qoderQueueWaitEnabled: queueWaitEnabled,
+          qoderQueueMode: queueMode,
           qoderQueueWaitMaxSecs: queueWaitMaxSecs,
           // null = 未自定义（后端保留原值保持 fail-open）；数组 = 白名单覆盖（[] = 清空恢复全量）
           ...(qoderUids !== null ? { qoderUids } : {}),
@@ -729,28 +733,37 @@ export default function QoderApiService() {
                   <span className="text-[11px] text-slate-400">ms</span>
                 </span>
               </div>
-              {/* 排队时等待（2026-10-19）：上游排队时持续等待而不是 20s 就 429 */}
-              <label className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-100/60 dark:hover:bg-zinc-800/60">
-                <input
-                  type="checkbox"
-                  className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
-                  checked={queueWaitEnabled}
-                  onChange={() => setQueueWaitEnabled((v) => !v)}
-                />
+              {/* 排队策略（2026-10-24，对齐 qoder2api-hub issue #87）：三模式 */}
+              <div className="flex items-start justify-between gap-3 rounded-md px-1.5 py-1.5">
                 <span className="min-w-0">
-                  <span className="block text-xs text-slate-700 dark:text-zinc-200">排队时等待</span>
+                  <span className="block text-xs text-slate-700 dark:text-zinc-200">排队策略</span>
                   <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
-                    开启后上游排队（10605 / queued）不再在 20 秒预算处返回 429，而是持续按上游建议
-                    退避重试，直到等待上限（当前 {queueWaitMaxSecs}s）；关闭时保持「20 秒内出结果，
-                    超时 429 让客户端稍后重试」的快速失败语义。单账号池排队期间建议开启
+                    {queueMode === 'visible' &&
+                      '先发响应头，排队期间持续下发可见状态帧（客户端能看到「已等待 N 秒」），到上限再收尾——推荐'}
+                    {queueMode === 'fast' &&
+                      '不等待：首次排队立即返回 429 + Retry-After + 中文原因，由客户端自行重试'}
+                    {queueMode === 'wait' &&
+                      '旧行为：内部静默等待，客户端在此期间收不到任何字节（正是「卡住」的来源，仅兼容保留）'}
                   </span>
                 </span>
-              </label>
+                <select
+                  value={queueMode}
+                  onChange={(e) =>
+                    setQueueMode(e.target.value as 'visible' | 'fast' | 'wait')
+                  }
+                  className="shrink-0 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                >
+                  <option value="visible">可见等待（默认）</option>
+                  <option value="fast">快速失败</option>
+                  <option value="wait">静默等待（旧）</option>
+                </select>
+              </div>
               <div className="flex items-center justify-between gap-3 px-1.5">
                 <span className="min-w-0">
                   <span className="block text-xs text-slate-700 dark:text-zinc-200">排队等待上限</span>
                   <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
-                    仅「排队时等待」开启时生效（有效范围 30–900 秒）；到达上限仍收尾 429 并提示调大上限
+                    仅「可见等待 / 静默等待」生效（有效范围 30–900 秒，当前 {queueWaitMaxSecs}s）；
+                    到达上限仍收尾并提示调大上限
                   </span>
                 </span>
                 <span className="flex shrink-0 items-center gap-1.5">
