@@ -445,6 +445,25 @@ ai-work-assistant/
 - ❌ 使用 `api.prevent_close()` → 会导致 Chromium 1412 错误。
 - ❌ 用 `npm run dev` 直接跑 Vite → 白屏，必须 `npm run tauri dev`（实际入口为 `scripts/dev-tauri.mjs`）。
 - ❌ 混用 dc uid 与 Cloud-IDE uid 入池 → 两套 id 空间不通用，会产生重复账号（见 §5.1）。
+- ❌ **用 PowerShell 读写含中文的源码文件**（`Get-Content -Raw` / `Set-Content` / `WriteAllText`）→ 见 §13.1，两次真实事故。
+
+## 13.1 含中文源码的编辑红线（2026-10-19 / 10-24 两次事故复盘）
+
+> **事故**：两次用 PowerShell 批量替换含中文的 Rust 文件，均造成不可逆损坏：
+> - 第一次（`qoder_route.rs`，2500 行）：`Set-Content` 按系统 ANSI(GBK) 代码页回写，中文全变 mojibake 且**吞掉 237 处换行**（注释与代码粘连、行数从 2508 掉到 2271），只能从 `TraeWorkAssistant@3.8` 基线重建。
+> - 第二次（`dispatch.rs` / `routes.rs`）：`Get-Content -Raw` + `WriteAllText(UTF8)` 看似安全，实际**吞掉 232 / 261 处换行**（GBK 双字节切分把 `\r\n` 吃进中文字符），只能 `git checkout` 回 HEAD 再逐处重做。
+>
+> **根因**：PowerShell 的默认编码与 .NET 字符串读写路径，在同一次往返里会做「UTF-8 字节 → 系统代码页 → UTF-8」的隐式转换；中文（3 字节 UTF-8）与换行（`0D 0A`）在 GBK 双字节切分下会发生**跨字符边界合并**，换行被识别成某个汉字的后半字节而消失。ASCII 内容毫发无损，所以肉眼扫代码「看起来对」，只有编译器报 `unexpected closing delimiter` 才暴露。
+
+**规范（逐条必守）**：
+
+1. **改文件只用 `edit` 工具**（或 `write` 整文件重写）——它们走 UTF-8 直读直写，不做代码页转换。**禁止**用 PowerShell 的 `Get-Content`/`Set-Content`/`[IO.File]::WriteAllText` 改源码。
+2. **批量替换先写 Node 脚本**（`fs.readFileSync(p,'utf8')` → 替换 → `fs.writeFileSync(p, s,'utf8')`），Node 是纯 UTF-8 往返，安全；脚本本身用 `write` 工具创建，不要用 PowerShell here-string 生成。
+3. **改完立刻自检**：`node -e "const t=require('fs').readFileSync(F,'utf8');console.log((t.match(/\uFFFD/g)||[]).length)"` 必须为 `0`，且行数应与改动量相符（少了上百行 = 换行被吞）。
+4. **PowerShell 只用于只读探查**（`Select-String` / `Get-ChildItem` / `git` / `cargo`）；即便只读，输出里的中文乱码也只是显示问题，不影响仓库。
+5. **不信「看起来对」**：中文文件被破坏后 ASCII 代码结构仍完好，必须靠**编译器 + 行数比对 + `\uFFFD` 计数**三重验证，不能靠肉眼。
+6. **改坏了先 `git checkout -- <file>`**（前提：该文件改动已提交或可放弃），**不要**尝试逆向修编码——GBK/UTF-8 往返是有损的，逆向只会二次污染（第一次事故即如此，越修越坏）。
+
 
 ## 14. 已知约束
 
