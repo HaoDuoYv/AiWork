@@ -266,7 +266,7 @@ pub fn ccswitch_register(
             app.to_string().into(),
             name.clone().into(),
             cfg_str.into(),
-            "https://github.com/smart-open".to_string().into(),
+            "https://github.com/HaoDuoYv/AiWork".to_string().into(),
             rusqlite::types::Value::Integer((ts * 1000) as i64), // CC Switch created_at 为毫秒时间戳
             (max_sort + 1).to_string().into(),
             notes.into(),

@@ -6,7 +6,6 @@ import {
   CheckCircle2,
   Download,
   Github,
-  Globe,
   Loader2,
   RefreshCw,
 } from 'lucide-react';
@@ -20,9 +19,8 @@ import {
   APP_AUTHOR,
   APP_COPYRIGHT,
   APP_DISCLAIMER,
-  LINK_GITHUB,
-  LINK_BLOG,
   LINK_REPO,
+  LINK_UPSTREAM_REPO,
   promoBanner,
 } from '../lib/about';
 
@@ -269,22 +267,16 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
         {/* 链接 */}
         <div className="flex flex-wrap gap-2">
           <button
-            onClick={() => void openUrl(LINK_GITHUB)}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium transition hover:bg-slate-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
-          >
-            <Github size={14} /> GitHub
-          </button>
-          <button
-            onClick={() => void openUrl(LINK_BLOG)}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium transition hover:bg-slate-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
-          >
-            <Globe size={14} /> 个人博客
-          </button>
-          <button
             onClick={() => void openUrl(LINK_REPO)}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium transition hover:bg-slate-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
           >
-            <Github size={14} /> 项目仓库 / README
+            <Github size={14} /> 项目仓库
+          </button>
+          <button
+            onClick={() => void openUrl(LINK_UPSTREAM_REPO)}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium transition hover:bg-slate-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          >
+            <Github size={14} /> 上游项目
           </button>
         </div>
 

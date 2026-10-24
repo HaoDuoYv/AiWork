@@ -13,8 +13,9 @@ export const APP_COPYRIGHT = `Copyright © 2026 ${APP_AUTHOR} · MIT License`;
 export const APP_DISCLAIMER =
   '本工具与 Trae / WorkBuddy / 豆包等官方均无关联，仅供学习研究，请仅管理本人合法持有的账号，风险自担。';
 
-export const LINK_GITHUB = 'https://github.com/smart-open';
-export const LINK_BLOG = 'https://blog.sopenai.cn/';
-export const LINK_REPO = 'https://github.com/smart-open/TraeWorkAssistant';
+// 仓库地址：本仓库（更新检查与「项目仓库」按钮同源）
+export const LINK_REPO = 'https://github.com/HaoDuoYv/AiWork';
+// 上游出处：本工程以其为代码基础（保留出处引用，不展示个人主页）
+export const LINK_UPSTREAM_REPO = 'https://github.com/smart-open/TraeWorkAssistant';
 
 export { promoBanner };

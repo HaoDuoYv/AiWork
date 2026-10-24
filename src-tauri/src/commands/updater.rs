@@ -19,9 +19,12 @@ use std::io::{Read, Write};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const RELEASES_API: &str =
-    "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
-const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases";
+// 更新源：本仓库的 GitHub Releases（公开发布，匿名可读）。
+// 注意：上游项目（smart-open/TraeWorkAssistant）是我们的代码来源，但**不是**更新源——
+// 从它拉更新会把用户装回上游版本。发布本仓库 Release 时必须包含 latest.json +
+// 与 scripts/rename_release.mjs 一致命名的安装包（见 AGENT.md §11.1 资产清单）。
+const RELEASES_API: &str = "https://api.github.com/repos/HaoDuoYv/AiWork/releases?per_page=100";
+const RELEASES_PAGE: &str = "https://github.com/HaoDuoYv/AiWork/releases";
 
 /// 发布校验清单资产名（scripts/rename_release.mjs 生成，随 Release 上传）：
 /// `{ "version": "x.y.z", "assets": { "<资产文件名>": "<sha256hex>" } }`
@@ -372,10 +375,7 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
     //    下载失败/损坏/版本不符/未收录资产任一情况直接报错阻止自动更新，引导手动下载
     // ② 回退 release 正文约定行（宽松文本匹配，兼容 3.3.2 的发布方式）
     // ③ 两者皆无（存量旧 release）：跳过校验（兼容过渡）
-    let sha256 = match fetch_manifest_hash(&assets, &asset_name, latest) {
-        Ok(h) => h,
-        Err(e) => return Err(e),
-    }
+    let sha256 = fetch_manifest_hash(&assets, &asset_name, latest)?
     .or_else(|| extract_sha256(&body, &asset_name));
 
     let has_update = cmp_version(latest, current) == std::cmp::Ordering::Greater;
@@ -656,7 +656,7 @@ pub fn update_run_installer(
     std::thread::sleep(Duration::from_millis(800));
     // 审查修复：走 Tauri 退出链（RunEvent::Exit）而非 std::process::exit——
     // 后者绕过清理链，代理运行中重启更新会残留死系统代理导致全局断网
-    let _ = app.exit(0);
+    app.exit(0);
     Ok(())
 }
 

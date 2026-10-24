@@ -6,7 +6,7 @@
 
 Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 18 + Rust
 
-**GitHub**：[github.com/smart-open](https://github.com/smart-open) · **个人博客**：[blog.sopenai.cn](https://blog.sopenai.cn/)
+**仓库**：[github.com/HaoDuoYv/AiWork](https://github.com/HaoDuoYv/AiWork)
 
 </div>
 
@@ -16,16 +16,23 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 >
 > ⚠️ 本工具与 Trae / WorkBuddy / 豆包等官方均无任何关联，仅供学习研究。使用本工具可能违反相关服务条款，风险自担。请仅管理本人合法持有的账号。
 
-## 🧩 关于本仓库：三项目合并版（v4.0.0）
+## 🧩 本项目说明
 
-本工程是 **`TraeWorkAssistant` + `qoder2api-hub` + `workbuddy2api-hub`** 三个项目的合并产物，
-以 `TraeWorkAssistant`（AI Work 助手）为宿主，把两个 Python 单进程网关里值得回收的算法与运维能力
-落成 Rust 模块，并补齐宿主唯一缺失的入口能力。合并方案、来源映射、未移植清单与构建验收记录见
-**[docs/merge-plan.md](docs/merge-plan.md)**。
+本工程基于 [`smart-open/TraeWorkAssistant`](https://github.com/smart-open/TraeWorkAssistant)（MIT），
+并在其基础上：
 
-本次新增的核心能力：
+- 合并了 **`qoder2api-hub` + `workbuddy2api-hub`** 两个网关项目，把其中值得回收的算法与运维能力落成 Rust 模块，
+  并入原有宿主（v4.0.0）。合并方案、来源映射、未移植清单见 **[docs/merge-plan.md](docs/merge-plan.md)**。
+- **工程质量**（v4.1.1）：接入 CI 质量门禁（`tsc` + ESLint + vitest / `cargo clippy -D warnings` + 全量测试），
+  编译警告清零，网关轻量端点拆出独立模块。
+- **生态接入**（v4.1.0）：注册到 CC Switch 时一并写入「用量查询」配置，在 CC Switch 的 provider 卡片上
+  展示网关 Key 的当日请求数、每日上限与近 7 日合计。
 
-- **智能体接入中心（必须项 · 宿主原先没有）**：一键扫描本机 **13 个 AI 编码智能体**的配置
+各版本变更详见 [更新日志](CHANGELOG.md)。
+
+合并版新增的核心能力：
+
+- **智能体接入中心**：一键扫描本机 **13 个 AI 编码智能体**的配置
   （Claude Code / Codex CLI / Gemini CLI / Qwen Code / OpenCode / Continue / Cline / Roo Code /
   Cursor / Windsurf / Cherry Studio / Chatbox / Aider），把其中的 OpenAI / Anthropic 兼容上游
   （base_url + api_key + 模型名）**一键并入资源池**（自定义模型 + 专用 `ck_` 子 Key + 统一 MCP 注册表）；
@@ -48,7 +55,7 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 
 > **豆包「公开 Open API」相关功能暂时搁置，恢复时间待定。**
 >
-> 目前豆包官方风控较为严格，作者本人多个账号已被封禁。为避免更多用户遭受账号损失，该方向的功能暂停推进，请知悉并谨慎评估相关使用风险。
+> 目前豆包官方风控较为严格，已有账号被批量封禁的先例。为避免更多用户遭受账号损失，该方向的功能暂停推进，请知悉并谨慎评估相关使用风险。
 
 ## 版本与分支
 
@@ -97,7 +104,7 @@ node scripts/package_portable.mjs   # 便携版 zip（AI Work 助手_<版本>_x6
 
 前置：Node.js 18+、Rust 1.85+（`Cargo.toml` rust-version）、WebView2 Runtime、VS Build Tools (C++)
 
-测试：`cargo test`（Rust 单测）、`npm run test`（vitest 前端）、`npx tsc --noEmit`（类型检查）
+测试与检查：`cargo test`（Rust 单测）、`cargo clippy --all-targets -- -D warnings`（Rust lint）、`npm test`（vitest 前端）、`npm run lint`（ESLint）、`npx tsc --noEmit`（类型检查）——以上均在 CI（`.github/workflows/ci.yml`）中对 `main` / `master` 推送与 PR 强制执行。
 
 ## 从老版本升级
 
@@ -143,14 +150,11 @@ node scripts/package_portable.mjs   # 便携版 zip（AI Work 助手_<版本>_x6
 
 ## 赞赏
 
-如果这个项目对你有帮助，欢迎请作者喝杯快乐水 ☕
-
-<div align="center">
-<img src="src/assets/donate-qr.jpg" alt="赞赏码" width="220" />
-</div>
+如果这个项目对你有帮助，可以在原作者的[上游项目仓库](https://github.com/smart-open/TraeWorkAssistant)查看支持方式。
 
 ## License
 
-本项目采用 [MIT License](LICENSE)，版权归 **朱天伟**（Copyright © 2026 朱天伟）所有。
+本项目采用 [MIT License](LICENSE)，版权声明见 [LICENSE](LICENSE) 文件。
 
-Fork / 二次开发请保留 `LICENSE` 及版权声明；引用或借鉴请注明原作者及原始仓库 `https://github.com/smart-open/TraeWorkAssistant`，派生项目须说明以原库为基础，原库版权与出处不变。
+本项目以 [`smart-open/TraeWorkAssistant`](https://github.com/smart-open/TraeWorkAssistant) 为代码基础二次开发；
+原库版权与出处不变，引用或借鉴请注明原项目及原始仓库地址。
