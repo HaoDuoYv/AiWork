@@ -384,6 +384,13 @@ pub async fn do_start(
             pool_file.qoder_hedge_threshold_ms,
         ),
         qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(pool_file.qoder_sticky_enabled),
+        // 排队时等待开关 + 上限（2026-10-19）：启动即按持久化配置生效
+        qoder_queue_wait_enabled: std::sync::atomic::AtomicBool::new(
+            pool_file.qoder_queue_wait_enabled,
+        ),
+        qoder_queue_wait_max_secs: std::sync::atomic::AtomicU64::new(
+            pool_file.qoder_queue_wait_max_secs.clamp(30, 900),
+        ),
         qoder_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "q:"),
     });
 
@@ -989,6 +996,9 @@ fn merge_pool_set(
     qoder_sticky_enabled: Option<bool>,
     // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111）；None = 保留原值
     qoder_flash_free_rate: Option<bool>,
+    // 排队时等待开关 + 等待上限秒数（2026-10-19）；None = 保留原值
+    qoder_queue_wait_enabled: Option<bool>,
+    qoder_queue_wait_max_secs: Option<u64>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值，
     // Some(list) = 覆盖（Qoder 页账号池勾选保存；空数组 = fail-open 全量入池）
     qoder_uids: Option<Vec<String>>,
@@ -1054,6 +1064,10 @@ fn merge_pool_set(
             .unwrap_or(existing.qoder_hedge_threshold_ms),
         qoder_sticky_enabled: qoder_sticky_enabled.unwrap_or(existing.qoder_sticky_enabled),
         qoder_flash_free_rate: qoder_flash_free_rate.unwrap_or(existing.qoder_flash_free_rate),
+        qoder_queue_wait_enabled: qoder_queue_wait_enabled
+            .unwrap_or(existing.qoder_queue_wait_enabled),
+        qoder_queue_wait_max_secs: qoder_queue_wait_max_secs
+            .unwrap_or(existing.qoder_queue_wait_max_secs),
         qoder_enabled_uids: qoder_uids.unwrap_or_else(|| existing.qoder_enabled_uids.clone()),
         qoder_group_ids: qoder_group_ids.unwrap_or_else(|| existing.qoder_group_ids.clone()),
         qoder_strategy: qoder_strategy.unwrap_or_else(|| existing.qoder_strategy.clone()),
@@ -1108,6 +1122,9 @@ pub fn pool_set(
     qoder_sticky_enabled: Option<bool>,
     // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；None = 保留原值
     qoder_flash_free_rate: Option<bool>,
+    // 排队时等待开关 + 等待上限秒数（2026-10-19，资源调度页可设）；None = 保留原值
+    qoder_queue_wait_enabled: Option<bool>,
+    qoder_queue_wait_max_secs: Option<u64>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值
     qoder_uids: Option<Vec<String>>,
     // Qoder 池分组筛选；None = 保留原值
@@ -1156,6 +1173,8 @@ pub fn pool_set(
         qoder_hedge_threshold_ms,
         qoder_sticky_enabled,
         qoder_flash_free_rate,
+        qoder_queue_wait_enabled,
+        qoder_queue_wait_max_secs,
         qoder_uids,
         qoder_group_ids,
         qoder_strategy,
@@ -1272,6 +1291,15 @@ pub fn pool_set(
         // Qwen3.8-Flash 免费活动倍率覆盖热应用（issue #111）
         rt.shared.qoder_flash_free_rate.store(
             pool_file.qoder_flash_free_rate,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // 排队时等待开关 + 上限热应用（2026-10-19）：保存即生效，无需重启服务
+        rt.shared.qoder_queue_wait_enabled.store(
+            pool_file.qoder_queue_wait_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared.qoder_queue_wait_max_secs.store(
+            pool_file.qoder_queue_wait_max_secs.clamp(30, 900),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -2003,6 +2031,8 @@ mod pool_merge_tests {
             qoder_hedge_threshold_ms: 4000,
             qoder_sticky_enabled: true,
             qoder_flash_free_rate: true,
+            qoder_queue_wait_enabled: false,
+            qoder_queue_wait_max_secs: 300,
             qoder_account_concurrency_limit: 3,
             qoder_pool_sticky_ttl_secs: 900,
             qoder_sticky_ttl_secs: 3600,
@@ -2024,7 +2054,9 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None,
-        );
+        
+        None,
+        None,);
         assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
         assert_eq!(m.strategy, "weighted");
         assert_eq!(m.wb_strategy, "p2c");
@@ -2070,7 +2102,9 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None,
-        );
+        
+        None,
+        None,);
         // Trae 白名单剥离 wb- 条目
         assert_eq!(m.enabled_uids, vec!["1001".to_string(), "1002".to_string()]);
         // 仅 existing 混存的 wb- 条目迁移进 WB 白名单；传入名单中的未知 wb- 条目
@@ -2178,7 +2212,9 @@ mod pool_merge_tests {
             None,
             None,
             None,
-        );
+        
+        None,
+        None,);
         assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
         assert_eq!(m.enabled_uids, vec!["u1".to_string()]);
     }
@@ -2267,7 +2303,9 @@ mod pool_merge_tests {
             None,
             None,
             None,
-        );
+        
+        None,
+        None,);
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
         assert!(m.group_ids.is_empty());
@@ -2302,7 +2340,9 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None,
-        );
+        
+        None,
+        None,);
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
         assert_eq!(m.strategy, "weighted");
@@ -2320,7 +2360,9 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None,
-        );
+        
+        None,
+        None,);
         assert_eq!(m.strategy, "");
         assert_eq!(m.wb_strategy, "");
         assert!(m.group_ids.is_empty());

@@ -3333,6 +3333,8 @@ mod tests {
             wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
+            qoder_queue_wait_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_queue_wait_max_secs: std::sync::atomic::AtomicU64::new(300),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             default_model: "deepseek-v4-flash".into(),

@@ -790,6 +790,23 @@ pub struct ApiPoolFile {
     /// 上游活动结束后关闭即恢复官方同步倍率
     #[serde(default = "default_true")]
     pub qoder_flash_free_rate: bool,
+    /// 排队时等待开关（2026-10-19，资源调度页可设）：
+    /// 开启后上游排队（10605/`queued`）不再在默认 20s 预算处报 429，而是持续
+    /// 等到 `qoder_queue_wait_max_secs` 上限——单账号池排队期间客户端只需要等，
+    /// 不会因为网关侧预算过短而失败；关闭时保持「20s 内出结果，超时 429」的
+    /// 快速失败语义。默认关闭（不改变既有行为）
+    #[serde(default)]
+    pub qoder_queue_wait_enabled: bool,
+    /// 排队等待上限秒数（`qoder_queue_wait_enabled=true` 时生效，默认 300；
+    /// 运行期 clamp 30–900）。到达上限仍收尾 429 并提示「已达等待上限」，
+    /// 避免客户端无限挂起（并发槽与连接都需要有界）
+    #[serde(default = "default_qoder_queue_wait_max_secs")]
+    pub qoder_queue_wait_max_secs: u64,
+}
+
+/// 排队等待上限默认 300s（5 分钟：覆盖上游常见排队窗口，又不至于无限挂起）
+pub fn default_qoder_queue_wait_max_secs() -> u64 {
+    300
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -849,6 +866,8 @@ impl Default for ApiPoolFile {
             qoder_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             qoder_sticky_ttl_secs: default_sticky_ttl_secs(),
             qoder_flash_free_rate: true,
+            qoder_queue_wait_enabled: false,
+            qoder_queue_wait_max_secs: default_qoder_queue_wait_max_secs(),
             qoder_strategy: String::new(),
             qoder_enabled_uids: Vec::new(),
             qoder_group_ids: Vec::new(),

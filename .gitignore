@@ -21,6 +21,9 @@ Thumbs.db
 .idea/
 .trae/
 
+# 编辑事故备份（编码损坏副本等，严禁提交）
+*.bak
+
 # WorkBuddy 自动产物（严禁提交）
 .workbuddy/
 .codebuddy/

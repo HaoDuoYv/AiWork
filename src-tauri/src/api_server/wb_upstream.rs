@@ -287,6 +287,12 @@ pub struct RaceOutcome<T> {
     pub takeover: bool,
     /// 对冲侧上下文：触发过对冲时 Some，未触发为 None
     pub hedge: Option<T>,
+    /// 审查修复（L2，移植自 3.8）：主请求侧已死（EOF / IO 错误 / 超窗，败于竞速）——
+    /// 对冲接管时主侧败者无失败痕迹，调用方据此补记错误/冷却，账单可解释
+    pub primary_failed: bool,
+    /// 审查修复（L2，移植自 3.8）：对冲侧已死（EOF / IO 错误 / 超窗，败于竞速）——
+    /// 主胜成功时对冲侧败者同理补记
+    pub hedge_failed: bool,
 }
 
 /// 慢请求竞速对冲（F-76③，P2C 调度理念的请求级延伸）：
@@ -322,6 +328,8 @@ pub fn lines_with_first_byte_hedged<T>(
                 lines: chain_rest(first, rx1),
                 takeover: false,
                 hedge: None,
+                primary_failed: false,
+                hedge_failed: false,
             })
         }
         // 主请求窗口内即失败（EOF/IO 错误）或窗口耗尽 → 进入对冲路径
@@ -338,6 +346,8 @@ pub fn lines_with_first_byte_hedged<T>(
                 lines: chain_rest(first, rx1),
                 takeover: false,
                 hedge: None,
+                primary_failed: false,
+                hedge_failed: false,
             }),
             _ => Err(()),
         };
@@ -365,6 +375,10 @@ pub fn lines_with_first_byte_hedged<T>(
                             lines: chain_rest(line, rx1),
                             takeover: false,
                             hedge: Some(hedge),
+                            primary_failed: false,
+                            // 对冲侧已死（EOF/IO/超窗）而主胜：败者带标记返回，
+                            // 由 settle_hedge 补记错误/冷却
+                            hedge_failed: hedge_dead,
                         })
                     }
                     Ok(Err(_)) | Err(TryRecvError::Disconnected) => primary_dead = true,
@@ -382,6 +396,10 @@ pub fn lines_with_first_byte_hedged<T>(
                             lines: chain_rest(line, rx2),
                             takeover: true,
                             hedge: Some(hedge),
+                            // 主侧已死（EOF/IO/超窗）而对冲接管：主侧败者带标记返回，
+                            // 由 settle_hedge 补记错误/冷却
+                            primary_failed: primary_dead,
+                            hedge_failed: false,
                         })
                     }
                     Ok(Err(_)) | Err(TryRecvError::Disconnected) => hedge_dead = true,
@@ -398,6 +416,8 @@ pub fn lines_with_first_byte_hedged<T>(
                 lines,
                 takeover: true,
                 hedge: Some(hedge),
+                primary_failed: true,
+                hedge_failed: false,
             });
         }
         if hedge_dead {
@@ -405,6 +425,8 @@ pub fn lines_with_first_byte_hedged<T>(
                 lines,
                 takeover: false,
                 hedge: Some(hedge),
+                primary_failed: false,
+                hedge_failed: true,
             });
         }
         std::thread::sleep(POLL);

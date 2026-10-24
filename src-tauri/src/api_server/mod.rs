@@ -88,6 +88,12 @@ pub struct ApiSharedState {
     /// 倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游活动结束后关闭恢复
     /// 官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
     pub qoder_flash_free_rate: std::sync::atomic::AtomicBool,
+    /// 排队时等待开关（2026-10-19，资源调度页可设）：开启后上游排队不再在默认
+    /// 20s 预算处 429，而是持续等到 `qoder_queue_wait_max_secs` 上限；
+    /// 关闭时保持「20s 内出结果 / 超时 429」的快速失败语义
+    pub qoder_queue_wait_enabled: std::sync::atomic::AtomicBool,
+    /// 排队等待上限秒数（运行时 clamp 30–900，默认 300）
+    pub qoder_queue_wait_max_secs: std::sync::atomic::AtomicU64,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
     pub wb_sticky: wb_sticky::StickyStore,
     /// 会话池粘性（统一网关 §4.4，内存态不落盘、重启即清）：
@@ -767,6 +773,10 @@ mod inflight_tests {
             wb_pool_sticky_ttl_secs: AtomicU64::new(0),
             qoder_pool_sticky_ttl_secs: AtomicU64::new(0),
             qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
+            qoder_queue_wait_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_queue_wait_max_secs: AtomicU64::new(
+                crate::models::default_qoder_queue_wait_max_secs(),
+            ),
             wb_sticky: wb_sticky::StickyStore::default(),
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),

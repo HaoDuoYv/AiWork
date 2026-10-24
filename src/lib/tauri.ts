@@ -756,6 +756,11 @@ export const api = {
         qoderStickyEnabled?: boolean;
         /** Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；null/未传 = 保留原值 */
         qoderFlashFreeRate?: boolean;
+        /** 排队时等待开关（2026-10-19）：开启后上游排队不再在 20s 预算处 429，
+         *  而是等到 qoderQueueWaitMaxSecs 上限；null/未传 = 保留原值 */
+        qoderQueueWaitEnabled?: boolean;
+        /** 排队等待上限秒数（clamp 30–900，默认 300）；null/未传 = 保留原值 */
+        qoderQueueWaitMaxSecs?: number;
         /** Qoder 池入池白名单（qd- 账号 id）；null/未传 = 保留原值 */
         qoderUids?: string[];
         /** Qoder 池分组筛选；null/未传 = 保留原值 */
@@ -799,6 +804,8 @@ export const api = {
         qoderHedgeThresholdMs: wbFlags?.qoderHedgeThresholdMs ?? null,
         qoderStickyEnabled: wbFlags?.qoderStickyEnabled ?? null,
         qoderFlashFreeRate: wbFlags?.qoderFlashFreeRate ?? null,
+        qoderQueueWaitEnabled: wbFlags?.qoderQueueWaitEnabled ?? null,
+        qoderQueueWaitMaxSecs: wbFlags?.qoderQueueWaitMaxSecs ?? null,
         qoderUids: wbFlags?.qoderUids ?? null,
         qoderGroupIds: wbFlags?.qoderGroupIds ?? null,
         qoderStrategy: wbFlags?.qoderStrategy ?? null,

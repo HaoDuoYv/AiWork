@@ -6,6 +6,27 @@
 
 ---
 
+## [4.0.7] · 2026-10-19 · Qoder「排队时等待」开关 + 对冲败者记账移植
+
+### 新增
+
+- **Qoder 排队时等待（资源调度页可开）**：上游排队（10605 / `queued`）时不再一律在 20 秒预算处返回 429，而是按上游建议持续退避重试，直到「排队等待上限」。两个设置项位于「Qoder 资源调度」页：
+  - **排队时等待**（开关，默认关）：关闭时保持「20 秒内出结果，超时 429 让客户端稍后重试」的快速失败语义；开启后单账号池排队期间请求不会因网关预算过短而失败。
+  - **排队等待上限**（默认 300s，有效 30–900s）：到达上限仍收尾 429，文案提示「已达等待上限，可在 Qoder 资源调度页调大」——并发槽与连接始终有界，不会无限挂起。
+  - 两个设置随「保存」即时热生效（无需重启 API 服务），并持久化到 `api_pool.json` 的 `qoder_queue_wait_enabled` / `qoder_queue_wait_max_secs`。
+
+### 移植（原仓库 TraeWorkAssistant 3.8，L2 加固）
+
+- **竞速对冲败者记账**：`lines_with_first_byte_hedged` 新增 `primary_failed` / `hedge_failed`（3.8 的审查修复 L2）——竞速中已死的一侧（EOF / IO 错误 / 超首字窗口）此前不留痕迹，胜者接管后该账号的失败无处记账。现由 `settle_hedge`（Buddy）与 `settle_qoder_hedge`（Qoder）对败者补记 Server 错误触发熔断冷却，并落 `[SCHED] hedge_primary_dead / hedge_side_dead` 可观测行；「输竞速但未死」一侧不记（该次请求本身没有失败，记错会误冷却健康账号）。
+
+### 决策记录：buddy-ai 第四池暂不移植
+
+3.8 的 buddy-ai 独立池（约 16.6k 行：新 `TargetPool` + 库/状态/用量/粘性六面隔离 + 六页前端 + 打卡）解决的是「国际版 Buddy 账号与国区 Buddy 镜像同名的归属隔离」问题。当前部署只有国区 Buddy 账号，无 buddy-ai 账号体系，移植后是**零收益 + 高风险**（需同时改调度、目录、用量、粘性、前端与设置项，且与 4.0.0 的 `upstream_pool.rs` 语义重叠）。触发条件：出现国际版 Buddy/CodeBuddy 账号且需要与国区账号并存调度时，再按「复用 `upstream_pool.rs` + 新增 `TargetPool::BuddyAi` 标签」的最小方案落地。
+
+验证：`cargo test --bins` → 1031 passed / 0 failed / 14 ignored；`npx tsc --noEmit` → 0；新增回归锁 `queue_wait_switch_selects_budget`（开关选预算 + 越界钳制 + 等待模式文案）。
+
+---
+
 ## [4.0.6] · 2026-10-19 · 上游排队「94 秒无输出」+ qoder_route 重建
 
 ### 修复

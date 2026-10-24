@@ -56,23 +56,61 @@ const QUEUE_DEFAULT_BACKOFF_SECS: u64 = 5;
 /// 退避上限（上游建议值异常大时钳制）
 const QUEUE_BACKOFF_MAX_SECS: u64 = 30;
 
-/// 同一请求内排队等待的**总预算**（秒；2026-10-19 实机修复）。
+/// 排队时等待关闭时的**快速失败预算**（秒；2026-10-19 实机修复）。
 ///
 /// 单账号池（`tried=1`）下，上游持续排队 + 每次钳制 ≤30s 的同号退避，会把请求拖到
 /// **94 秒**仍无任何 token 输出，最后还以 503 `no healthy account available` 收尾——既慢又
 /// 误导（账号是健康的，只是上游在排队）。预算到点即收尾 429（带上游建议退避秒数）。
 const QUEUE_WAIT_BUDGET_SECS: u64 = 20;
 
+/// 排队等待**上限**的运行时 clamp 区间与默认值（Qoder 调度页可设，
+/// api_pool.json `qoder_queue_wait_max_secs`）：下限 30s 保证至少能覆盖一次
+/// 上游建议退避，上限 900s 防止无限挂起占住并发槽与连接
+const QUEUE_WAIT_MAX_MIN_SECS: u64 = 30;
+const QUEUE_WAIT_MAX_MAX_SECS: u64 = 900;
+const QUEUE_WAIT_MAX_DEFAULT_SECS: u64 = 300;
+
+/// 本次请求的排队总预算（秒）：
+/// - 「排队时等待」关闭（默认）→ 快速失败预算 20s，超时立刻 429，客户端按 Retry-After 重试；
+/// - 开启 → 等到 Qoder 调度页设置的等待上限（clamp 30–900，默认 300s），
+///   期间持续同号重试，只有到上限才收尾——单账号池排队时不会因为网关预算过短而失败。
+fn queue_budget_secs(state: &ApiSharedState) -> u64 {
+    effective_queue_budget(
+        state
+            .qoder_queue_wait_enabled
+            .load(std::sync::atomic::Ordering::Relaxed),
+        state
+            .qoder_queue_wait_max_secs
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// 预算决策纯函数（便于单测）：开关关 → 快速失败预算；开 → clamp 后的等待上限
+fn effective_queue_budget(enabled: bool, max_secs: u64) -> u64 {
+    if enabled {
+        max_secs.clamp(QUEUE_WAIT_MAX_MIN_SECS, QUEUE_WAIT_MAX_MAX_SECS)
+    } else {
+        QUEUE_WAIT_BUDGET_SECS
+    }
+}
+
 /// 排队预算内的收尾文案（流式/非流式共用，便于断言）
-fn queue_budget_exhausted_msg(model: &str, waited: u64, next_wait: u64) -> String {
+/// `waiting_mode`：是否处于「排队时等待」模式——决定提示是「稍后重试」还是
+/// 「已达等待上限（可在 Qoder 调度页调大）」
+fn queue_budget_exhausted_msg(model: &str, waited: u64, next_wait: u64, waiting_mode: bool) -> String {
+    let hint = if waiting_mode {
+        "已达等待上限，可在「Qoder 资源调度」页调大等待上限后重试"
+    } else {
+        "上游排队中，账号与凭证正常；请稍后重试或改用其它模型"
+    };
     format!(
-        "upstream queue timeout: model {model} still queued after {waited}s (upstream suggests waiting {next_wait}s more) —— 上游排队中，账号与凭证正常；请稍后重试或改用其它模型"
+        "upstream queue timeout: model {model} still queued after {waited}s (upstream suggests waiting {next_wait}s more) —— {hint}"
     )
 }
 
 /// 排队预算判定（纯函数）：再等 `next` 秒就会超出总预算 → true（调用方立即收尾）
-fn queue_budget_exceeded(waited: u64, next: u64) -> bool {
-    waited.saturating_add(next) > QUEUE_WAIT_BUDGET_SECS
+fn queue_budget_exceeded(waited: u64, next: u64, budget: u64) -> bool {
+    waited.saturating_add(next) > budget
 }
 
 // ==================== 双区域池选择（CN / INTL，方案 C） ====================
@@ -525,6 +563,11 @@ struct QoderRaceWin {
     uid: String,
     hedge: Option<QoderHedgeLease>,
     takeover: bool,
+    /// L2（移植自 3.8）：主侧已死（EOF/IO/超窗）而对冲接管——胜者无失败痕迹，
+    /// settle_qoder_hedge 据此对主账号补记 Server 错误/冷却
+    primary_failed: bool,
+    /// L2（移植自 3.8）：对冲侧已死而主胜——同理对冲账号补记
+    hedge_failed: bool,
     /// 胜者信封的 (request_id, session_id, record_id)（G4）：主账号胜 = 主信封 id，
     /// 对冲接管 = 对冲信封 id；记账按胜者落定，与会话行 uid 同源
     session_ids: Option<(String, String, String)>,
@@ -560,6 +603,8 @@ fn race_qoder_first_byte(
             uid: primary_uid.to_string(),
             hedge: None,
             takeover: false,
+            primary_failed: false,
+            hedge_failed: false,
             session_ids: primary_session_ids.clone(),
         });
     }
@@ -616,6 +661,9 @@ fn race_qoder_first_byte(
                 uid,
                 hedge: out.hedge,
                 takeover: out.takeover,
+                // L2（移植自 3.8）：把竞速败者的死亡标记透传给 settle 记账
+                primary_failed: out.primary_failed,
+                hedge_failed: out.hedge_failed,
                 session_ids,
             })
         }
@@ -644,6 +692,26 @@ fn settle_qoder_hedge(
     let Some(lease) = win.hedge.take() else {
         return guard;
     };
+    // L2（移植自 3.8）：竞速败者记账——已死一侧（EOF/IO 错误/超首字窗口）
+    // 补记 Server 错误触发熔断冷却；仅「输竞速但未死」一侧不记（那次请求本身
+    // 没有失败，记错误会让健康账号被误冷却）
+    if win.primary_failed {
+        state
+            .qoder_pool_for(pool_tag)
+            .note_error(primary_uid, ErrKind::Server);
+        state.logger.log_sched_event(&format!(
+            "hedge_primary_dead pool={pool_tag} primary={primary_uid}（已补记 Server 错误）"
+        ));
+    }
+    if win.hedge_failed {
+        state
+            .qoder_pool_for(pool_tag)
+            .note_error(&lease.uid, ErrKind::Server);
+        state.logger.log_sched_event(&format!(
+            "hedge_side_dead pool={pool_tag} hedge={}（已补记 Server 错误）",
+            lease.uid
+        ));
+    }
     let hedge_uid = lease.uid.as_str();
     if win.takeover {
         state.logger.log_sched_event(&format!(
@@ -756,6 +824,11 @@ fn run_qoder_stream(
         peek.get("model").and_then(Value::as_str),
         key_id,
     );
+    // 排队预算（「排队时等待」开关决定：20s 快速失败 / 调度页设置的上限）
+    let queue_budget = queue_budget_secs(&state);
+    let queue_wait_on = state
+        .qoder_queue_wait_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     // 目录条目（upstreamKey/config）：调度命中后目录刷新导致条目消失时按 404 透传。
     // 区域边界（v1）：恒 CN 区解析 + CN 网关执行（QODER_CHAT_URL）——Global 区
@@ -913,11 +986,7 @@ fn run_qoder_stream(
                     // 2026-10-19 实机修复：末次失败是「上游排队」时不再报
                     // no_healthy_account——账号是好的，是上游在排队。按限流语义收尾 429
                     if last_kind == Some(UpstreamKind::Queued) {
-                        let msg = queue_budget_exhausted_msg(
-                            model,
-                            queue_waited_secs,
-                            QUEUE_DEFAULT_BACKOFF_SECS,
-                        );
+                        let msg = queue_budget_exhausted_msg(model, queue_waited_secs, QUEUE_DEFAULT_BACKOFF_SECS, queue_wait_on);
                         state.logger.log_request(
                             "qoder", "POST", "/v1/chat/completions", model, true, 429, "none",
                             duration_ms, &key_name, "", Some(&msg),
@@ -1157,7 +1226,7 @@ fn run_qoder_stream(
                                         last_kind = Some(UpstreamKind::Queued);
                                         // 排队总预算：超预算立即收尾（429 + 上游建议
                                         // 退避秒数），不再把请求拖到分钟级无输出
-                                        if queue_budget_exceeded(queue_waited_secs, secs) {
+                                        if queue_budget_exceeded(queue_waited_secs, secs, queue_budget) {
                                             let duration_ms =
                                                 start_ts.elapsed().as_millis() as u64;
                                             state.record_usage_qoder(
@@ -1174,11 +1243,7 @@ fn run_qoder_stream(
                                             );
                                             send_stream_error(
                                                 tx, proto, 429,
-                                                &queue_budget_exhausted_msg(
-                                                    model,
-                                                    queue_waited_secs,
-                                                    secs,
-                                                ),
+                                                &queue_budget_exhausted_msg(model, queue_waited_secs, secs, queue_wait_on),
                                             );
                                             return;
                                         }
@@ -1392,7 +1457,7 @@ fn run_qoder_stream(
                                 // 审查修复：模型级冷却（同流内 Queued 分支）——
                                 // 尾巴放行（睡完窗口继续同号重试）/ 长窗口硬 429
                                 last_kind = Some(UpstreamKind::Queued);
-                                if queue_budget_exceeded(queue_waited_secs, secs) {
+                                if queue_budget_exceeded(queue_waited_secs, secs, queue_budget) {
                                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                                     state.record_usage_qoder(
                                         model, &picked.uid, key_id, false, true,
@@ -1407,7 +1472,7 @@ fn run_qoder_stream(
                                     );
                                     send_stream_error(
                                         tx, proto, 429,
-                                        &queue_budget_exhausted_msg(model, queue_waited_secs, secs),
+                                        &queue_budget_exhausted_msg(model, queue_waited_secs, secs, queue_wait_on),
                                     );
                                     return;
                                 }
@@ -1542,6 +1607,11 @@ pub async fn qoder_aggregate_chat(
             peek.get("model").and_then(Value::as_str),
             &key_id,
         );
+        // 排队预算（「排队时等待」开关决定：20s 快速失败 / 调度页设置的上限）
+        let queue_budget = queue_budget_secs(&state);
+        let queue_wait_on = state
+            .qoder_queue_wait_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         // 区域边界（v1）：恒 CN 区解析，同 run_qoder_stream 注释（Global 区未接线）
         let Some(entry) = qoder_upstream::resolve(
@@ -1673,11 +1743,7 @@ pub async fn qoder_aggregate_chat(
                         // 2026-10-19 实机修复：末次失败是「上游排队」→ 限流语义收尾
                         //（429 前缀由端点映射），而不是把健康账号报成 no healthy account
                         if last_kind == Some(UpstreamKind::Queued) {
-                            let msg = queue_budget_exhausted_msg(
-                                &model,
-                                queue_waited_secs,
-                                QUEUE_DEFAULT_BACKOFF_SECS,
-                            );
+                            let msg = queue_budget_exhausted_msg(&model, queue_waited_secs, QUEUE_DEFAULT_BACKOFF_SECS, queue_wait_on);
                             state.logger.log_debug_line(format!(
                                 "[DEBUG] UPSTREAM_QUEUE_TIMEOUT tried={} waited={}s pool=qoder",
                                 tried.len(),
@@ -1871,17 +1937,13 @@ pub async fn qoder_aggregate_chat(
                                             // 审查修复：模型级冷却（同流式分支）——
                                             // 尾巴放行 / 长窗口硬 429 / 排队总预算
                                             last_kind = Some(UpstreamKind::Queued);
-                                            if queue_budget_exceeded(queue_waited_secs, secs) {
+                                            if queue_budget_exceeded(queue_waited_secs, secs, queue_budget) {
                                                 state.record_usage_qoder(
                                                     &model, &win_uid, &key_id, false, stream,
                                                     duration_ms, 0, 0, None, None, None,
                                                     &session_ctx(&peek),
                                                 );
-                                                let msg = queue_budget_exhausted_msg(
-                                                    &model,
-                                                    queue_waited_secs,
-                                                    secs,
-                                                );
+                                                let msg = queue_budget_exhausted_msg(&model, queue_waited_secs, secs, queue_wait_on);
                                                 state.logger.log_request_ttfb(
                                                     "qoder", "POST", "/v1/chat/completions",
                                                     &model, stream, 429, &win_uid, duration_ms,
@@ -2003,16 +2065,12 @@ pub async fn qoder_aggregate_chat(
                                     // 审查修复：模型级冷却（同流式分支）——尾巴放行 /
                                     // 长窗口硬 429 / 排队总预算
                                     last_kind = Some(UpstreamKind::Queued);
-                                    if queue_budget_exceeded(queue_waited_secs, secs) {
+                                    if queue_budget_exceeded(queue_waited_secs, secs, queue_budget) {
                                         state.record_usage_qoder(&model, &picked.uid, &key_id,
                                             false, stream,
                                             start_ts.elapsed().as_millis() as u64, 0, 0,
                                             None, None, None, &session_ctx(&peek));
-                                        let msg = queue_budget_exhausted_msg(
-                                            &model,
-                                            queue_waited_secs,
-                                            secs,
-                                        );
+                                        let msg = queue_budget_exhausted_msg(&model, queue_waited_secs, secs, queue_wait_on);
                                         state.logger.log_request(
                                             "qoder", "POST", "/v1/chat/completions", &model,
                                             stream, 429, &picked.uid,
@@ -2308,15 +2366,32 @@ mod tests {
     /// 预算判定：累计等待 + 下次建议退避 > 20s 即收尾（单账号池不再拖到分钟级）
     #[test]
     fn queue_budget_stops_runaway_wait() {
-        assert!(!queue_budget_exceeded(0, QUEUE_WAIT_BUDGET_SECS));
-        assert!(queue_budget_exceeded(0, QUEUE_WAIT_BUDGET_SECS + 1));
-        assert!(queue_budget_exceeded(15, 10));
-        assert!(!queue_budget_exceeded(10, 10));
+        assert!(!queue_budget_exceeded(0, QUEUE_WAIT_BUDGET_SECS, QUEUE_WAIT_BUDGET_SECS));
+        assert!(queue_budget_exceeded(0, QUEUE_WAIT_BUDGET_SECS + 1, QUEUE_WAIT_BUDGET_SECS));
+        assert!(queue_budget_exceeded(15, 10, QUEUE_WAIT_BUDGET_SECS));
+        assert!(!queue_budget_exceeded(10, 10, QUEUE_WAIT_BUDGET_SECS));
         // 文案必须点明「账号与凭证正常」，避免被当成账号故障去排查
-        let msg = queue_budget_exhausted_msg("qwen3.8-flash", 20, 30);
+        let msg = queue_budget_exhausted_msg("qwen3.8-flash", 20, 30, false);
         assert!(msg.contains("queue timeout"), "{msg}");
         assert!(msg.contains("still queued after 20s"), "{msg}");
         assert!(msg.contains("账号与凭证正常"), "{msg}");
+    }
+
+    /// 「排队时等待」开关决定预算：关 → 20s 快速失败；开 → 调度页上限（clamp 30–900）
+    #[test]
+    fn queue_wait_switch_selects_budget() {
+        assert_eq!(effective_queue_budget(false, 300), QUEUE_WAIT_BUDGET_SECS);
+        assert_eq!(effective_queue_budget(false, 900), QUEUE_WAIT_BUDGET_SECS);
+        assert_eq!(effective_queue_budget(true, 300), 300);
+        assert_eq!(effective_queue_budget(true, 600), 600);
+        // 越界钳制：低于 30 抬到 30，高于 900 压到 900（防止无限挂起）
+        assert_eq!(effective_queue_budget(true, 0), QUEUE_WAIT_MAX_MIN_SECS);
+        assert_eq!(effective_queue_budget(true, 10), QUEUE_WAIT_MAX_MIN_SECS);
+        assert_eq!(effective_queue_budget(true, 99_999), QUEUE_WAIT_MAX_MAX_SECS);
+        // 等待模式下的收尾提示应指向「调大上限」，而不是让用户去查账号
+        let msg = queue_budget_exhausted_msg("qwen3.8-flash", 300, 30, true);
+        assert!(msg.contains("已达等待上限"), "{msg}");
+        assert!(msg.contains("Qoder 资源调度"), "{msg}");
     }
     // ==================== issue #90 修复①：Server 渐进模型级冷却 ====================
 

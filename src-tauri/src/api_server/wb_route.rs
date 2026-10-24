@@ -285,6 +285,11 @@ struct RaceWin {
     hedge: Option<HedgeLease>,
     /// 对冲接管（对冲请求先出首字）
     takeover: bool,
+    /// L2（移植自 3.8）：主侧已死（EOF/IO/超窗）而对冲接管——settle_hedge 据此
+    /// 对主账号补记 Server 错误/冷却
+    primary_failed: bool,
+    /// L2（移植自 3.8）：对冲侧已死而主胜——同理对冲账号补记
+    hedge_failed: bool,
 }
 
 /// 首字竞速（F-76③）：对冲关闭（阈值 0）时与纯首字超时语义完全一致；开启时
@@ -309,6 +314,8 @@ fn race_first_byte(
             uid: primary_uid.to_string(),
             hedge: None,
             takeover: false,
+            primary_failed: false,
+            hedge_failed: false,
         });
     }
     let state2 = state.clone();
@@ -348,7 +355,14 @@ fn race_first_byte(
             } else {
                 primary_uid.to_string()
             };
-            Ok(RaceWin { uid, lines: out.lines, hedge: out.hedge, takeover: out.takeover })
+            Ok(RaceWin {
+                uid,
+                lines: out.lines,
+                hedge: out.hedge,
+                takeover: out.takeover,
+                primary_failed: out.primary_failed,
+                hedge_failed: out.hedge_failed,
+            })
         }
         Err(()) => Err(()),
     }
@@ -368,6 +382,21 @@ fn settle_hedge(
     let Some(lease) = win.hedge.take() else {
         return guard;
     };
+    // L2（移植自 3.8）：竞速败者记账——已死一侧补记 Server 错误触发熔断冷却；
+    // 「输竞速但未死」一侧不记（该请求没有失败）
+    if win.primary_failed {
+        state.wb_pool.note_error(primary_uid, ErrKind::Server);
+        state.logger.log_sched_event(&format!(
+            "hedge_primary_dead primary={primary_uid}（已补记 Server 错误）"
+        ));
+    }
+    if win.hedge_failed {
+        state.wb_pool.note_error(&lease.uid, ErrKind::Server);
+        state.logger.log_sched_event(&format!(
+            "hedge_side_dead hedge={}（已补记 Server 错误）",
+            lease.uid
+        ));
+    }
     let hedge_uid = lease.uid.as_str();
     if win.takeover {
         state.logger.log_sched_event(&format!(
