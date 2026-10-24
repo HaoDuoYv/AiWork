@@ -415,7 +415,7 @@ pub fn unified_models_ex(
         // 自定义模型可用性 = 条目 enabled（find_enabled 只回 enabled 条目）
         TargetPool::Custom => true,
         // Qoder：开关 && 池健康（调用方未提供旗标时该源不参与聚合）
-        TargetPool::Qoder => qoder.map_or(false, |(e, ok)| e && ok),
+        TargetPool::Qoder => qoder.is_some_and(|(e, ok)| e && ok),
     };
 
     let mut order: Vec<String> = Vec::new();
@@ -792,12 +792,9 @@ pub fn unified_models_ex(
             }
         }
         // supports_image：命中 buddy → WB 声明值；命中 trae → Trae 侧值（L1/L2/L4），
-        // 未声明（None）时退 WB 声明兜底（有值优先，§3.3 #2）
-        if hit == Some("buddy") {
-            if let Some(img) = buddy_img.get(&canonical) {
-                u.supports_image = Some(*img);
-            }
-        } else if u.supports_image.is_none() {
+        // 未声明（None）时退 WB 声明兜底（有值优先，§3.3 #2）。
+        // 两个来源同一取值：未命中 buddy 时仅在无值时补 WB 声明
+        if hit == Some("buddy") || u.supports_image.is_none() {
             if let Some(img) = buddy_img.get(&canonical) {
                 u.supports_image = Some(*img);
             }

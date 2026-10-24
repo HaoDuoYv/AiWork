@@ -271,13 +271,12 @@ fn filter_claimable(campaigns: &[Value]) -> Vec<Value> {
 fn daily_credits_claimed_in_list(campaigns: &[Value], now_secs: i64) -> bool {
     campaigns.iter().any(|c| {
         let claimed =
-            s_of(fs_utils::dig(c, &["claimStatus", "claim_status"])).to_ascii_uppercase()
-                == "CLAIMED";
-        let action = s_of(c.get("actionType")).to_ascii_uppercase() == "CLAIM_BENEFIT";
+            s_of(fs_utils::dig(c, &["claimStatus", "claim_status"])).eq_ignore_ascii_case("CLAIMED");
+        let action = s_of(c.get("actionType")).eq_ignore_ascii_case("CLAIM_BENEFIT");
         let credits = c
             .get("benefit")
             .and_then(|x| x.get("kind"))
-            .map(|v| s_of(Some(v)).to_ascii_uppercase() == "CREDITS")
+            .map(|v| s_of(Some(v)).eq_ignore_ascii_case("CREDITS"))
             .unwrap_or(false);
         let start = c.get("startAt").and_then(|v| num_or_none(Some(v))).map(|v| v as i64);
         let end = c.get("endAt").and_then(|v| num_or_none(Some(v))).map(|v| v as i64);
@@ -295,9 +294,7 @@ fn campaign_is_claimed(campaigns: &[Value], campaign_id: &str) -> bool {
     campaigns.iter().any(|c| {
         let cid = s_of(fs_utils::dig(c, &["campaignId", "campaign_id"]));
         cid == campaign_id
-            && s_of(fs_utils::dig(c, &["claimStatus", "claim_status"]))
-                .to_ascii_uppercase()
-                == "CLAIMED"
+            && s_of(fs_utils::dig(c, &["claimStatus", "claim_status"])).eq_ignore_ascii_case("CLAIMED")
     })
 }
 
@@ -511,11 +508,11 @@ fn learned_entry_from(c: &Value) -> Option<(String, String)> {
 fn learn_daily_campaign_ids(campaigns: &[Value], now_secs: i64) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for c in campaigns {
-        let action = s_of(c.get("actionType")).to_ascii_uppercase() == "CLAIM_BENEFIT";
+        let action = s_of(c.get("actionType")).eq_ignore_ascii_case("CLAIM_BENEFIT");
         let credits = c
             .get("benefit")
             .and_then(|x| x.get("kind"))
-            .map(|v| s_of(Some(v)).to_ascii_uppercase() == "CREDITS")
+            .map(|v| s_of(Some(v)).eq_ignore_ascii_case("CREDITS"))
             .unwrap_or(false);
         let start = c.get("startAt").and_then(|v| num_or_none(Some(v))).map(|v| v as i64);
         let end = c.get("endAt").and_then(|v| num_or_none(Some(v))).map(|v| v as i64);
@@ -546,11 +543,11 @@ fn learn_daily_campaign_ids_lenient(campaigns: &[Value]) -> Vec<(String, String)
     let is_credits = |c: &Value| {
         c.get("benefit")
             .and_then(|x| x.get("kind"))
-            .map(|v| s_of(Some(v)).to_ascii_uppercase() == "CREDITS")
+            .map(|v| s_of(Some(v)).eq_ignore_ascii_case("CREDITS"))
             .unwrap_or(false)
     };
     let is_claim_benefit =
-        |c: &Value| s_of(c.get("actionType")).to_ascii_uppercase() == "CLAIM_BENEFIT";
+        |c: &Value| s_of(c.get("actionType")).eq_ignore_ascii_case("CLAIM_BENEFIT");
     let learn = |pred: &dyn Fn(&Value) -> bool| -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         for c in campaigns {
@@ -771,7 +768,7 @@ fn learn_from_min_headers(
 fn benefit_is_credits(c: &Value) -> bool {
     c.get("benefit")
         .and_then(|x| x.get("kind"))
-        .map(|v| s_of(Some(v)).to_ascii_uppercase() == "CREDITS")
+        .map(|v| s_of(Some(v)).eq_ignore_ascii_case("CREDITS"))
         .unwrap_or(false)
 }
 

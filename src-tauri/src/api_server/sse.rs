@@ -218,7 +218,7 @@ fn stream_convert_src(
                 continue; // 仅停滞未断连：继续等待
             }
         };
-        if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
+        if let Some(ev) = scan_line(&mut st, line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
                     let mut delta = Map::new();
@@ -344,7 +344,7 @@ fn stream_convert_src(
     }
 
     (
-        error_info.map(|(code, msg)| (code, msg)),
+        error_info,
         sent_any,
         pending_usage,
     )
@@ -404,7 +404,7 @@ fn stream_convert_text_src(
                 continue;
             }
         };
-        if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
+        if let Some(ev) = scan_line(&mut st, line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
                     if !ev.response.is_empty() {
@@ -513,7 +513,7 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
             Ok(l) => l,
             Err(_) => break,
         };
-        if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
+        if let Some(ev) = scan_line(&mut st, line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
                     out.content.push_str(&ev.response);
@@ -856,7 +856,7 @@ fn stream_convert_anthropic_src(
                 continue;
             }
         };
-        if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
+        if let Some(ev) = scan_line(&mut st, line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
                     if !ev.response.is_empty() {
@@ -926,7 +926,7 @@ fn stream_convert_anthropic_src(
                                     tools.push(ToolBuf {
                                         id,
                                         name,
-                                        args: args,
+                                        args,
                                         slot: idx,
                                     });
                                 }
@@ -1014,7 +1014,7 @@ fn stream_convert_anthropic_src(
     // 需计入 sent_any，否则调用方会重复下发 error / 误触发重试重放
     let sent_any = message_started || (!tools.is_empty() && error_info.is_some());
     (
-        error_info.map(|(code, msg)| (code, msg)),
+        error_info,
         sent_any,
         usage,
     )
@@ -1039,7 +1039,7 @@ pub fn aggregate_anthropic<R: Read + Send>(
             Ok(l) => l,
             Err(_) => break,
         };
-        if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
+        if let Some(ev) = scan_line(&mut st, line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
                     content.push_str(&ev.response);

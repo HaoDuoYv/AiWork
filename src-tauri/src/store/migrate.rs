@@ -1245,13 +1245,10 @@ fn annotate_traework_source(sidecar: &Path) {
 
 /// 旧池清理：目录不存在或非空时不动；确为空目录才删除
 fn try_remove_empty_pool(pool: &Path) {
-    match std::fs::read_dir(pool) {
-        Ok(mut rd) => {
-            if rd.next().is_none() {
-                let _ = std::fs::remove_dir(pool);
-            }
+    if let Ok(mut rd) = std::fs::read_dir(pool) {
+        if rd.next().is_none() {
+            let _ = std::fs::remove_dir(pool);
         }
-        Err(_) => {}
     }
 }
 

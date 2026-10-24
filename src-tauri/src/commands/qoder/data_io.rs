@@ -285,9 +285,7 @@ fn merge_account(pool: &mut Vec<QoderAccount>, a: &Value) -> MergeResult {
         return Err("缺少 id".into());
     }
     // 字符集白名单，杜绝 `..`/绝对路径/分隔符注入
-    if let Err(e) = fs_utils::ensure_uid_safe(&id) {
-        return Err(e);
-    }
+    fs_utils::ensure_uid_safe(&id)?;
     // id 规则校验：须与池内生成规则一致——qd-<sha256 前 12 位十六进制小写>
     let hex = id.strip_prefix("qd-").unwrap_or("");
     if hex.len() != 12 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {

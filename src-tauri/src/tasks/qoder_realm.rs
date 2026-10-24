@@ -28,10 +28,6 @@ pub const CN: &str = "cn";
 /// 国际版
 pub const INTL: &str = "intl";
 
-/// OAuth 设备流 client_id（按区域）
-pub const CLIENT_ID_CN: &str = "1c5e33e1-364d-4ce6-b02c-acaa81274a5c";
-pub const CLIENT_ID_INTL: &str = "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb";
-
 /// 归一：空/未知一律按 CN（存量账号无 realm 字段，默认沿用旧行为）
 pub fn normalize(realm: &str) -> &'static str {
     let r = realm.trim().to_ascii_lowercase();
@@ -52,15 +48,6 @@ pub fn region(realm: &str) -> QoderRegion {
         QoderRegion::Global
     } else {
         QoderRegion::Cn
-    }
-}
-
-/// 区域展示名
-pub fn label(realm: &str) -> &'static str {
-    if is_intl(realm) {
-        "国际版"
-    } else {
-        "国内版"
     }
 }
 
@@ -97,29 +84,6 @@ pub fn chat_url(realm: &str) -> &'static str {
         "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
     } else {
         "https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
-    }
-}
-
-/// 对话上游 host（传输错误文案用）
-pub fn chat_host(realm: &str) -> &'static str {
-    if is_intl(realm) {
-        "https://api3.qoder.sh"
-    } else {
-        "https://gateway.qoder.com.cn"
-    }
-}
-
-/// 模型目录 URL（`model/list`，签名 body 必须是 `qoder_encode(b"{}")`）
-pub fn model_list_url(realm: &str) -> String {
-    format!("{}algo/api/v2/model/list", gateway_base(realm))
-}
-
-/// 设备授权 client_id
-pub fn client_id(realm: &str) -> &'static str {
-    if is_intl(realm) {
-        CLIENT_ID_INTL
-    } else {
-        CLIENT_ID_CN
     }
 }
 
@@ -211,9 +175,13 @@ pub fn normalize_model_id(id: &str) -> (Option<&'static str>, String) {
     (None, trimmed.to_string())
 }
 
-/// 定区优先级（纯函数，handler 与单测共用）：
+/// 定区优先级（纯函数）：
 /// 模型显式区域（`qoder-intl/x`）> Key 绑区（`bind_pool=qoder_cn/qoder_intl`）> 默认国内版。
 /// 返回值是**池标签**（`qoder_cn` / `qoder_intl`），直接喂 `ApiSharedState::qoder_pool_for`。
+///
+/// **当前未接线**（保留设计与单测锚点，接线见 `docs/backlog.md`「Qoder 双池 Key 绑区」）：
+/// 现网定区只认模型前缀 `qoder-intl/`，Key 的 `bind_pool="qoder_intl"` 实际不生效。
+#[allow(dead_code)]
 pub fn resolve_pool_tag(model_realm: Option<&str>, key_bind_pool: &str) -> &'static str {
     if let Some(r) = model_realm {
         return pool_tag(r);
@@ -222,31 +190,6 @@ pub fn resolve_pool_tag(model_realm: Option<&str>, key_bind_pool: &str) -> &'sta
         return pool_tag(r);
     }
     pool_tag(CN)
-}
-
-/// 池化 uid：`qoder_cn:<uid>` / `qoder_intl:<uid>`（方案 C 第 3 步的落库/调度键）。
-///
-/// Qoder 池内 uid 目前是裸 uid；升为双池后必须带前缀，否则同 uid 在两区分身会
-/// 互相覆盖（额度/冷却/设备指纹）。前缀只影响**池内键**，对外 API 与 UI 仍展示裸 uid。
-pub fn uid_with_pool(uid: &str, realm: &str) -> String {
-    format!("{}:{}", pool_tag(realm), uid.trim())
-}
-
-/// 拆分池化 uid：`qoder_intl:x` → ("qoder_intl", "x")；无前缀 → ("qoder_cn", 原名)
-/// （存量裸 uid 一律视为国内版，保证零迁移）。
-pub fn split_pooled_uid(value: &str) -> (&'static str, String) {
-    let trimmed = value.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    for tag in ["qoder_intl:", "qoder_cn:", "qoder:"] {
-        if lower.starts_with(tag) {
-            let rest = trimmed[tag.len()..].trim().to_string();
-            if !rest.is_empty() {
-                return (realm_of_pool(&tag[..tag.len() - 1]), rest);
-            }
-            break;
-        }
-    }
-    (pool_tag(CN), trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -271,16 +214,22 @@ mod tests {
         assert_eq!(web_base(INTL), "https://qoder.com");
         assert!(chat_url(CN).contains("gateway.qoder.com.cn"));
         assert!(chat_url(INTL).contains("api3.qoder.sh"));
-        assert!(model_list_url(INTL).starts_with("https://api3.qoder.sh/"));
-        assert_eq!(client_id(INTL), CLIENT_ID_INTL);
-        assert_eq!(client_id(CN), CLIENT_ID_CN);
     }
 
     #[test]
     fn region_mapping() {
         assert_eq!(region(CN), QoderRegion::Cn);
         assert_eq!(region(INTL), QoderRegion::Global);
-        assert_eq!(label(INTL), "国际版");
+    }
+
+    /// 定区优先级契约锚点（resolve_pool_tag 暂未接线，见 docs/backlog.md）
+    #[test]
+    fn pool_tag_priority_prefix_over_key_over_default() {
+        assert_eq!(resolve_pool_tag(Some(INTL), "qoder_cn"), "qoder_intl");
+        assert_eq!(resolve_pool_tag(Some(CN), "qoder_intl"), "qoder_cn");
+        assert_eq!(resolve_pool_tag(None, "qoder_intl"), "qoder_intl");
+        assert_eq!(resolve_pool_tag(None, ""), "qoder_cn");
+        assert_eq!(resolve_pool_tag(None, "buddy"), "qoder_cn");
     }
 
     /// 账号身份键 = (区域, uid)：国际区与国区是两个账号，同 uid 也不得互相覆盖；
@@ -305,7 +254,8 @@ mod tests {
     }
 
     #[test]
-    fn domain_and_dir_inference() {        assert_eq!(from_domain("qoder.com.cn"), CN);
+    fn domain_and_dir_inference() {
+        assert_eq!(from_domain("qoder.com.cn"), CN);
         assert_eq!(from_domain("www.qoder.cn"), CN);
         assert_eq!(from_domain("openapi.qoder.sh"), INTL);
         assert_eq!(from_domain("qoder.com"), INTL);
@@ -324,19 +274,6 @@ mod tests {
         assert_eq!(realm_of_pool("qoder_cn"), CN);
         assert_eq!(realm_of_pool("qoder"), CN, "兼容别名按 cn");
         assert_eq!(realm_of_pool("unknown"), CN);
-    }
-
-    #[test]
-    fn pool_tag_priority_prefix_over_key_over_default() {
-        // 模型前缀最高：即便 Key 绑国内版，带 intl 前缀仍走国际版池
-        assert_eq!(resolve_pool_tag(Some(INTL), "qoder_cn"), "qoder_intl");
-        assert_eq!(resolve_pool_tag(Some(CN), "qoder_intl"), "qoder_cn");
-        // 无前缀：Key 绑区次之
-        assert_eq!(resolve_pool_tag(None, "qoder_intl"), "qoder_intl");
-        assert_eq!(resolve_pool_tag(None, "qoder_cn"), "qoder_cn");
-        // 未绑区 / 其它池：默认国内版
-        assert_eq!(resolve_pool_tag(None, ""), "qoder_cn");
-        assert_eq!(resolve_pool_tag(None, "buddy"), "qoder_cn");
     }
 
     #[test]

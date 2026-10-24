@@ -205,8 +205,8 @@ fn with_open<T>(
         let sh = Stronghold::new(&path, password).map_err(|e| format!("打开 vault 失败: {e}"))?;
         // 快照数据不会自动进入 clients map，必须显式 load_client（见单元测试 stronghold_快照往返）；
         // 仅当快照中不存在该 client（首次创建）时才新建，防止空 client 覆盖已有快照导致凭据丢失
-        if sh.load_client(CLIENT_PATH.to_vec()).is_err() {
-            sh.create_client(CLIENT_PATH.to_vec())
+        if sh.load_client(CLIENT_PATH).is_err() {
+            sh.create_client(CLIENT_PATH)
                 .map_err(|e| format!("创建 vault client 失败: {e}"))?;
         }
         *entry = Some(sh);
@@ -235,7 +235,7 @@ pub fn ns_get(data_dir: &Path, ns: &str, key: &str) -> Option<serde_json::Value>
     }
     with_open(data_dir, |sh| {
         let client = sh
-            .get_client(CLIENT_PATH.to_vec())
+            .get_client(CLIENT_PATH)
             .map_err(|e| format!("获取 vault client 失败: {e}"))?;
         match client.store().get(&ns_vault_key(ns, key)).map_err(|e| format!("vault 读取失败: {e}"))? {
             Some(v) => {
@@ -259,7 +259,7 @@ pub fn ns_set(data_dir: &Path, ns: &str, key: &str, v: &serde_json::Value) -> Re
     }
     with_open(data_dir, |sh| {
         let client = sh
-            .get_client(CLIENT_PATH.to_vec())
+            .get_client(CLIENT_PATH)
             .map_err(|e| format!("获取 vault client 失败: {e}"))?;
         let value = serde_json::to_vec(v).map_err(|e| format!("凭证序列化失败: {e}"))?;
         client
@@ -274,7 +274,7 @@ pub fn ns_set(data_dir: &Path, ns: &str, key: &str, v: &serde_json::Value) -> Re
 pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
     let result = with_open(data_dir, |sh| {
         let client = sh
-            .get_client(CLIENT_PATH.to_vec())
+            .get_client(CLIENT_PATH)
             .map_err(|e| format!("获取 vault client 失败: {e}"))?;
         client
             .store()
@@ -297,7 +297,7 @@ pub fn load_accounts(state: &AppState) -> AccountsFile {
     // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）
     let _ = with_open(&state.data_dir, |sh| {
         let client = sh
-            .get_client(CLIENT_PATH.to_vec())
+            .get_client(CLIENT_PATH)
             .map_err(|e| format!("获取 vault client 失败: {e}"))?;
         for a in file.accounts.iter_mut() {
             let Some(uid) = a.user_id.as_deref().filter(|u| !u.is_empty()) else {
@@ -315,7 +315,7 @@ pub fn load_accounts(state: &AppState) -> AccountsFile {
                     // 账号会恒显「无 Refresh」（2026-10-11 实测）
                     if a.refresh_token
                         .as_deref()
-                        .map_or(true, |s| s.trim().is_empty())
+                        .is_none_or(|s| s.trim().is_empty())
                         && !entry.refresh_token.is_empty()
                     {
                         a.refresh_token = Some(entry.refresh_token);
@@ -354,7 +354,7 @@ pub fn save_accounts(state: &AppState, accounts: &mut AccountsFile) -> Result<()
 /// 将账号结构体中的明文凭据占位化（清空 jwt / refresh_token）
 fn wipe_placeholders(accounts: &mut AccountsFile) {
     for a in accounts.accounts.iter_mut() {
-        if a.user_id.as_deref().map_or(false, |u| !u.is_empty()) {
+        if a.user_id.as_deref().is_some_and(|u| !u.is_empty()) {
             a.jwt.clear();
             a.refresh_token = None;
         }
@@ -365,7 +365,7 @@ fn wipe_placeholders(accounts: &mut AccountsFile) {
 fn write_vault_secrets(state: &AppState, accounts: &AccountsFile) -> Result<(), String> {
     with_open(&state.data_dir, |sh| {
         let client = sh
-            .get_client(CLIENT_PATH.to_vec())
+            .get_client(CLIENT_PATH)
             .map_err(|e| format!("获取 vault client 失败: {e}"))?;
         let mut count = 0usize;
         for a in &accounts.accounts {
@@ -421,7 +421,7 @@ fn merge_entry(existing: Option<SecretEntry>, jwt_new: &str, rt_new: &str) -> Se
 pub fn remove_secret(state: &AppState, uid: &str) {
     let result = with_open(&state.data_dir, |sh| {
         let client = sh
-            .get_client(CLIENT_PATH.to_vec())
+            .get_client(CLIENT_PATH)
             .map_err(|e| format!("获取 vault client 失败: {e}"))?;
         client
             .store()
@@ -448,7 +448,7 @@ pub fn migrate_on_startup(state: &AppState) {
         .accounts
         .iter()
         .filter(|a| {
-            !a.jwt.trim().is_empty() || a.refresh_token.as_deref().map_or(false, |s| !s.is_empty())
+            !a.jwt.trim().is_empty() || a.refresh_token.as_deref().is_some_and(|s| !s.is_empty())
         })
         .count();
     if plaintext == 0 {
@@ -487,7 +487,7 @@ pub fn migrate_ns_on_startup(state: &AppState) {
                             .any(|k| {
                                 rec.get(k)
                                     .and_then(|v| v.as_str())
-                                    .map_or(false, |s| !s.is_empty())
+                                    .is_some_and(|s| !s.is_empty())
                             })
                     })
                     .map(|(id, rec)| (id.clone(), rec.clone()))
@@ -540,7 +540,7 @@ pub fn migrate_ns_on_startup(state: &AppState) {
             .filter(|a| {
                 [a.session_id.as_deref(), a.sid_guard.as_deref(), a.ttwid.as_deref()]
                     .iter()
-                    .any(|v| v.map_or(false, |s| !s.is_empty()))
+                    .any(|v| v.is_some_and(|s| !s.is_empty()))
             })
             .count();
         if plain > 0 {
@@ -564,7 +564,7 @@ pub fn migrate_ns_on_startup(state: &AppState) {
         let has_session = plain
             .get("session_id")
             .and_then(|s| s.as_str())
-            .map_or(false, |s| !s.is_empty());
+            .is_some_and(|s| !s.is_empty());
         if has_session {
             match crate::vault::ns_set(&state.data_dir, "doubao", "captured", &plain) {
                 Ok(()) => {
@@ -591,11 +591,10 @@ fn cleanup_temp_in(dir: &Path) -> usize {
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
-        if entry.file_name().to_string_lossy().starts_with(TEMP_ACCOUNTS_PREFIX) {
-            if std::fs::remove_file(entry.path()).is_ok() {
+        if entry.file_name().to_string_lossy().starts_with(TEMP_ACCOUNTS_PREFIX)
+            && std::fs::remove_file(entry.path()).is_ok() {
                 n += 1;
             }
-        }
     }
     n
 }

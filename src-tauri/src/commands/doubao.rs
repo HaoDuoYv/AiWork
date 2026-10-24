@@ -137,21 +137,21 @@ pub(crate) fn load_pool(state: &AppState) -> DoubaoAccountPool {
             continue;
         };
         // 仅填空值：DB 明文优先（更新鲜，如迁移残留，待下次保存收敛）
-        if a.session_id.as_deref().map_or(true, |s| s.is_empty()) {
+        if a.session_id.as_deref().is_none_or(|s| s.is_empty()) {
             if let Some(v) = sec.get("session_id").and_then(|v| v.as_str()) {
                 if !v.is_empty() {
                     a.session_id = Some(v.to_string());
                 }
             }
         }
-        if a.sid_guard.as_deref().map_or(true, |s| s.is_empty()) {
+        if a.sid_guard.as_deref().is_none_or(|s| s.is_empty()) {
             if let Some(v) = sec.get("sid_guard").and_then(|v| v.as_str()) {
                 if !v.is_empty() {
                     a.sid_guard = Some(v.to_string());
                 }
             }
         }
-        if a.ttwid.as_deref().map_or(true, |s| s.is_empty()) {
+        if a.ttwid.as_deref().is_none_or(|s| s.is_empty()) {
             if let Some(v) = sec.get("ttwid").and_then(|v| v.as_str()) {
                 if !v.is_empty() {
                     a.ttwid = Some(v.to_string());
@@ -642,7 +642,7 @@ pub(crate) fn ensure_live_has_login_session() -> Result<(), String> {
 /// 内部已与抓包文件按时间戳比新鲜度（代理开着取抓包、没开取客户端本地记录）。
 /// 检测失败/无结果返回 None（不阻断后续兜底链）。
 fn detect_uid_from_local_storage(state: &State<AppState>) -> Option<String> {
-    let v = crate::tasks::doubao_chats::detect_uid(&state);
+    let v = crate::tasks::doubao_chats::detect_uid(state);
     let uid = v.get("user_id")?.as_str()?.trim().to_string();
     (!uid.is_empty()).then_some(uid)
 }

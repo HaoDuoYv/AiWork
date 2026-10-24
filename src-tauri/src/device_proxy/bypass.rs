@@ -72,7 +72,7 @@ pub fn cleanup_residual_bypass(data_dir: &Path) {
             // 失败保留标记，下次启动重试
             return;
         }
-        let _ = win::notify_wininet_changed();
+        win::notify_wininet_changed();
     }
     let _ = std::fs::remove_file(&marker);
 }

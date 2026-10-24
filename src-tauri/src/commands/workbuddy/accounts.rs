@@ -210,7 +210,7 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 credits_fetched_at: a.credits_fetched_at.clone(),
                 is_current: auth_uid.is_some() && auth_uid == Some(a.uid.clone()),
                 has_credential: has_cred,
-                has_snapshot: has_snapshot,
+                has_snapshot,
                 has_snapshot_codebuddy: snap_cb_path.join(&a.id).is_dir(),
                 is_current_workbuddy: cur_wb.as_deref() == Some(a.id.as_str()),
                 is_current_codebuddy: cb_live_id.as_deref() == Some(a.id.as_str()),

@@ -545,15 +545,15 @@ pub fn stream_forward_ex(
                     usage = Some(x);
                 }
                 // 真实内容标记（issue #57 空完成检测）：空 delta chunk 不计入
-                if delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                if delta.get("content").and_then(|c| c.as_str()).is_some_and(|s| !s.is_empty())
                     || delta
                         .get("reasoning_content")
                         .and_then(|c| c.as_str())
-                        .map_or(false, |s| !s.is_empty())
+                        .is_some_and(|s| !s.is_empty())
                     || delta
                         .get("tool_calls")
                         .and_then(|t| t.as_array())
-                        .map_or(false, |a| !a.is_empty())
+                        .is_some_and(|a| !a.is_empty())
                 {
                     has_content = true;
                 }
@@ -658,7 +658,7 @@ pub fn stream_forward_ex(
                                 if obj
                                     .get("tool_calls")
                                     .and_then(|v| v.as_array())
-                                    .map_or(false, |a| a.is_empty())
+                                    .is_some_and(|a| a.is_empty())
                                 {
                                     obj.remove("tool_calls");
                                 }
@@ -676,7 +676,7 @@ pub fn stream_forward_ex(
                                 }
                                 // 恒空噪声字段剥离
                                 for key in ["extra_fields", "function_call"] {
-                                    if obj.get(key).map_or(false, |v| v.is_null()) {
+                                    if obj.get(key).is_some_and(|v| v.is_null()) {
                                         obj.remove(key);
                                     }
                                 }
@@ -685,7 +685,7 @@ pub fn stream_forward_ex(
                             // 帧整帧跳过：has_content 基于非空语义判定，不受影响，
                             // 空完成哨兵检测（issue #57）语义不变
                             let frame_empty =
-                                delta.as_object().map_or(true, |o| o.is_empty());
+                                delta.as_object().is_none_or(|o| o.is_empty());
                             if !(frame_empty && finish.is_empty() && !frame_has_usage) {
                                 let mut choice = json!({"index":0,"delta":delta});
                                 if !finish.is_empty() {

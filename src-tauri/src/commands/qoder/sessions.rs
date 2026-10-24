@@ -301,7 +301,7 @@ pub fn qoder_session_detail_query(
         };
         let mut stmt = c.prepare(sql)?;
         let mut rows: Vec<UsageSessionView> = Vec::new();
-        let mut it = stmt.query_map(
+        let it = stmt.query_map(
             rusqlite::params![date, uid, sid, pv],
             |r| {
                 Ok((
@@ -317,7 +317,7 @@ pub fn qoder_session_detail_query(
                 ))
             },
         )?;
-        while let Some(r) = it.next() {
+        for r in it {
             let (rid, row_sid, ts, model, credits, pt, ct, row_preview, record_id) = r?;
             let _ = rid; // request_id 不外显（幂等键内部用途）
             rows.push(UsageSessionView {

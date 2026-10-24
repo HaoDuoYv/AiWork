@@ -482,7 +482,7 @@ pub fn record_failure(model: &str, endpoint_id: &str, kind: FailKind, detail: &s
         FailKind::RateLimited | FailKind::Transport => {
             st.soft_streak = st.soft_streak.saturating_add(1);
             let soft = (SOFT_BASE
-                * pow2(st.soft_streak.saturating_sub(1) as u32))
+                * pow2(st.soft_streak.saturating_sub(1)))
             .min(SOFT_MAX);
             st.soft_until = now + soft;
             if st.fails >= BREAKER_THRESHOLD {

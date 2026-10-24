@@ -84,12 +84,10 @@ fn auth_file_uid_value(j: &serde_json::Value) -> Option<String> {
         j.get("uid"),
         j.get("auth").and_then(|a| a.get("account")).and_then(|a| a.get("uid")),
         j.get("auth").and_then(|a| a.get("uid")),
-    ] {
-        if let Some(v) = v {
-            if let Some(s) = v.as_str() {
-                if !s.is_empty() {
-                    return Some(s.to_string());
-                }
+    ].into_iter().flatten() {
+        if let Some(s) = v.as_str() {
+            if !s.is_empty() {
+                return Some(s.to_string());
             }
         }
     }
@@ -100,7 +98,7 @@ fn auth_file_uid_value(j: &serde_json::Value) -> Option<String> {
 pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
     let auth_file = &sess.auth_file;
     // 关闭客户端后先等 auth 文件静默（残留进程可能延迟回写旧登录，实测 3 秒后才落盘）
-    wait_auth_file_quiet(&auth_file, sink);
+    wait_auth_file_quiet(auth_file, sink);
     let dest = sess.prof.profiles_dir.join(slot);
     if !auth_file.exists() {
         // 前置早退：首次使用/从未登录场景（区别于复制失败）——不建槽、不写 meta、
@@ -118,7 +116,7 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
     let mut copied = 0usize;
 
     // L1 必选：auth 文件
-    match std::fs::copy(&auth_file, dest.join("auth").join(WB_AUTH_FILE_NAME)) {
+    match std::fs::copy(auth_file, dest.join("auth").join(WB_AUTH_FILE_NAME)) {
         Ok(_) => {
             copied += 1;
             sink.step("backup", StepStatus::Ok, "L1 auth 文件已备份");
@@ -130,7 +128,7 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
     }
 
     // L2 体验：~\<app_data>\storage\user-<uid>* 目录
-    let uid = auth_file_uid(&auth_file);
+    let uid = auth_file_uid(auth_file);
     match &uid {
         Some(uid) => {
             let storage_dir = sess.prof.data_dir.join("storage");
@@ -289,8 +287,8 @@ pub fn restore_authfile(
     } else {
         // L1 必选：回写 auth 文件
         if let Err(e) = {
-            let _ = std::fs::create_dir_all(&auth_dir);
-            std::fs::copy(&auth_src, &auth_file)
+            let _ = std::fs::create_dir_all(auth_dir);
+            std::fs::copy(&auth_src, auth_file)
         } {
             sink.step("restore", StepStatus::Error, &format!("auth 文件恢复失败: {e}"));
             return Err(super::thrown(sink, "auth 文件恢复失败"));
@@ -300,7 +298,7 @@ pub fn restore_authfile(
 
         // 回写校验：确认落盘内容确为目标账号（防复制中途失败或复制后立即被其他进程回写）
         let want_uid = auth_file_uid(&auth_src);
-        let got_uid = auth_file_uid(&auth_file);
+        let got_uid = auth_file_uid(auth_file);
         if let (Some(want), Some(got)) = (&want_uid, &got_uid) {
             if got != want {
                 sink.step(
@@ -594,7 +592,7 @@ pub fn synthesize_auth_snapshot(
         .and_then(|raw| serde_json::from_str(raw.trim_start_matches('\u{feff}')).ok())
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| json!({"account": {}, "auth": {}}));
-    let hits = rewrite_identity_keys(&mut shell, &creds);
+    let hits = rewrite_identity_keys(&mut shell, creds);
 
     // 壳缺失键位补写（默认壳/结构未知壳）：uid 按 auth_file_uid 四键兼容保证可读，
     // 凭证字段按 camelCase 惯例（与 token store / 实测 auth 文件形态一致）补齐
@@ -756,7 +754,7 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
     let check_auth = sess.prof.app_name != "CodeBuddy";
 
     // F1-2 因果信号锚点：记录"恢复落盘后"的 auth 文件 mtime
-    let restore_mtime = std::fs::metadata(&auth_file).and_then(|m| m.modified()).ok();
+    let restore_mtime = std::fs::metadata(auth_file).and_then(|m| m.modified()).ok();
     // 信号③锚点（仅 CodeBuddy）：恢复落盘后的 vscdb mtime。仅在快照确实包含 vscdb
     // 登录真源（本次恢复覆盖了它）时启用——旧版快照（无 vscdb 槽）只恢复了 auth 文件，
     // 登录真源未变，客户端启动正常写 vscdb 也会翻动 mtime，贸然启用会假阳性确认。
@@ -800,10 +798,10 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_secs(2));
         // 信号②：共享 auth 文件 uid（仅 WorkBuddy；连续两次命中才确认）
-        let auth_uid = if check_auth { auth_file_uid(&auth_file) } else { None };
+        let auth_uid = if check_auth { auth_file_uid(auth_file) } else { None };
         let mut auth_rewritten = true;
         if !has_snap_dir {
-            auth_rewritten = std::fs::metadata(&auth_file)
+            auth_rewritten = std::fs::metadata(auth_file)
                 .and_then(|m| m.modified())
                 .ok()
                 .map(|t| Some(t) != restore_mtime)

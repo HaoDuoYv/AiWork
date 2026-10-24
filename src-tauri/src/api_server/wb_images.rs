@@ -109,7 +109,7 @@ fn upstream_unsupported(status: u16, body: &str) -> (u16, String) {
     }
     (
         if status == 200 { 502 } else { status },
-        format!("上游生图错误（HTTP {status}）: {}", &body.chars().take(200).collect::<String>()),
+        format!("上游生图错误（HTTP {status}）: {}", body.chars().take(200).collect::<String>()),
     )
 }
 

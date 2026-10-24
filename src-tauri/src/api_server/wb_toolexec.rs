@@ -30,7 +30,7 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub fn responses_declares_web_search(body: &Value) -> bool {
     body.get("tools")
         .and_then(|t| t.as_array())
-        .map_or(false, |arr| {
+        .is_some_and(|arr| {
             arr.iter()
                 .any(|t| matches!(t.get("type").and_then(|v| v.as_str()), Some("web_search") | Some("web_search_preview")))
         })
@@ -431,7 +431,7 @@ fn open_url(url: &str) -> Result<String, String> {
     let mut current = url.trim().to_string();
     for _hop in 0..3 {
         url_allowed(&current)?;
-        let _ = match agent
+        match agent
             .get(&current)
             .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .call()
@@ -464,14 +464,13 @@ fn resolve_redirect_target(current: &str, location: &str) -> Result<String, Stri
     }
     if let Some(rest) = current.strip_prefix("http://").or_else(|| current.strip_prefix("https://")) {
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-        if !authority.is_empty() {
-            if loc.starts_with('/') {
+        if !authority.is_empty()
+            && loc.starts_with('/') {
                 let scheme = &current[..current.find("://").unwrap_or(0)];
                 return Ok(format!("{scheme}://{authority}{loc}"));
             }
-        }
     }
-    Err(format!("不支持的重定向 Location 形态: {}", &loc.chars().take(80).collect::<String>()))
+    Err(format!("不支持的重定向 Location 形态: {}", loc.chars().take(80).collect::<String>()))
 }
 
 fn finish_open_url(resp: ureq::Response) -> Result<String, String> {

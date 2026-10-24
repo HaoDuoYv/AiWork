@@ -387,7 +387,7 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
                 .iter()
                 .filter(|s| s.get("date").and_then(Value::as_str).map(|d| d < today.as_str()).unwrap_or(false))
                 .filter(|s| s.get("total_balance").and_then(Value::as_f64).is_some())
-                .last()
+                .next_back()
         });
     let prev_total = prev_snapshot.and_then(|s| s.get("total_balance").and_then(Value::as_f64));
     // 可比性守卫：账号集合与上一快照不一致 → 差分含新账号余额，不可信，earned 只取签到 reward
@@ -743,23 +743,23 @@ pub(crate) fn workbuddy_usage_official_impl(
 
     // 选号：user_id → auth 文件当前账号 → 首个有 token store 凭证的账号
     //（审查 P1：选号解析提到缓存命中判断之前——缓存按账号区分，命中须同账号）
-    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(&state);
+    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let pick = |id: &str| -> Option<(String, String, String)> {
         let rec = tokens.get(id)?;
-        let token = as_str(fs_utils::dig(&rec, &["access_token"]))?;
+        let token = as_str(fs_utils::dig(rec, &["access_token"]))?;
         if token.is_empty() {
             return None;
         }
-        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
+        let domain = as_str(fs_utils::dig(rec, &["domain"])).unwrap_or_default();
         Some((id.to_string(), token, domain))
     };
-    let pool = load_pool(&state);
+    let pool = load_pool(state);
     let chosen = user_id
         .as_deref()
-        .and_then(|uid| pick(uid))
+        .and_then(&pick)
         .or_else(|| {
-            let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(&state));
+            let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(state));
             let fuid = as_str(fs_utils::dig(&raw, &["uid"]))?;
             pool.accounts.iter().find(|a| a.uid == fuid).map(|a| a.id.clone()).and_then(|id| pick(&id))
         })
@@ -1076,11 +1076,11 @@ pub(crate) fn workbuddy_usage_official_all_impl(
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let pick = |id: &str| -> Option<(String, String, String)> {
         let rec = tokens.get(id)?;
-        let token = as_str(fs_utils::dig(&rec, &["access_token"]))?;
+        let token = as_str(fs_utils::dig(rec, &["access_token"]))?;
         if token.is_empty() {
             return None;
         }
-        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
+        let domain = as_str(fs_utils::dig(rec, &["domain"])).unwrap_or_default();
         Some((id.to_string(), token, domain))
     };
     let pool = load_pool(state);
@@ -1411,17 +1411,17 @@ pub fn workbuddy_activity_info(
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let pick = |id: &str| -> Option<(String, String, String)> {
         let rec = tokens.get(id)?;
-        let token = as_str(fs_utils::dig(&rec, &["access_token"]))?;
+        let token = as_str(fs_utils::dig(rec, &["access_token"]))?;
         if token.is_empty() {
             return None;
         }
-        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
+        let domain = as_str(fs_utils::dig(rec, &["domain"])).unwrap_or_default();
         Some((id.to_string(), token, domain))
     };
     let pool = load_pool(&state);
     let chosen = user_id
         .as_deref()
-        .and_then(|uid| pick(uid))
+        .and_then(&pick)
         .or_else(|| {
             let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(&state));
             let fuid = as_str(fs_utils::dig(&raw, &["uid"]))?;

@@ -220,7 +220,7 @@ pub fn prepare_llm_chat_body(
         .get("max_tokens")
         .or_else(|| obj_mut.get("max_completion_tokens"))
         .cloned()
-        .filter(|v| v.as_u64().map_or(false, |n| n > 0))
+        .filter(|v| v.as_u64().is_some_and(|n| n > 0))
         .unwrap_or_else(|| json!(4096));
     obj_mut.insert("max_tokens".into(), max_tokens);
     obj_mut.insert("conversation_id".into(), json!(gen_uuid_like()));

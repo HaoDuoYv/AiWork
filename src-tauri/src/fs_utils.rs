@@ -117,7 +117,7 @@ pub fn ensure_uid_safe(uid: &str) -> Result<(), String> {
         || uid.contains("..")
         || uid == "."
     {
-        return Err(format!("非法账号标识: {}", &uid.chars().take(24).collect::<String>()));
+        return Err(format!("非法账号标识: {}", uid.chars().take(24).collect::<String>()));
     }
     Ok(())
 }

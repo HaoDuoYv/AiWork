@@ -213,9 +213,9 @@ pub fn usage_history_save(s: &Store, root: &Value) -> Result<(), String> {
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })?;
     // 365 天滚动裁剪（原实现无界增长，P6 修复）
     let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(365))
@@ -280,9 +280,9 @@ pub fn sticky_bindings_save(s: &Store, root: &Value) -> Result<(), String> {
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -346,9 +346,9 @@ pub fn sticky_bindings_save_ns(
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -822,9 +822,9 @@ pub fn accounts_save(s: &Store, f: &AccountsFile) -> Result<(), String> {
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -881,9 +881,9 @@ pub fn accounts_save_raw(s: &Store, root: &Value) -> Result<(), String> {
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -973,9 +973,9 @@ pub fn groups_save(s: &Store, f: &GroupsFile) -> Result<(), String> {
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -1019,9 +1019,9 @@ pub(crate) fn group_defs_save_unlocked(s: &Store, defs: &[crate::models::Group])
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -1056,9 +1056,9 @@ pub fn tags_save(s: &Store, defs: &[crate::models::Tag]) -> Result<(), String> {
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -1466,7 +1466,7 @@ fn bucket_of(name: &str) -> Option<UsageBucket> {
     }
 }
 
-fn bucket_map_mut<'a>(f: &'a mut UsageFile, b: UsageBucket) -> &'a mut std::collections::HashMap<String, DayStats> {
+fn bucket_map_mut(f: &mut UsageFile, b: UsageBucket) -> &mut std::collections::HashMap<String, DayStats> {
     match b {
         UsageBucket::Trae => &mut f.days,
         UsageBucket::Wb => &mut f.wb_days,
@@ -1527,9 +1527,9 @@ pub fn api_usage_save(s: &Store, f: &UsageFile) -> Result<(), String> {
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -1617,7 +1617,7 @@ pub fn qoder_sessions_prune(s: &Store, keep_days: i64) -> Result<usize, String> 
     let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(keep_days))
         .format("%Y-%m-%d")
         .to_string();
-    s.with_conn(|c| Ok(c.execute("DELETE FROM qoder_sessions WHERE date < ?1", [cutoff.as_str()])?))
+    s.with_conn(|c| c.execute("DELETE FROM qoder_sessions WHERE date < ?1", [cutoff.as_str()]))
 }
 
 /// 合并保留窗默认值（天）：早于 N 天的请求级流水参与合并（date < today-N），
@@ -1737,9 +1737,9 @@ pub fn credits_history_save(s: &Store, f: &CreditsFile) -> Result<(), String> {
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -1787,9 +1787,9 @@ pub fn credits_daily_save(s: &Store, f: &CreditsDailyFile) -> Result<(), String>
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -1841,9 +1841,9 @@ pub fn checkin_results_save(s: &Store, f: &crate::checkin_results::ResultsFile) 
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -1902,9 +1902,9 @@ pub fn wb_checkin_results_save(s: &Store, root: &Value) -> Result<(), String> {
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 
@@ -1942,9 +1942,9 @@ pub fn doubao_health_save(s: &Store, events: &[Value]) -> Result<(), String> {
         c.execute_batch("COMMIT;")?;
         Ok(())
     })
-    .or_else(|e| {
+    .map_err(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
-        Err(e)
+        e
     })
 }
 

@@ -130,8 +130,8 @@ pub async fn do_start(
                 &state.data_dir,
                 &format!("  账号池跳过: name={} uid={} reason=not_in_enabled_list", name, uid),
             );
-        } else if !group_filter.as_ref().map_or(true, |f| {
-            groups_file.membership.get(uid).map_or(false, |g| f.contains(g.as_str()))
+        } else if !group_filter.as_ref().is_none_or(|f| {
+            groups_file.membership.get(uid).is_some_and(|g| f.contains(g.as_str()))
         }) {
             fs_utils::app_log(
                 &state.data_dir,
@@ -150,9 +150,9 @@ pub async fn do_start(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
-            let status = if cd.map_or(false, |c| c.error_type == "SessionDead") {
+            let status = if cd.is_some_and(|c| c.error_type == "SessionDead") {
                 "SessionDead(disabled)".to_string()
-            } else if cd.map_or(false, |c| c.until > 0 && now < c.until) {
+            } else if cd.is_some_and(|c| c.until > 0 && now < c.until) {
                 format!("cooldown(remaining={}s)", cd.unwrap().until - now)
             } else if let Some(exp) = expire {
                 if exp > 0 && exp < now {
@@ -844,8 +844,8 @@ fn apply_pool_snapshot(
         .filter(|a| {
             let group_ok = qoder_group_filter
                 .as_ref()
-                .map_or(true, |f| f.contains(a.group_id.as_str()));
-            let tag_ok = qoder_tag_filter.as_ref().map_or(true, |t| t.contains(&a.id));
+                .is_none_or(|f| f.contains(a.group_id.as_str()));
+            let tag_ok = qoder_tag_filter.as_ref().is_none_or(|t| t.contains(&a.id));
             group_ok && tag_ok
         })
         .map(|a| crate::api_server::pool::QoderSyncAccount {

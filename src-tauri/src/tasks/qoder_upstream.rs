@@ -44,12 +44,10 @@ use crate::tasks::qoder_common::{self, QoderCreds};
 use crate::tasks::qoder_sign::{self, CosyIdentity};
 
 // ==================== ② 协议常量 ====================
-
-/// Qoder 对话上游（CN 推理网关；签名路径会剥去 `/algo` 前缀与查询串，
-/// 见 `qoder_sign::signature_path` 的测试背书）
-pub const QODER_CHAT_URL: &str = "https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1";
-/// 对话上游 host（传输错误文案用）
-pub const QODER_CHAT_HOST: &str = "https://gateway.qoder.com.cn";
+//
+// 说明：早期有 CN 专用常量 `QODER_CHAT_URL` / `QODER_CHAT_HOST`（含完整查询串），
+// 双区化后一律经 [`qoder_realm::chat_url`] / [`QoderRegion::gateway`] 按区域取址，
+// 两个常量已删除（原值见 git 历史）。
 
 /// Qoder SSE Agent：连接 10s / 写 30s / 空闲读 300s（对齐 wb_agent）。
 /// 进程级共享（审查 P2：原每请求新建 Agent，连接池配置随临时实例丢弃，
@@ -90,7 +88,10 @@ impl QoderRegion {
         }
     }
 
-    /// 该地区的推理网关基址（`model/list` 刷新与对话共用域名口径）
+    /// 该地区的推理网关基址（`model/list` 刷新与对话共用域名口径）。
+    /// 由 `qoder_catalog::model_list_url` 消费；网关对话侧统一走 `qoder_realm::chat_url`。
+    /// 编译器视角下仅测试路径可见，故显式放行
+    #[allow(dead_code)]
     pub fn gateway(self) -> &'static str {
         match self {
             Self::Global => "https://api3.qoder.sh/",

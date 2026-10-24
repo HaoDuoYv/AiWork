@@ -262,7 +262,7 @@ fn read_sst_entries(raw: &[u8]) -> Result<Vec<(u64, u8, Vec<u8>, Vec<u8>)>, Stri
 }
 
 fn put_entry(best: &mut HashMap<Vec<u8>, (u64, Vec<u8>)>, seq: u64, key: &[u8], val: Option<&[u8]>) {
-    let newer = best.get(key).map_or(true, |(s, _)| seq > *s);
+    let newer = best.get(key).is_none_or(|(s, _)| seq > *s);
     if newer {
         best.insert(key.to_vec(), (seq, val.unwrap_or_default().to_vec()));
     }

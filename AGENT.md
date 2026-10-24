@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v4.0.9 · 三项目合并版
+# AGENT.md — AI Work 助手 (ai-work-assistant) v4.1.1 · 三项目合并版
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
@@ -33,6 +33,17 @@ node scripts/rename_release.mjs     # 产物统一输出到 release/，中文命
 ```powershell
 cargo test                                    # Rust 单测（需先装工具链；切换器/签到/网关全覆盖）
 ```
+
+质量门禁（P1，与 CI `.github/workflows/ci.yml` 一致）：
+
+```powershell
+cd src-tauri; cargo clippy --all-targets -- -D warnings   # Rust lint（基线见 src-tauri/Cargo.toml [lints.clippy]）
+npm run lint                                  # 前端 ESLint（eslint.config.js；0 error 0 warning）
+npx tsc --noEmit                              # 类型检查
+npm test                                      # 前端单测
+```
+
+> 编译器警告当前为 **0**；clippy 风格类规则已在 `[lints.clippy]` 显式 allow（附理由），其余规则全部强制——新增代码不得引入任何警告。`cargo fmt --check` 暂未纳入 CI（存量从未统一格式化，实测 248 文件 2433 处差异，需先单独做一次全仓格式化提交）。
 
 ## 3. 技术栈
 
@@ -78,7 +89,8 @@ ai-work-assistant/
 │       ├── api_server/           # API 网关模块
 │       │   ├── mod.rs            # 常量 + 路由注册
 │       │   ├── server.rs         # axum 服务器启停
-│       │   ├── routes.rs         # OpenAI /v1/chat/completions + Anthropic /v1/messages + Codex /v1/responses（SSE 流式 + 非流式，三协议输出）
+│       │   ├── routes.rs         # OpenAI /v1/chat/completions + Anthropic /v1/messages + Codex /v1/responses（SSE 流式 + 非流式，三协议输出；含 /status）
+│       │   ├── routes_light.rs   # 轻量端点（P1 拆分自 routes.rs）：/health、/healthz、/v1/usage（按 Key 当日用量 + 近 7 日合计，供 CC Switch 用量查询）
 │       │   ├── pool.rs           # 账号池调度（积分感知 + 冷却状态机 + 账号轮换，app 无关）
 │       │   ├── payload.rs        # OpenAI/Anthropic 请求 → llm_utils_chat 改写（anthropic_to_openai 先转内部格式）
 │       │   ├── sse.rs            # SSE 协议转换（SOLO → OpenAI chunk / Anthropic 事件流）
@@ -433,7 +445,7 @@ ai-work-assistant/
   - **后台任务降级（F-65③）**：`api_pool.json.wb_bg_downgrade`（默认关）——max_tokens≤128 且全文≤512 字符 → 目录最低倍率模型；`/v1/chat/completions` 收到 `anthropic-version` 头 → 400 明示改走 `/v1/messages`。
   - **本地 quota 兜底（F-21，`wb_common.rs`）**：credits 云端全链失败 → 扫 `~/.workbuddy/*.port` + 候选/有界端口段 → GET `/api/v1/quota` 按 remaining 特征确认（source=`local_quota`）。
   - **DSH provider 目录动态替换（F-37，`wb_catalog.rs`）**：`parse_upstream_catalog` 宽容解析（三容器形态/字段链探测/产出 0 条不落盘）+ `fetch_and_replace`（GET `{chatBase}/console/enterprises/personal/models`）；网关启动自动一次（失败保持静态兜底）+ `api_wb_catalog_sync` 手动命令；`/v1/models` WB 条目透传 `supports_image`/`supported_efforts`。
-  - **CC Switch 协同（F-43，`commands/ccswitch.rs`）**：不自建切换器——upsert 固定 id `aiwork-gateway-<claude|codex>` 进 `~/.cc-switch/cc-switch.db` providers 表（claude=扁平 env，base 不带 /v1；codex=auth+config.toml，wire_api=responses）；写前整库备份至 `~/.cc-switch/backups/`、**只动自有条目**、Key 不入日志；CC Switch 运行中写入后需重启其生效。
+  - **CC Switch 协同（F-43，`commands/ccswitch.rs`）**：不自建切换器——upsert 固定 id `aiwork-gateway-<claude|codex>` 进 `~/.cc-switch/cc-switch.db` providers 表（claude=扁平 env，base 不带 /v1；codex=auth+config.toml，wire_api=responses）；写前整库备份至 `~/.cc-switch/backups/`、**只动自有条目**、Key 不入日志；CC Switch 运行中写入后需重启其生效。**用量查询（v4.1.0）**：注册时一并在 provider `meta.usage_script` 写入自定义脚本（按 ccswitch.co「2.5 Usage Query」文档格式）——`baseUrl` 固定本机网关（不能用 `{{baseUrl}}`，它指向 provider 上游）、`{{apiKey}}` 由 CC Switch 按凭据替换、每 10 分钟查询 `GET /v1/usage`；extractor 直接返回 `data` 数组（多套餐展示形态）。`GET /v1/usage`（`routes_light::usage`）在鉴权中间件之后执行，按**当前调用的 Key**（`api_keys::usage_view` 读内存权威副本、跨天归一）返回 `{success, data:[{planName, used, total, remaining, unit:"times", extra, date}]}`——网关没有余额概念，展示的是当日请求数 / 每日上限（不限时 total/remaining 为 null）；该端点**不消耗请求配额**。鉴权关闭（anonymous）时返回 `success:false` + 说明。响应另含 `week_total` / `week_days`（近 7 日合计，窗口外的旧记账不计），`extra` 末尾追加「近 N 天共 M 次」——额度不限时卡片也有量级参照。
 
 ## 13. 禁止与红线（Do NOT）
 

@@ -311,7 +311,7 @@ impl ApiPool {
                 }
             }
             if let Some(exp) = e.credits_expire_at {
-                if exp > 0 && earliest.map_or(true, |cur| exp < cur) {
+                if exp > 0 && earliest.is_none_or(|cur| exp < cur) {
                     earliest = Some(exp);
                 }
             }
@@ -350,7 +350,7 @@ impl ApiPool {
                 if let Some(filter) = &group_filter {
                     let in_group = membership
                         .get(uid)
-                        .map_or(false, |g| filter.contains(g.as_str()));
+                        .is_some_and(|g| filter.contains(g.as_str()));
                     if !in_group {
                         continue;
                     }
@@ -614,7 +614,7 @@ impl ApiPool {
         let all_cands: Vec<&PoolEntry> = entries
             .values()
             .filter(|e| selectable(e, tried, now, reserve, skip_credit_filters))
-            .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+            .filter(|e| allowed.is_none_or(|a| a.contains(&e.uid)))
             .collect();
         // F-77 busy 过滤 + 全 busy 降级
         let inflight = self.inflight_snapshot();
@@ -726,7 +726,7 @@ impl ApiPool {
             entries
                 .values()
                 .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve, skip_credit_filters))
-                .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+                .filter(|e| allowed.is_none_or(|a| a.contains(&e.uid)))
                 .fold((false, false), |(any, idle), e| {
                     (any || true, idle || inflight_of(e, &inflight) < limit)
                 })
@@ -751,7 +751,7 @@ impl ApiPool {
         let idle: Vec<&PoolEntry> = entries
             .values()
             .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve, skip_credit_filters))
-            .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+            .filter(|e| allowed.is_none_or(|a| a.contains(&e.uid)))
             .filter(|e| inflight_of(e, &inflight) < limit)
             .collect();
         let strategy = *safe_lock(&self.strategy);
@@ -855,7 +855,7 @@ impl ApiPool {
                     e.err_count += 1;
                     if e.err_count >= 3 {
                         // 熔断器：30m 起指数递增（×2/次），封顶 6h
-                        let exp = 30 * 60u64 << e.cb_trips.min(4);
+                        let exp = (30 * 60u64) << e.cb_trips.min(4);
                         let capped = exp.min(6 * 3600);
                         let until = now_ts() + capped as i64;
                         e.until = until;
@@ -989,7 +989,7 @@ impl ApiPool {
         for e in entries.values() {
             if selectable(e, &tried, now, reserve, skip_credit_filters) {
                 total += 1;
-                if allowed.map_or(true, |a| a.contains(&e.uid)) {
+                if allowed.is_none_or(|a| a.contains(&e.uid)) {
                     in_allowed += 1;
                 }
             }
@@ -1037,7 +1037,7 @@ impl ApiPool {
         let entries = safe_lock(&self.entries);
         entries
             .values()
-            .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+            .filter(|e| allowed.is_none_or(|a| a.contains(&e.uid)))
             .filter_map(|e| e.credits)
             .fold(None, |acc: Option<f64>, c| {
                 Some(acc.map_or(c, |m| m.min(c)))
@@ -1256,8 +1256,8 @@ fn pick_by_strategy<'a>(
         }),
         PoolStrategy::ExpireFirst => cands.iter().copied().min_by(|a, b| {
             // 有过期时间者优先（现状语义）→ 更早过期优先 → 平手积分多者优先
-            let ha = a.credits_expire_at.map_or(false, |t| t > 0);
-            let hb = b.credits_expire_at.map_or(false, |t| t > 0);
+            let ha = a.credits_expire_at.is_some_and(|t| t > 0);
+            let hb = b.credits_expire_at.is_some_and(|t| t > 0);
             hb.cmp(&ha)
                 .then_with(|| {
                     a.credits_expire_at
@@ -1367,14 +1367,14 @@ pub(crate) fn seeded_hex(n: usize, seed: &str, salt: &str) -> String {
     let data = format!("{}:{}", salt, seed);
     let mut out = Vec::new();
     let mut i: u32 = 0;
-    while out.len() < (n + 1) / 2 {
+    while out.len() < n.div_ceil(2) {
         let mut hasher = Sha256::new();
         hasher.update(data.as_bytes());
         hasher.update(i.to_be_bytes());
         out.extend_from_slice(&hasher.finalize());
         i += 1;
     }
-    out.truncate((n + 1) / 2);
+    out.truncate(n.div_ceil(2));
     out.iter().map(|b| format!("{:02x}", b)).collect::<String>()
         .chars().take(n).collect()
 }

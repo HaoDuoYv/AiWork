@@ -30,7 +30,9 @@ use crate::state::AppState;
 pub const OPEN_API_BASE: &str = "https://openapi.qoder.com.cn";
 
 /// 官网 Web 域（R-11 抓包 2026-10-04：账户页 `/api/v2/me/usages/big_model_credits`
-/// 端点在此域，Bearer 鉴权与 openapi 同源；openapi 主机无该路由——实测 alb 503）
+/// 端点在此域，Bearer 鉴权与 openapi 同源；openapi 主机无该路由——实测 alb 503）。
+/// 抓包记录保留；调用方现走 `qoder_realm::web_base(realm)`（分区），此常量当前无引用
+#[allow(dead_code)]
 pub const WEB_BASE: &str = "https://qoder.cn";
 
 /// `Cosy-ClientType` 真实值（R-4 已闭合：2026-09-27 抓包实测主进程恒带 `cosy-clienttype: 10`）
@@ -233,7 +235,7 @@ pub fn token_store_load_secure(data_dir: &std::path::Path) -> Value {
                 continue;
             }
             // 仅填空值：DB 明文优先（更新鲜，如迁移残留，待下次写入收敛）
-            if rm.get(k).and_then(Value::as_str).map_or(true, |s| s.is_empty()) {
+            if rm.get(k).and_then(Value::as_str).is_none_or(|s| s.is_empty()) {
                 rm.insert(k.to_string(), serde_json::json!(val));
             }
         }
@@ -295,7 +297,7 @@ pub fn migrate_token_store(state: &AppState) -> Result<usize, String> {
                 TOKEN_SENSITIVE_KEYS.iter().any(|k| {
                     rec.get(k)
                         .and_then(Value::as_str)
-                        .map_or(false, |s| !s.is_empty())
+                        .is_some_and(|s| !s.is_empty())
                 })
             })
         })
@@ -1002,7 +1004,7 @@ pub fn exchange_job_token(
             ("User-Agent".to_string(), CLIENT_USER_AGENT.to_string()),
             ("Content-Type".to_string(), "application/json".to_string()),
         ];
-        let (status, resp) = post_json(agent, &url, &headers, &body);
+        let (status, resp) = post_json(agent, &url, &headers, body);
         if i == 0 {
             first_status = Some(status);
         }

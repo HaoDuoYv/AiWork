@@ -6,6 +6,49 @@
 
 ---
 
+## [4.1.1] · 2026-10-24 · 工程可交付性：质量门禁 + 死代码清理
+
+### 新增
+
+- **CI 质量门禁（`.github/workflows/ci.yml`）**：`main` / `master` 每次推送与所有 PR 都必须通过——前端 `tsc` + ESLint + vitest，后端 `cargo clippy -D warnings` + 全量测试。此前 CI 只在一个旧分支上打包，主线提交从不校验。
+- **前端 ESLint**（`eslint.config.js`，`npm run lint`）：推荐规则 + TS 规则 + Hook 调用规则，当前 0 error / 0 warning。
+- **Rust lint 基线**（`src-tauri/Cargo.toml [lints.clippy]`）：风格类规则显式放行并附理由，其余全部强制。
+
+### 修复
+
+- **编译警告清零**（19 → 0）：删除 20 余处从未使用的常量/函数（含 Qoder 早期 CN 专用常量、重复的模型目录 URL 拼接、方案 C 未接线的池化 uid 工具）；统一「仅测试使用」的放行标注；修正两处多余 `mut`。
+- **潜在崩溃点收紧**：日志滚动复用分支的 `is_some().expect()` 改为不变量更明确的写法；Trae JWT 刷新回调的 `is_some().unwrap()` 改为直接取用，消除「先判后取」的竞态窗口。
+- **模型目录 `supports_image` 分支去重**：两条取值路径完全相同，合并为一个条件（行为不变）。
+
+### 变更
+
+- **网关轻量端点拆分**：`/health`、`/healthz`、`/v1/usage` 从 3778 行的 `routes.rs` 移至 `routes_light.rs`（首轮拆分，零逻辑改动，`routes.rs` 降至 3668 行）。
+- **`/v1/usage` 增强**：新增 `week_total` / `week_days`（近 7 日合计），`extra` 追加「近 N 天共 M 次」——额度不限时也能看到量级。
+- **`.gitignore`**：忽略 `.claude/settings.local.json`、`tsconfig.tsbuildinfo`、`tauri.dev.conf.json` 与编码事故残留副本。
+
+### 已知问题（登记于 docs/backlog.md）
+
+- **F-83**：Qoder 子 Key 绑区（`bind_pool=qoder_intl`）实际不生效，定区只认模型前缀。相关纯函数已就绪待接线，未在本版改变行为。
+- **F-84**：`ModelsSources::is_dual` 未接线，随跨池回退（F-81）处理。
+- `cargo fmt --check` 暂未纳入 CI（存量代码未统一格式化，需先单独提交一次全仓格式化）。
+
+验证：`cargo clippy --all-targets -- -D warnings` → 0 警告；`cargo test` → 1041 passed / 0 failed；`npx tsc --noEmit` → 0；`npm run lint` → 0；`npm test` → 59 passed。
+
+---
+
+## [4.1.0] · 2026-10-24 · 生态接入：CC Switch 用量查询
+
+### 新增
+
+- **CC Switch 用量查询**：在「API 服务 → 生态接入」注册到 CC Switch 时，一并写入「用量查询」配置。重启 CC Switch 后，网关 provider 卡片底部会显示该网关 Key 的**当日请求数 / 每日上限**（每 10 分钟刷新，仅在该 provider 处于「使用中」时查询）。
+  - 网关新增 `GET /v1/usage`：按请求所用的 API Key 返回当日用量，鉴权关闭或无此端点时给出明确文字提示（不再静默无数据）。
+  - 查询本身**不消耗请求配额**，不会让被观测的计数自己涨上去。
+  - 对已注册的用户：重新点一次「注册到 CC Switch」即可写入用量查询配置（写入前照旧整库备份，只动本网关条目）。
+
+验证：`cargo test` → 1039 passed / 0 failed / 14 ignored；`npm run test` → 59 passed；`npx tsc --noEmit` → 0。新增 `usage_view_reads_live_counter_and_normalizes_day`、`usage_script_targets_gateway_and_keeps_placeholders`。
+
+---
+
 ## [4.0.9] · 2026-10-24 · 排队可见化 + 模型目录可诊断（对齐 qoder2api-hub 1.6.13/1.6.7）
 
 ### 新增

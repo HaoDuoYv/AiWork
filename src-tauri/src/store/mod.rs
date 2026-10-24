@@ -206,10 +206,10 @@ impl Store {
             c.execute_batch("COMMIT;")?;
             Ok(())
         })
-        .or_else(|e| {
+        .map_err(|e| {
             // 事务中途失败回滚（连接可能残留未结束的事务）
             let _ = self.with_conn(|c| c.execute_batch("ROLLBACK;"));
-            Err(e)
+            e
         })
     }
 

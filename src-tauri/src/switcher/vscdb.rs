@@ -94,23 +94,17 @@ pub fn merge_global_keys(vscdb: &Path, pre: &GlobalKeys) -> Result<Option<String
     let mut folders_added = 0usize;
     let mut recent_added = 0usize;
     if let Some(p) = pre.project_folders.as_deref() {
-        match merge_value(cur.project_folders.as_deref(), p) {
-            Some((merged, added)) => {
-                folders_added = added;
-                let blob = cur.folders_blob || pre.folders_blob;
-                writes.push((KEY_PROJECT_FOLDERS, merged, blob));
-            }
-            None => {}
+        if let Some((merged, added)) = merge_value(cur.project_folders.as_deref(), p) {
+            folders_added = added;
+            let blob = cur.folders_blob || pre.folders_blob;
+            writes.push((KEY_PROJECT_FOLDERS, merged, blob));
         }
     }
     if let Some(p) = pre.recent_paths.as_deref() {
-        match merge_value(cur.recent_paths.as_deref(), p) {
-            Some((merged, added)) => {
-                recent_added = added;
-                let blob = cur.recent_blob || pre.recent_blob;
-                writes.push((KEY_RECENT_PATHS, merged, blob));
-            }
-            None => {}
+        if let Some((merged, added)) = merge_value(cur.recent_paths.as_deref(), p) {
+            recent_added = added;
+            let blob = cur.recent_blob || pre.recent_blob;
+            writes.push((KEY_RECENT_PATHS, merged, blob));
         }
     }
     if writes.is_empty() {

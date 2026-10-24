@@ -349,7 +349,7 @@ pub fn strip_cc_fingerprints(text: &str) -> String {
                 let v = r.trim_start(); // v 是 text 的后缀
                 let vs = text.len() - v.len();
                 let stop_rel = v
-                    .find(|c| matches!(c, ';' | ',' | ' ' | '\n' | '\t'))
+                    .find([';', ',', ' ', '\n', '\t'])
                     .unwrap_or(v.len());
                 end = vs + stop_rel;
             }
@@ -558,7 +558,7 @@ fn merge_message(base: &mut Value, extra: Value) {
     let content_b = extra.get("content").cloned().unwrap_or(Value::Null);
     if !content_b.is_null() {
         // 目标 content 缺失/为 null：直接采用新值
-        if base.get("content").map_or(true, |c| c.is_null()) {
+        if base.get("content").is_none_or(|c| c.is_null()) {
             base["content"] = content_b;
         } else {
             join_content(base.get_mut("content").unwrap(), content_b);

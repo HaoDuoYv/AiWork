@@ -146,7 +146,7 @@ pub fn token_store_load_secure(data_dir: &std::path::Path) -> Value {
             }
             // 仅填空值：DB 明文优先（更新鲜，如迁移残留，待下次写入收敛）
             if !val.is_empty()
-                && rm.get(k).and_then(Value::as_str).map_or(true, |s| s.is_empty())
+                && rm.get(k).and_then(Value::as_str).is_none_or(|s| s.is_empty())
             {
                 rm.insert(k.to_string(), serde_json::json!(val));
             }
@@ -234,7 +234,7 @@ pub fn effective_creds(state: &AppState, acct_id: &str, acct_uid: &str) -> Creds
     let a = store_creds.expires_at_ms;
     let b = file_creds.expires_at_ms;
     // python: file 有 token 且 (store 无到期时间 或 file 到期 >= store 到期)
-    let file_newer = a.is_none() || b.is_some_and(|bv| a.map_or(true, |av| bv >= av));
+    let file_newer = a.is_none() || b.is_some_and(|bv| a.is_none_or(|av| bv >= av));
     if !file_creds.access_token.is_empty() && file_newer {
         return file_creds;
     }
@@ -738,7 +738,7 @@ pub fn discover_local_quota_services(
     // ② 固定候选 ③ 有界端口段
     for p in ports
         .into_iter()
-        .chain(QUOTA_PORT_CANDIDATES.into_iter())
+        .chain(QUOTA_PORT_CANDIDATES)
         .chain(QUOTA_PORT_RANGE.clone())
     {
         if seen.contains(&p) || p == 0 {

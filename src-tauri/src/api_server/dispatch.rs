@@ -280,7 +280,9 @@ struct ModelSources {
 
 impl ModelSources {
     /// 是否多源（≥2 个源存在，忽略开关状态）：跨池回退的前提。
-    /// 命名沿用 is_dual（历史上只有双源）；Qoder 加入后语义泛化为「多源」
+    /// 命名沿用 is_dual（历史上只有双源）；Qoder 加入后语义泛化为「多源」。
+    /// 当前无调用方（跨池回退判定未使用此入口），保留待接线
+    #[allow(dead_code)]
     fn is_dual(&self) -> bool {
         let mut n = 0;
         if self.buddy.is_some() {
@@ -627,7 +629,7 @@ pub fn resolve_target(
             None
         };
         if let Some(pool) = sticky_pool {
-            if bind.map_or(true, |b| pool.as_str() == b)
+            if bind.is_none_or(|b| pool.as_str() == b)
                 && sources.available(pool, trae_enabled, wb_enabled, qoder_enabled)
                 && pool_healthy(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref(), req_realm)
             {
@@ -940,13 +942,13 @@ fn credit_blocked_only(pool: &super::pool::ApiPool, allowed: Option<&HashSet<Str
 fn trae_model_is_free(state: &Arc<ApiSharedState>, model: &str) -> bool {
     models_sync::load_models(&state.data_dir)
         .iter()
-        .any(|m| m.id == model && m.rate.map_or(false, |r| r <= 0.0))
+        .any(|m| m.id == model && m.rate.is_some_and(|r| r <= 0.0))
 }
 
 /// Buddy 侧模型是否零倍率（免费）：同 Trae 口径
 fn buddy_model_is_free(state: &Arc<ApiSharedState>, model: &str) -> bool {
     let catalog = super::wb_catalog::load(&state.data_dir);
-    super::wb_catalog::find(&catalog, model).map_or(false, |m| m.rate <= 0.0)
+    super::wb_catalog::find(&catalog, model).is_some_and(|m| m.rate <= 0.0)
 }
 
 /// 首选池健康检查：Buddy 池额外检查模型级冷却（优先级高于账号级）

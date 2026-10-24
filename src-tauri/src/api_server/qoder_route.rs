@@ -61,6 +61,7 @@ const QUEUE_BACKOFF_MAX_SECS: u64 = 30;
 /// 单账号池（`tried=1`）下，上游持续排队 + 每次钳制 ≤30s 的同号退避，会把请求拖到
 /// **94 秒**仍无任何 token 输出，最后还以 503 `no healthy account available` 收尾——既慢又
 /// 误导（账号是健康的，只是上游在排队）。该预算只用于 `wait`（旧行为）模式。
+#[cfg(test)]
 const QUEUE_WAIT_BUDGET_SECS: u64 = 20;
 
 /// 排队等待**上限**的运行时 clamp 区间与默认值（Qoder 调度页可设，
@@ -68,6 +69,8 @@ const QUEUE_WAIT_BUDGET_SECS: u64 = 20;
 /// 上游建议退避，上限 900s 防止无限挂起占住并发槽与连接
 const QUEUE_WAIT_MAX_MIN_SECS: u64 = 30;
 const QUEUE_WAIT_MAX_MAX_SECS: u64 = 900;
+/// 默认值的运行时真源是 `models::default_qoder_queue_wait_max_secs`（本常量仅文档用途）
+#[allow(dead_code)]
 const QUEUE_WAIT_MAX_DEFAULT_SECS: u64 = 300;
 
 /// 排队策略取值（空串/未知值按 `visible` 归一，与 qoder2api-hub 同口径）
@@ -90,12 +93,27 @@ impl QueueMode {
         }
     }
 
+    /// 策略名（测试往返锚点；运行时只解析不输出）
+    #[cfg(test)]
     fn as_str(self) -> &'static str {
         match self {
             QueueMode::Visible => "visible",
             QueueMode::Fast => "fast",
             QueueMode::Wait => "wait",
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_mode_name_tests {
+    use super::*;
+
+    /// 策略名与解析互为逆（调度页保存/回显的一致性锚点）
+    #[test]
+    fn queue_mode_as_str_roundtrips() {
+        assert_eq!(QueueMode::parse(QueueMode::Fast.as_str()), QueueMode::Fast);
+        assert_eq!(QueueMode::parse(QueueMode::Wait.as_str()), QueueMode::Wait);
+        assert_eq!(QueueMode::parse(QueueMode::Visible.as_str()), QueueMode::Visible);
     }
 }
 
@@ -238,7 +256,7 @@ fn resolve_realm_pool_tag(
         .or_else(|| body_model.and_then(|m| qoder_realm::normalize_model_id(m).0));
     let bind_pool = super::api_keys::constraints_for(&state.data_dir, key_id)
         .and_then(|k| k.bind_pool());
-    let bind_realm = bind_pool.as_deref().map(qoder_realm::realm_of_pool);
+    let bind_realm = bind_pool.map(qoder_realm::realm_of_pool);
     let settings: crate::models::Settings =
         crate::store::db(&state.data_dir).kv_get("app_settings");
     realm_pool_tag_from(
@@ -906,16 +924,16 @@ fn run_qoder_stream(
 
     // 本请求命中的区域池（区前缀 > Key 绑区 > 默认区域）
     let pool_tag = resolve_realm_pool_tag(
-        &state,
-        &model,
+        state,
+        model,
         peek.get("model").and_then(Value::as_str),
         key_id,
     );
     // 排队预算（「排队时等待」开关决定：20s 快速失败 / 调度页设置的上限）
-    let queue_budget = queue_budget_secs(&state);
+    let queue_budget = queue_budget_secs(state);
     // 排队策略热读（visible（默认）/ fast / wait）
 
-    let queue_mode = queue_mode(&state);
+    let queue_mode = queue_mode(state);
 
     // 等待模式：非 fast 即为等待（visible 与 wait 都会持续重试，
 
@@ -1035,7 +1053,7 @@ fn run_qoder_stream(
     let mut tried: HashSet<String> = HashSet::new();
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
 
-    // 排队累计等待（预算见 QUEUE_WAIT_BUDGET_SECS）与最后一次上游失败分类：
+    // 排队累计等待（预算见 queue_budget_secs）与最后一次上游失败分类：
 
     // 耗尽收尾据此判断「上游一直在排队」还是「账号真不可用」
 
@@ -1840,7 +1858,7 @@ pub async fn qoder_aggregate_chat(
         let mut tried: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
 
-        // 排队累计等待（预算见 QUEUE_WAIT_BUDGET_SECS）与最后一次上游失败分类：
+        // 排队累计等待（预算见 queue_budget_secs）与最后一次上游失败分类：
 
         // 耗尽收尾据此判断「上游一直在排队」还是「账号真不可用」
 
@@ -2299,7 +2317,7 @@ pub async fn qoder_aggregate_chat(
                                     status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64, &key_name,
                                     &state.qoder_pool_for(pool_tag).name_of(&picked.uid),
-                                    Some(&safe_slice(&resp_body, 300)),
+                                    Some(safe_slice(&resp_body, 300)),
                                 );
                                 return Err(format!(
                                     "upstream {} error: {}",

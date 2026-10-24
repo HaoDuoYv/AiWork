@@ -39,10 +39,7 @@ fn app_data_dirs(app_kind: &str) -> Vec<std::path::PathBuf> {
 }
 
 fn app_label(app_kind: &str) -> &str {
-    match app_kind {
-        "Trae" => "Trae",
-        _ => app_kind,
-    }
+    app_kind
 }
 
 /// 读取应用的 storage.json（多个候选目录取第一个存在的）
@@ -492,7 +489,7 @@ pub fn backfill_dc_id_for(data_dir: &std::path::Path, user_id: &str) -> Option<S
     {
         a.dc_id = Some(dc.clone());
         a.updated_at = Some(fs_utils::now_iso());
-        if crate::store::docs::accounts_save(&crate::store::db(data_dir), &mut accounts).is_ok() {
+        if crate::store::docs::accounts_save(&crate::store::db(data_dir), &accounts).is_ok() {
             fs_utils::app_log(
                 data_dir,
                 &format!("已记录账户中心id(预留): user_id={uid} dc={dc}"),

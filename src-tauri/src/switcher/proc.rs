@@ -385,7 +385,7 @@ pub fn post_wm_close(pid: u32) {
 /// 强杀全部白名单进程（sysinfo TerminateProcess，等价 PS Stop-Process -Force）
 fn kill_all(prof: &AppProfile) {
     let sys = snapshot();
-    for (_, p) in sys.processes() {
+    for p in sys.processes().values() {
         if name_matches(prof, &p.name().to_string_lossy()) {
             let _ = p.kill();
         }

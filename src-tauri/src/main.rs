@@ -672,11 +672,10 @@ fn main() {
             }
 
             // 启动时最小化到托盘（hide_main_window 会记录最大化状态，供托盘显示时恢复）
-            if settings.launch_minimized {
-                if hide_main_window(app.handle()) {
+            if settings.launch_minimized
+                && hide_main_window(app.handle()) {
                     fs_utils::app_log(&state.data_dir, "启动最小化：窗口已隐藏到托盘");
                 }
-            }
 
             // 启动静默签到（T11）：延迟 60s 后对未签到账号自动执行一轮签到，
             // 复用托盘签到链路（含防重入锁，与手动/托盘签到天然互斥）；

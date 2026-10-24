@@ -303,6 +303,9 @@ impl RequestLogger {
         max_size: u64,
     ) -> std::io::Result<&'a mut std::fs::File> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        // 复用路径：is_some 与 expect 在同一 if 条件/体内，逻辑上不会 panic；
+        // 改成 if let 会因返回 &'a mut 的生命周期被借用检查拒绝（clippy 建议不适用）
+        #[allow(clippy::unnecessary_unwrap)]
         if state.file.is_some() && state.day == today && state.size < max_size {
             return Ok(state.file.as_mut().expect("checked"));
         }

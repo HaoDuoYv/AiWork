@@ -147,7 +147,7 @@ fn ms_to_date(ms: i64) -> String {
 fn earliest_expire_secs(row: &Value) -> Option<i64> {
     let mut earliest_ms: Option<i64> = None;
     let consider = |ms: i64, earliest: &mut Option<i64>| {
-        if earliest.map_or(true, |cur| ms < cur) {
+        if earliest.is_none_or(|cur| ms < cur) {
             *earliest = Some(ms);
         }
     };
@@ -442,7 +442,7 @@ fn fetch_account(
         row["source"] = json!("none");
         return row;
     }
-    let headers = qoder_common::build_auth_headers(&creds);
+    let headers = qoder_common::build_auth_headers(creds);
     let url = format!(
         "{}/sash/api/v2/me/usage",
         super::qoder_realm::openapi_base(&creds.realm)

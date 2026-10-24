@@ -208,12 +208,11 @@ pub fn workbuddy_cli_bridge_set(state: State<AppState>, user_id: String) -> Resu
         .ok_or_else(|| "该账号无工具侧凭证副本，请先导入凭证（auth 导入或续期回写）".to_string())?;
 
     let previous = std::fs::read_to_string(cli_settings_path()).ok();
-    apply_cli_token(&token).map_err(|e| {
+    apply_cli_token(&token).inspect_err(|_e| {
         // 写入失败回滚：原子恢复写入前的 settings.json 原文（审查 P2）
         if let Some(prev) = &previous {
             restore_cli_settings(prev);
         }
-        e
     })?;
 
     let mut st = load_cli_rotate_state(&state);
@@ -306,12 +305,11 @@ fn cli_rotate_cycle(state: &AppState) -> serde_json::Value {
                 .ok_or_else(|| "目标账号无工具侧凭证副本".to_string())
                 .and_then(|token| {
                     let previous = std::fs::read_to_string(cli_settings_path()).ok();
-                    apply_cli_token(&token).map_err(|e| {
+                    apply_cli_token(&token).inspect_err(|_e| {
                         // 写入失败回滚：原子恢复写入前的 settings.json 原文（审查 P2）
                         if let Some(prev) = &previous {
                             restore_cli_settings(prev);
                         }
-                        e
                     })
                 }) {
                 Ok(()) => {

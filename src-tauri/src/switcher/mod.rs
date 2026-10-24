@@ -658,7 +658,7 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
     if !uid.is_empty() {
         // PS 白名单 ^[A-Za-z0-9_\-]{4,64}$ 语义（ensure_uid_safe 更严：另拒 ..），
         // 文案逐字保留
-        if let Err(_) = crate::fs_utils::ensure_uid_safe(uid.trim()) {
+        if crate::fs_utils::ensure_uid_safe(uid.trim()).is_err() {
             let msg = format!(
                 "UserId 参数格式非法（仅允许 A-Z a-z 0-9 _ -，长度 4~64 位）: {}",
                 uid.trim()

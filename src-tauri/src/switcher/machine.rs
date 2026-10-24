@@ -187,11 +187,10 @@ pub fn reset_device_ids_only(sess: &Session, sink: &dyn ProgressSink) -> Result<
         let mut ok = true;
         for d in ["Network", "Local Storage", "Session Storage"] {
             let target = webview_dir.join(d);
-            if target.exists() {
-                if std::fs::remove_dir_all(&target).is_err() {
+            if target.exists()
+                && std::fs::remove_dir_all(&target).is_err() {
                     ok = false;
                 }
-            }
         }
         if ok {
             sink.step("device", StepStatus::Ok, "[6/6] trae-webview 追踪数据已清除");

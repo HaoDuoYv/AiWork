@@ -41,7 +41,7 @@ impl NotifyChannels {
     pub fn is_empty(&self) -> bool {
         [self.bark_url.as_deref(), self.wechat_webhook.as_deref(), self.serverchan_sendkey.as_deref()]
             .iter()
-            .all(|c| c.map_or(true, |s| s.trim().is_empty()))
+            .all(|c| c.is_none_or(|s| s.trim().is_empty()))
     }
 }
 

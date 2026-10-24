@@ -639,7 +639,7 @@ impl UsageDayView {
             credits: d.credits,
             original_credits: d.original_credits,
             avg_duration_ms: if d.total.requests > 0 {
-                d.duration_ms_total / d.total.requests as u64
+                d.duration_ms_total / d.total.requests
             } else {
                 0
             },

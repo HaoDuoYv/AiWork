@@ -108,9 +108,7 @@ fn resolve_wb_target(
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = wb_catalog::load(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
-    if wb_catalog::find(&catalog, &r.model).is_none() {
-        return None;
-    }
+    wb_catalog::find(&catalog, &r.model)?;
     // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型；
     // F-76④ 长上下文降档：输入粗估超阈值 → flash 档模型。
     // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
@@ -294,7 +292,9 @@ pub(crate) fn with_retry_after(resp: Response, secs: u64) -> Response {
 }
 
 /// 从错误文案里取 `retry after <N>s`（冷却剩余秒数）：非流式 429 的状态码由
-/// `Err(String)` 透传而来，没有结构字段通道，只能从文案回收后补成 Retry-After 头
+/// `Err(String)` 透传而来，没有结构字段通道，只能从文案回收后补成 Retry-After 头。
+/// 当前仅被单测使用（解析契约锚点）
+#[cfg(test)]
 pub(crate) fn retry_after_in_msg(msg: &str) -> Option<u64> {
     const MARK: &str = "retry after ";
     let tail = &msg[msg.find(MARK)? + MARK.len()..];
@@ -630,116 +630,6 @@ fn whitelist_error_response(model: &str, proto: Protocol) -> Response {
     }
 }
 
-pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
-    // 收敏（2026-10-12 审查 P2）：/health 在 auth.rs 免鉴权放行（探活豁免），
-    // 原实现透出 total_credits/active_uid/last_error/池账号数——非环回监听时
-    // 局域网内无 Key 即可抓取账号与积分画像，与「非环回强制鉴权」防线矛盾。
-    // 探活只需存活布尔；完整诊断由需鉴权的 GET /status 承载（字段超集）
-    let _ = &state;
-    Json(json!({
-        "status": "ok",
-        "running": true,
-    }))
-}
-
-/// /healthz（T2.3/F-32）：三池均无可用账号 → 503，供探活/看门狗。
-/// H1 修复（审查）：旧口径仅 Trae ∨ WB 且不查 hard_credit/积分过期/零积分——
-/// 仅部署 Qoder 账号或全部账号 hard_credit 冷却时探活恒 503（可能触发误重启）。
-/// 改用 has_selectable()（= pool::selectable 口径：健康 + 未禁用 + 未冷却 +
-/// 积分未过期且非零），三池 × enabled 开关，与 /v1/models 徽章判定同源
-pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
-    let trae_enabled = state.trae_enabled.load(std::sync::atomic::Ordering::Relaxed);
-    let solo_ok = trae_enabled && state.pool.has_selectable();
-    let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
-    let wb_ok = wb_enabled && state.wb_pool.has_selectable();
-    let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
-    // 双区池：CN 或 INTL 任一有可选账号即视为 Qoder 可用；INTL 池受
-    // `qoder_intl_enabled` 开关约束（关闭时国际池不参调，与 dispatch 三级路由
-    // 回落国内口径一致）
-    let qoder_intl_enabled = {
-        let s: crate::models::Settings =
-            crate::store::db(&state.data_dir).kv_get("app_settings");
-        s.qoder_intl_enabled
-    };
-    let qoder_ok = qoder_enabled
-        && (state.qoder_pool.has_selectable()
-            || (qoder_intl_enabled && state.qoder_intl_pool.has_selectable()));
-    if solo_ok || wb_ok || qoder_ok {
-        (
-            StatusCode::OK,
-            axum::Json(json!({
-                "status": "ok",
-                "solo_available": solo_ok,
-                "wb_available": wb_ok,
-                "qoder_available": qoder_ok,
-            })),
-        )
-            .into_response()
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(json!({ "status": "unavailable", "reason": "no healthy account" })),
-        )
-            .into_response()
-    }
-}
-
-/// `GET /v1/usage`：当前调用方 API Key 的当日用量（CC Switch「用量查询」自定义脚本用）。
-///
-/// 鉴权已由 bearer_auth 完成（未带 Key 时根据配置记为 anonymous 或 401），这里
-/// 只取鉴权结果里命中的 Key 记账：返回 `{success, data:[{planName, used, total,
-/// remaining, unit}]}`——CC Switch 的 extractor 可把 `data` 数组原样返回当作
-/// 多套餐展示（参照其 New API 模板）。`used` / `total` 为「请求次数」，`total`
-/// 在 daily_limit=0（不限）时为 null，表示无上限。本端点不消耗请求配额：
-/// 用量查询是观测行为，不应反过来推高被观测的计数。
-pub async fn usage(
-    State(state): State<Arc<ApiSharedState>>,
-    Extension(key): Extension<KeyId>,
-) -> Response {
-    if key.0 == "anonymous" {
-        return (
-            StatusCode::OK,
-            Json(json!({
-                "success": false,
-                "message": "API 鉴权已关闭，无法按 Key 统计用量（请在 API 服务页启用 API Key 后用其查询）",
-            })),
-        )
-            .into_response();
-    }
-    let data_dir = state.data_dir.clone();
-    let key_id = key.0.clone();
-    let view = tokio::task::spawn_blocking(move || {
-        crate::api_server::api_keys::usage_view(&data_dir, &key_id, &super::usage::today_key())
-    })
-    .await
-    .ok()
-    .flatten();
-    let Some(e) = view else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "success": false, "message": "API Key 已不存在（可能已被删除）" })),
-        )
-            .into_response();
-    };
-    let unlimited = e.daily_limit == 0;
-    Json(json!({
-        "success": true,
-        "data": [{
-            "planName": e.name,
-            "used": e.used_today,
-            "total": if unlimited { Value::Null } else { json!(e.daily_limit) },
-            "remaining": if unlimited { Value::Null } else { json!(e.daily_limit.saturating_sub(e.used_today)) },
-            "unit": "times",
-            "extra": if unlimited {
-                "不限每日请求数".to_string()
-            } else {
-                format!("每日上限 {} 次", e.daily_limit)
-            },
-            "date": e.used_date,
-        }]
-    }))
-    .into_response()
-}
 
 pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
     let pool = state.pool.status_list();
@@ -762,9 +652,9 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "disabled"
         } else if p.cooling {
             "cooling"
-        } else if p.credits_expire_at.map_or(false, |exp| exp < now) {
+        } else if p.credits_expire_at.is_some_and(|exp| exp < now) {
             "expired"
-        } else if p.credits.map_or(false, |c| c <= 0.0) {
+        } else if p.credits.is_some_and(|c| c <= 0.0) {
             "no_credits"
         } else {
             "available"
@@ -1097,7 +987,7 @@ pub async fn chat_completions(
                 if stream {
                     return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new()).await;
+                wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new()).await
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
@@ -1105,7 +995,7 @@ pub async fn chat_completions(
                 if stream {
                     return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
                 }
-                return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+                super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Trae 池 effort 通道（默认思考两池对齐）——
@@ -1434,20 +1324,20 @@ pub async fn messages(
         Ok(r) => match r.pool {
             TargetPool::Buddy => {
                 // T5.3 默认深度思考：Anthropic 侧 thinking 参数视为显式请求
-                let explicit = peek.get("thinking").map_or(false, |t| !t.is_null());
+                let explicit = peek.get("thinking").is_some_and(|t| !t.is_null());
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
                     return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new()).await;
+                wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new()).await
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
                 if stream {
                     return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard);
                 }
-                return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+                super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Anthropic thinking 参数视为显式请求
@@ -1593,14 +1483,14 @@ pub async fn completions(
                 if stream {
                     return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new()).await;
+                wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new()).await
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：text completions 入参已在端点层投影为内部格式
                 if stream {
                     return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
                 }
-                return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+                super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：text completions 无 effort 字段 → 仅默认思考生效
@@ -1991,14 +1881,13 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         // 覆盖；叠加首字超时包装，语义为「请求发起 → 首行到达」）
                         let lines = {
                             let ttfb_flag = ttfb_us.clone();
-                            win_lines.map(move |l| {
+                            win_lines.inspect(move |_l| {
                                 let _ = ttfb_flag.compare_exchange(
                                     0,
                                     ttfb_start.elapsed().as_micros() as u64,
                                     std::sync::atomic::Ordering::Relaxed,
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
-                                l
                             })
                         };
                         // ttfb 包装产物为普通迭代器 → 桥接回可中断行源
@@ -2208,12 +2097,20 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 // Trae 401 自愈（issue #27 方案 B，对齐 wb_route T2.6）：
                                 // 强制刷新一次凭证后同号重试（每请求每账号一次）；成功则
                                 // 不冷却不换号。失败/无回调维持原「note_error + 换号」语义。
-                                if status == 401
+                                // 注入的刷新回调（Option<Arc<dyn Fn>>）：先克隆出引用，避免
+                                // 在条件里借 state 的同时在体内再次借用。edition 2021 不支持
+                                // let-chain，用外层 match 表达「有回调才刷新」
+                                let refresh_opt = state.trae_jwt_refresh.clone();
+                                let refresh = if status == 401
                                     && !refreshed_401.contains(&picked.uid)
-                                    && state.trae_jwt_refresh.is_some()
+                                {
+                                    refresh_opt
+                                } else {
+                                    None
+                                };
+                                if let Some(refresh) = refresh
                                 {
                                     refreshed_401.insert(picked.uid.clone());
-                                    let refresh = state.trae_jwt_refresh.as_ref().unwrap();
                                     match refresh(&picked.uid) {
                                         Ok(new_jwt) => {
                                             let clean = new_jwt
@@ -2254,7 +2151,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                     Some(&format!("upstream status={}", status)),
                                 );
                                 if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                                    state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(&preview));
+                                    state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(preview));
                                 }
                                 break; // 换号（same_attempt 随新账号归零）
                             }
@@ -2663,12 +2560,20 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 // Trae 401 自愈（issue #27 方案 B，对齐 wb_route T2.6）：
                                 // 强制刷新一次凭证后同号重试（每请求每账号一次）；成功则
                                 // 不冷却不换号。失败/无回调维持原「note_error + 换号」语义。
-                                if status == 401
+                                // 注入的刷新回调（Option<Arc<dyn Fn>>）：先克隆出引用，避免
+                                // 在条件里借 state 的同时在体内再次借用。edition 2021 不支持
+                                // let-chain，用外层 match 表达「有回调才刷新」
+                                let refresh_opt = state.trae_jwt_refresh.clone();
+                                let refresh = if status == 401
                                     && !refreshed_401.contains(&picked.uid)
-                                    && state.trae_jwt_refresh.is_some()
+                                {
+                                    refresh_opt
+                                } else {
+                                    None
+                                };
+                                if let Some(refresh) = refresh
                                 {
                                     refreshed_401.insert(picked.uid.clone());
-                                    let refresh = state.trae_jwt_refresh.as_ref().unwrap();
                                     match refresh(&picked.uid) {
                                         Ok(new_jwt) => {
                                             let clean = new_jwt

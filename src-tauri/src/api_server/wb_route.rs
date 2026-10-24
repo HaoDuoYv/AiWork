@@ -559,7 +559,7 @@ fn run_wb_stream(
         .wb_sticky
         .resolve(&sticky_key, now_ts())
         .and_then(|b| {
-            if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
+            if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                 return None;
             }
             state
@@ -796,7 +796,7 @@ fn run_wb_stream(
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
-                                    state.wb_sticky.unbind_uid(&win_uid);
+                                    state.wb_sticky.unbind_uid(win_uid);
                                 }
                             }
                             if !sent_any {
@@ -992,7 +992,7 @@ pub async fn wb_aggregate_chat(
             .wb_sticky
             .resolve(&sticky_key, now_ts())
             .and_then(|b| {
-                if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
+                if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                     return None;
                 }
                 state
@@ -1175,7 +1175,7 @@ pub async fn wb_aggregate_chat(
                                     note_model_failure_ex(&state, &model, Some(&msg));
                                     // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                     if kind.unbinds_sticky() {
-                                        state.wb_sticky.unbind_uid(&win_uid);
+                                        state.wb_sticky.unbind_uid(win_uid);
                                     }
                                 }
                                 *safe_lock(&state.last_error) =
@@ -1287,7 +1287,7 @@ pub async fn wb_aggregate_chat(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,
                                     &key_name, &state.wb_pool.name_of(&picked.uid),
-                                    Some(&safe_slice(&resp_body, 300)),
+                                    Some(safe_slice(&resp_body, 300)),
                                 );
                                 return Err(format!(
                                     "upstream {} error: {}",

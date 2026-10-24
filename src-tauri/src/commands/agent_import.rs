@@ -866,7 +866,7 @@ fn parse_mcp_map(agent: &AgentSpec, v: &Value, source: &Path, out: &mut Parsed) 
             .get("type")
             .and_then(Value::as_str)
             .or_else(|| cfg.get("transport").and_then(Value::as_str))
-            .unwrap_or_else(|| if url.is_empty() { "stdio" } else { "http" });
+            .unwrap_or(if url.is_empty() { "stdio" } else { "http" });
         out.mcp_server(agent, name, command, args, url, transport, source);
     }
 }

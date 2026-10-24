@@ -95,7 +95,7 @@ pub(super) fn auth_file_path_of_readable(state: &AppState) -> PathBuf {
 /// 探测 `accessToken` 是否被客户端 at-rest 加密（`{"$wbEncrypted":1,"envelope":"..."}`）。
 /// 命中返回信封所在字段名（当前恒为 `auth.accessToken`），未命中/缺失返回 None。
 /// 保留为诊断辅助（真正解密走 `read_auth_file`）。
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // 诊断辅助：生产不调用，保留供排障时临时挂接
 pub(super) fn access_token_envelope(raw: &serde_json::Value) -> Option<&'static str> {
     let v = raw.get("auth").and_then(|a| a.get("accessToken"))?;
     if crate::tasks::wb_atrest::is_envelope(v) {
@@ -133,7 +133,7 @@ pub(super) fn realm_of_auth_file(path: &std::path::Path, raw: &serde_json::Value
 }
 
 /// 区域展示名（UI/日志）
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // 区域展示名：UI/日志辅助，当前无调用方
 pub fn realm_label(realm: &str) -> &'static str {
     if realm == "intl" {
         "国际区"

@@ -206,7 +206,7 @@ fn normalize_order(mut fetched: Vec<ModelOption>) -> Vec<ModelOption> {
                 defaults
                     .iter()
                     .position(|d| d.id == m.id)
-                    .map_or(false, |i| i > pos)
+                    .is_some_and(|i| i > pos)
             })
             .unwrap_or(fetched.len());
         fetched.insert(
@@ -230,7 +230,7 @@ fn normalize_order(mut fetched: Vec<ModelOption>) -> Vec<ModelOption> {
             .position(|d| d.id == id)
             .unwrap_or(usize::MAX)
     };
-    fetched.sort_by(|a, b| rank(&a.id).cmp(&rank(&b.id)));
+    fetched.sort_by_key(|a| rank(&a.id));
     fetched
 }
 
@@ -299,15 +299,15 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
             .set("User-Agent", "TraeClient/TTNet")
             .set("x-app-id", super::APP_ID)
             .set("x-app-version", "default")
-            .set("x-app-version-code", &super::IDE_VERSION_CODE.to_string())
+            .set("x-app-version-code", super::IDE_VERSION_CODE)
             .set("x-bridge-transport", "aha")
             .set("x-device-brand", "CREFG-XX")
             .set("x-device-cpu", "Intel")
             .set("x-device-id", device_id)
             .set("x-device-type", "windows")
             .set("x-ide-token", jwt_clean)
-            .set("x-ide-version", &super::IDE_VERSION)
-            .set("x-ide-version-code", &super::IDE_VERSION_CODE.to_string())
+            .set("x-ide-version", super::IDE_VERSION)
+            .set("x-ide-version-code", super::IDE_VERSION_CODE)
             .set("x-ide-version-type", "stable")
             .set("x-lgw-req-sdk-type", "3")
             .set("x-machine-id", machine_id)
@@ -315,7 +315,7 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
             .set("package-type", "stable_cn")
             .set("x-lscbd-aid", "787976")
             .set("x-lscbd-platform", "windows")
-            .set("app-version", &super::IDE_VERSION)
+            .set("app-version", super::IDE_VERSION)
             .set("x-ss-dp", "787976")
             .send_json(body.clone());
 
@@ -516,7 +516,7 @@ fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
                 || ci
                     .get("custom_models")
                     .and_then(|v| v.as_array())
-                    .map_or(false, |a| !a.is_empty())
+                    .is_some_and(|a| !a.is_empty())
             {
                 continue;
             }
@@ -540,7 +540,7 @@ fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
                 .get("context_window_tokens")
                 .and_then(|c| c.get("max"))
                 .and_then(|v| v.as_u64());
-            if ctx_max.map_or(true, |m| m < CONTEXT_MAX_MIN) {
+            if ctx_max.is_none_or(|m| m < CONTEXT_MAX_MIN) {
                 continue;
             }
             let has_dev = ci
@@ -550,7 +550,7 @@ fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
                     arr.iter().any(|m| {
                         m.get("model_name")
                             .and_then(|v| v.as_str())
-                            .map_or(false, |s| s.ends_with("__dev"))
+                            .is_some_and(|s| s.ends_with("__dev"))
                     })
                 })
                 .unwrap_or(false);

@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "ai-work-assistant"
-version = "4.0.9"
+version = "4.1.1"
 dependencies = [
  "aes",
  "aes-gcm",

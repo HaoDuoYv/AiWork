@@ -475,7 +475,7 @@ pub fn recover_key(
 }
 
 /// 进程内已有可用密钥？（扫描预览用：有钥即可直接解密，无需再点一次）
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // 扫描预览辅助：当前由调用方直接判定缓存密钥
 pub fn has_cached_key() -> bool {
     cached_key().is_some()
 }

@@ -118,7 +118,7 @@ fn py_truthy(v: Option<&Value>) -> bool {
     match v {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().map_or(true, |f| f != 0.0),
+        Some(Value::Number(n)) => n.as_f64() != Some(0.0),
         Some(Value::String(s)) => !s.is_empty(),
         Some(Value::Array(a)) => !a.is_empty(),
         Some(Value::Object(_)) => true,

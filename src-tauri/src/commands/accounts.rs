@@ -487,8 +487,7 @@ fn parse_import_file(
     };
     let groups_arr: Vec<serde_json::Value> = root
         .get("groups")
-        .and_then(|v| v.as_array())
-        .map(|a| a.clone())
+        .and_then(|v| v.as_array()).cloned()
         .unwrap_or_default();
     Ok((accounts_arr, groups_arr))
 }
@@ -1111,7 +1110,7 @@ fn parse_credit_stats(packs: &[serde_json::Value], now_ts: i64) -> CreditStats {
                 .and_then(|v| v.as_i64())
                 .or_else(|| pack.get("expire_time").and_then(|v| v.as_i64()));
             if let Some(end) = end {
-                if membership_expire.map_or(true, |cur| end > cur) {
+                if membership_expire.is_none_or(|cur| end > cur) {
                     membership_expire = Some(end);
                     // next_billing_time：0 / 1970 时间戳表示无自动续费
                     let nb = pack
@@ -1386,7 +1385,7 @@ pub fn refresh_remaining_credits_impl(
             continue;
         }
         attempted_uids.insert(uid.clone());
-        let dev = resolve_device(&state, &uid);
+        let dev = resolve_device(state, &uid);
         match calc_remaining_credits(&a.jwt, &dev) {
             Ok(stats) => {
                 rc.credits.insert(uid.clone(), stats.total);
@@ -1480,7 +1479,7 @@ pub fn refresh_remaining_credits_impl(
         for (uid, snap) in &thawed_uids {
             // 竞态防护：扫描窗口内调度签到/手动操作重写的新冷却（until/计数等已变化）
             // 不得误清——仅移除与快照完全一致的条目；条目已消失（他方已清）则跳过
-            let unchanged_since_snap = cd.cooldowns.get(uid).map_or(true, |e| {
+            let unchanged_since_snap = cd.cooldowns.get(uid).is_none_or(|e| {
                 e.error_type == snap.error_type
                     && e.until == snap.until
                     && e.reason == snap.reason
@@ -1535,7 +1534,7 @@ fn record_daily_snapshot(
         .snapshots
         .iter()
         .filter(|s| s.date < today)
-        .last()
+        .next_back()
         .map(|s| s.total)
         .unwrap_or(0.0);
 
@@ -2022,7 +2021,7 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
         }
         account.name.clone()
     };
-    crate::vault::save_accounts(&state, &mut accounts)?;
+    crate::vault::save_accounts(state, &mut accounts)?;
     // 记录成功刷新时刻：供 401 自愈 force 路径并发去重（FORCE_REFRESH_DEDUP_SECS 窗内复用）
     LAST_SUCCESS_REFRESH
         .lock()
@@ -2184,7 +2183,7 @@ fn record_refresh_failure(state: &AppState, user_id: &str, rejected: bool, err_m
 
 /// 构建账号视图（聚合 JWT / 分组 / 设备 / 积分 / 今日签到 / 冷却状态 / 套餐身份）。
 pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
-    let accounts = crate::vault::load_accounts(&state);
+    let accounts = crate::vault::load_accounts(state);
     let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     let device_map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
     let credits: CreditsFile = crate::store::docs::credits_history_load(&crate::store::db(&state.data_dir));

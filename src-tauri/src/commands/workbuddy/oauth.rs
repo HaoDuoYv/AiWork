@@ -194,7 +194,7 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
         &format!(
             "workbuddy: OAuth auth/state 响应键[{}] data键[{}]，打开登录页 {auth_url}",
             keys_of(&body),
-            body.get("data").map(|d| keys_of(d)).unwrap_or_default()
+            body.get("data").map(keys_of).unwrap_or_default()
         ),
     );
 

@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 
 use super::auth;
 use super::routes;
+use super::routes_light;
 use super::wb_catalog;
 use super::ApiSharedState;
 
@@ -172,11 +173,11 @@ fn ensure_bind_auth_policy(
 
 fn build_router(state: Arc<ApiSharedState>) -> Router {
     Router::new()
-        .route("/health", get(routes::health))
-        .route("/healthz", get(routes::healthz))
+        .route("/health", get(routes_light::health))
+        .route("/healthz", get(routes_light::healthz))
         .route("/status", get(routes::status))
         // 用量查询（CC Switch「用量查询」自定义脚本）：按当前 API Key 返回当日用量
-        .route("/v1/usage", get(routes::usage))
+        .route("/v1/usage", get(routes_light::usage))
         .route("/v1/models", get(routes::models))
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/completions", post(routes::completions))

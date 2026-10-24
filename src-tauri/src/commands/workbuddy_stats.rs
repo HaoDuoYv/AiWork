@@ -1271,10 +1271,7 @@ fn add_summary(dst: &mut Value, src: &Value) {
 }
 
 fn merge_totals(dst: Option<&mut Value>, src: Option<&Value>) {
-    match (dst, src) {
-        (Some(d), Some(s)) => add_summary(d, s),
-        _ => {}
-    }
+    if let (Some(d), Some(s)) = (dst, src) { add_summary(d, s) }
 }
 
 /// 按 key 分组的聚合数组（date/key 字段对齐累加，重排序）

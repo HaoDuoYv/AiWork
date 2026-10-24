@@ -90,11 +90,10 @@ fn clear_user_id_files(dir: &std::path::Path) -> Result<usize, String> {
         let name = e.file_name().to_string_lossy().to_string();
         let stem = name.split('_').next().unwrap_or("");
         let is_uid_file = stem.len() == 36 && stem.contains('-');
-        if is_uid_file || name == "user-memery-state.json" {
-            if std::fs::remove_file(e.path()).is_ok() {
+        if (is_uid_file || name == "user-memery-state.json")
+            && std::fs::remove_file(e.path()).is_ok() {
                 n += 1;
             }
-        }
     }
     Ok(n)
 }
@@ -356,11 +355,11 @@ fn current_access_token(state: &AppState) -> Option<String> {
     let mut best: Option<(i64, String)> = None;
     if let Some(tokens) = store.get("tokens").and_then(|t| t.as_object()) {
         for rec in tokens.values() {
-            let t = as_str(fs_utils::dig(&rec, &["access_token"])).unwrap_or_default();
+            let t = as_str(fs_utils::dig(rec, &["access_token"])).unwrap_or_default();
             if t.is_empty() {
                 continue;
             }
-            let exp = fs_utils::dig(&rec, &["expires_at_ms"]).and_then(|v| v.as_i64()).unwrap_or(0);
+            let exp = fs_utils::dig(rec, &["expires_at_ms"]).and_then(|v| v.as_i64()).unwrap_or(0);
             if best.as_ref().map(|(e, _)| exp > *e).unwrap_or(true) {
                 best = Some((exp, t));
             }

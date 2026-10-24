@@ -1,0 +1,60 @@
+name: CI
+
+# P0：质量门禁——main / master 的每次推送与所有 PR 都必须通过。
+# 与 build-windows.yml（发布打包）分离：本工作流快（约 3-5 分钟），失败即阻断合并。
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (tsc + eslint + vitest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: Lint
+        run: npm run lint
+      - name: Unit tests
+        run: npm test
+
+  rust:
+    name: Rust (fmt-check + clippy -D warnings + test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # generate_context! 编译期需要 frontendDist（../dist）存在，先构建前端
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      # Lint 基线见 src-tauri/Cargo.toml [lints.clippy]：风格类规则已显式 allow，
+      # 剩余规则全部强制——新增代码不得引入任何警告。
+      # 注：cargo fmt --check 暂未纳入（存量代码从未统一格式化，2026-10-24 实测
+      # 248 个文件、2433 处差异；如需纳入应先单独做一次全仓格式化提交）
+      - name: clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --all-targets

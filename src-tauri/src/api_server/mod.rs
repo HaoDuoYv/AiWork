@@ -18,6 +18,7 @@ pub mod pricing;
 pub mod qoder_route;
 pub mod retry;
 pub mod routes;
+pub mod routes_light;
 pub mod server;
 pub mod sse;
 pub mod unified_catalog;
@@ -543,7 +544,7 @@ pub fn is_model_config_mismatch(text: &str) -> bool {
             let after = from + pos + key_bytes.len();
             let ok = bytes
                 .get(after)
-                .map_or(true, |b| !(b.is_ascii_digit() || *b == b'.'));
+                .is_none_or(|b| !(b.is_ascii_digit() || *b == b'.'));
             if ok {
                 return true;
             }
@@ -678,15 +679,15 @@ pub fn aggregated_response_is_empty(r: &serde_json::Value) -> bool {
     let empty_at = |p: &str| -> bool {
         r.pointer(p)
             .and_then(|v| v.as_str())
-            .map_or(true, str::is_empty)
+            .is_none_or(str::is_empty)
     };
     empty_at("/choices/0/message/content")
         && empty_at("/choices/0/message/reasoning_content")
         && r.pointer("/choices/0/message/tool_calls")
             .and_then(|t| t.as_array())
-            .map_or(true, |a| a.is_empty())
+            .is_none_or(|a| a.is_empty())
         && r.pointer("/choices/0/message/function_call")
-            .map_or(true, serde_json::Value::is_null)
+            .is_none_or(serde_json::Value::is_null)
         && empty_at("/choices/0/text")
 }
 

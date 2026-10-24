@@ -312,7 +312,6 @@ fn model_from_item(item: &Value) -> Option<WbModel> {
                 Value::String(s) => s
                     .trim()
                     .trim_start_matches(['x', 'X'])
-                    .trim()
                     .split_whitespace()
                     .next()
                     .and_then(|n| n.parse().ok()),
@@ -450,7 +449,7 @@ pub fn parse_upstream_catalog(body: &Value) -> Vec<WbModel> {
         !is_noise_model_id(&m.id)
             && whitelist
                 .as_ref()
-                .map_or(true, |w| w.iter().any(|x| x.eq_ignore_ascii_case(&m.id)))
+                .is_none_or(|w| w.iter().any(|x| x.eq_ignore_ascii_case(&m.id)))
     };
     let mut out: Vec<WbModel> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();

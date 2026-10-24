@@ -37,6 +37,8 @@
 | F-70 | Trae tc 凭证直读 + ECDSA P-256 刷新情报核对 | Trae 生态 | **P2** | 1~2 天（余量） | **部分完成**（解密算法 + DeviceProof 已落地 2026-09-16；剩余账号发现直读接入） |
 | F-81 | 池耗尽后跨池重试（执行期耗尽的池间回退编排） | 网关 | **P2** | 2~3 天 | 待开发（2026-10-11 调度全链路审查产出，方案已论证见条目） |
 | F-82 ✅ | Trae 双应用合并适配（Trae Work 并入 Trae CN 单客户端，全链路收敛 + 存量迁移） | Trae 生态 | **P1** | 2~3 天（P0~P3 于 2026-10-14 当日完成） | 已完成（2026-10-14，方案见 docs/completed/Trae双应用合并适配调整方案.md） |
+| F-83 | Qoder 子 Key 绑区（`bind_pool=qoder_intl`）未生效 | 网关/Qoder | **P2** | 0.5~1 天 | 待开发（2026-10-24 审查产出；`resolve_pool_tag` / `pool_realm_of` 已就绪待接线） |
+| F-84 | `ModelsSources::is_dual` 未接线 | 网关 | **P3** | — | 待定（随 F-81 复用或删除） |
 | F-69 | Trae 会话导出存档（Markdown + 存档浏览器） | Trae 生态 | **P3** | 2~3 天 | 待开发 |
 | F-79 | 网关流式上游异步化（reqwest + async SSE 迁移） | 网关 | **P3** | 2~3 天 | 待开发（过渡方案 D-1/A/B/C/E 已落地 2026-09-16） |
 | E-03 | 豆包多模态端点（生图/生视频/音乐/文件中转站） | 豆包/网关 | **P3** | 3~4 天 | 待开发（依赖 E-01） |
@@ -57,6 +59,20 @@
 ---
 
 ## 二、条目详情
+
+### F-83 Qoder 子 Key 绑区（`bind_pool=qoder_intl`）未生效（P2，2026-10-24 代码审查产出）
+
+- **现状**：Key 的 `bind_pool` 允许填 `qoder` / `qoder_cn` / `qoder_intl`，UI 上也提供了「只打某区」的语义；但实际定区只认**模型名前缀**（`qoder-intl/xxx`）。`parse_bind_pool("qoder_intl")` 归入家族 `"qoder"`，而各池的 `constrains_pool()` 只认 `"trae" | "buddy"`——Qoder 池永远返回 false，绑区约束不生效。
+- **相关未接线代码**（本次已加 `#[allow(dead_code)]` 并注明，勿删）：
+  - `tasks::qoder_realm::resolve_pool_tag(model_realm, bind_pool)`：定区优先级「模型前缀 > Key 绑区 > 默认国内」，纯函数 + 单测已就绪；
+  - `api_server::api_keys::pool_realm_of(tag)`：`qoder_intl` → INTL、`qoder`/`qoder_cn` → CN。
+- **实现路径**：在 Qoder 路由入口把 `(normalize_model_id 的模型前缀, key.bind_pool)` 喂给 `resolve_pool_tag` 得到目标池标签，替换现在「只看前缀、否则默认 CN」的分支；补一条「绑 intl 的 Key 调裸模型名 → 落 INTL 池」的集成断言。改动面在 `qoder_route.rs` 定区段，约半天 + 回归测试。
+- **风险**：改了会让「绑区」从无效变为有效——已把 `bind_pool=qoder_intl` 当摆设使用的用户，请求可能改落 INTL 池。上线前在更新说明里点名。
+
+### F-84 `ModelsSources::is_dual` 未被使用（P3，2026-10-24 代码审查产出）
+
+- **现状**：`api_server/dispatch.rs` 的 `is_dual()`（语义已是「多源 ≥2」）没有任何调用方；注释所说的「跨池回退的前提」判定在别处实现（F-81 相关）。本次已 `#[allow(dead_code)]`。
+- **处理**：F-81（执行期跨池回退）落地时优先复用它作为判定入口；若 F-81 最终采用其它口径，则删除本函数与注释。
 
 ### F-76 网关慢接口优化——延迟归因 + TTFT 分维 + 慢请求竞速（P1）
 

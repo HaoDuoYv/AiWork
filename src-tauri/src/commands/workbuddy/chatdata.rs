@@ -182,7 +182,7 @@ pub fn restore_chats(data_root: &Path, app: BuddyApp, user_id: &str) -> Result<u
     if app.chats_dir().is_dir() {
         let bak = home.join("projects.bak");
         let _ = std::fs::remove_dir_all(&bak);
-        std::fs::rename(&app.chats_dir(), &bak).map_err(|e| format!("快照现有 projects 失败: {e}"))?;
+        std::fs::rename(app.chats_dir(), &bak).map_err(|e| format!("快照现有 projects 失败: {e}"))?;
     }
     std::fs::create_dir_all(app.chats_dir()).map_err(|e| format!("重建 projects 目录失败: {e}"))?;
     for db in ["workbuddy.db", "edge-sync-mapping-v2.db"] {

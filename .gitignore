@@ -21,6 +21,17 @@ Thumbs.db
 .idea/
 .trae/
 
+# 编辑器临时/格式覆盖文件
+tsconfig.tsbuildinfo
+tauri.dev.conf.json
+
+# 编码损坏残留副本（事故复盘产物，严禁提交）
+*.corrupt.bak
+*.mojibake.bak
+
+# 本地 Claude Code 会话配置（个人权限/临时态，不入库）
+.claude/settings.local.json
+
 # 编辑事故备份（编码损坏副本等，严禁提交）
 *.bak
 

@@ -300,7 +300,7 @@ fn aes128_cbc_base64(key16: &str, plaintext: &[u8]) -> Result<String, String> {
 fn rsa_encrypt_base64(plaintext: &str) -> Result<String, String> {
     let modulus = BigUint::parse_bytes(RSA_MODULUS_HEX.as_bytes(), 16)
         .ok_or_else(|| "Qoder 签名公钥无效".to_string())?;
-    let key_len = ((modulus.bits() + 7) / 8) as usize;
+    let key_len = modulus.bits().div_ceil(8) as usize;
     let message = plaintext.as_bytes();
     if message.len() + 11 > key_len {
         return Err("Qoder 签名内容过长".to_string());

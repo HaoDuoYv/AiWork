@@ -492,14 +492,14 @@ fn parse_claim_reward(data: Option<&Value>) -> Option<i64> {
 fn resolve_claim_credits(
     claim_data: Option<&Value>,
     credits_before: Option<i64>,
-    mut recheck: Option<&mut dyn FnMut() -> (bool, Option<i64>)>,
+    recheck: Option<&mut dyn FnMut() -> (bool, Option<i64>)>,
 ) -> (Option<i64>, i64, &'static str) {
     // 层1：claim 响应奖励字段
     if let Some(reward) = parse_claim_reward(claim_data) {
         return (credits_before, reward, "claim_reward");
     }
     // 层2：签到后复查 status，用两次余额差求 delta（失败可容忍，不影响签到成功判定）
-    if let (Some(before), Some(re)) = (credits_before, recheck.as_deref_mut()) {
+    if let (Some(before), Some(re)) = (credits_before, recheck) {
         let (ok_r, credits_after) = re();
         if ok_r && credits_after.is_some_and(|c| c - before >= 0) {
             let after = credits_after.unwrap();
@@ -694,6 +694,8 @@ pub fn run_round(
         if ok {
             // 签到成功 → 清除冷却 + 积分三层兜底（复查 status 失败可容忍）
             clear_cooldown(state, &uid_str);
+            // 闭包需要声明为 mut（要转成 &mut dyn FnMut 传参）；unused_mut 在此为误报
+            #[allow(unused_mut)]
             let mut recheck = || {
                 let r = status_check(state, &agent, &jwt, info.user_id.as_deref());
                 (r.ok, r.credits)
