@@ -90,7 +90,9 @@ export default function EcoAccess() {
       <p className="mt-2 text-[11px] text-slate-400 dark:text-zinc-500">
         统一注册单条目「AI Work 助手网关」（默认模型 {gwModel ?? 'glm-5.3'}）：CC Switch
         注册会先整库备份至 ~/.cc-switch/backups/，仅写入本网关条目、不改其它 provider；
-        写入后需重启 CC Switch 生效。历史 Buddy 条目（aiwork-wb-gateway-*）不再使用，可手动在
+        写入后需重启 CC Switch 生效。注册同时会写入「用量查询」配置（查询网关
+        <code className="mx-0.5">/v1/usage</code>，在 CC Switch 中展示该网关 Key
+        的当日请求数 / 每日上限），需 CC Switch 处于「使用中」状态才会刷新。历史 Buddy 条目（aiwork-wb-gateway-*）不再使用，可手动在
         CC Switch 中清理。
       </p>
     </div>

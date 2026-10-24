@@ -175,6 +175,8 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/health", get(routes::health))
         .route("/healthz", get(routes::healthz))
         .route("/status", get(routes::status))
+        // 用量查询（CC Switch「用量查询」自定义脚本）：按当前 API Key 返回当日用量
+        .route("/v1/usage", get(routes::usage))
         .route("/v1/models", get(routes::models))
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/completions", post(routes::completions))

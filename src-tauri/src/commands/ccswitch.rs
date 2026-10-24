@@ -217,7 +217,10 @@ pub fn ccswitch_register(
         port,
         crate::fs_utils::now_iso()
     );
-    let meta = serde_json::json!({ "commonConfigEnabled": false });
+    let meta = serde_json::json!({
+        "commonConfigEnabled": false,
+        "usage_script": usage_script(port),
+    });
     let cfg_str = serde_json::to_string(&settings_config).map_err(|e| e.to_string())?;
     let meta_str = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
 
@@ -302,6 +305,58 @@ pub fn ccswitch_register(
 
 /// CC Switch 注册专用 Key 名（自动创建/复用；与业务 Key 隔离，不受业务每日配额影响）
 const CC_SWITCH_KEY_NAME: &str = "CC Switch 专用";
+
+/// CC Switch「用量查询」自定义脚本（ccswitch.co/docs/providers-usage-query.html）。
+///
+/// CC Switch 对内置模板未覆盖的 provider 不会自动查询余额，需在 provider 的
+/// `meta.usage_script` 里配置查询逻辑。本网关没有「余额」概念，用量查询展示的是
+/// 本条网关 Key 的**当日请求数 / 每日上限**（来自 `GET /v1/usage`，鉴权即该 Key）。
+///
+/// - `baseUrl` 固定写本机网关地址：CC Switch 的 `{{baseUrl}}` 取 provider 配置的
+///   上游地址，而注入的 Key 只在我们自己的网关上有效；
+/// - `{{apiKey}}` 由 CC Switch 按 provider 凭据（claude 用 ANTHROPIC_AUTH_TOKEN、
+///   codex 用 OPENAI_API_KEY）替换；
+/// - extractor 直接返回 `data` 数组（CC Switch 多套餐展示形态），未启用/旧版本
+///   网关无此端点时给出可读的 invalidMessage 而不是静默空白；
+/// - 间隔 10 分钟（与用户已有 provider 配置一致），查询本身不计请求配额。
+fn usage_script(port: u16) -> serde_json::Value {
+    let base = format!("http://127.0.0.1:{}", port);
+    // 用 JSON 字符串转义生成 JS 字面量（避免手写转义；base 只含字母数字/冒号/斜杠）
+    let base_lit = serde_json::to_string(&base).unwrap_or_else(|_| "\"\"".to_string());
+    // 注意：是 JS 源码而非 JSON——`{{apiKey}}` 由 CC Switch 运行期替换
+    let code = format!(
+        r#"({{
+  request: {{
+    url: {base_lit} + "/v1/usage",
+    method: "GET",
+    headers: {{
+      "Authorization": "Bearer {{{{apiKey}}}}",
+      "x-api-key": "{{{{apiKey}}}}",
+      "Accept": "application/json",
+      "User-Agent": "cc-switch/1.0"
+    }}
+  }},
+  extractor: function(response) {{
+    if (response && response.success === true && Array.isArray(response.data)) {{
+      return response.data;
+    }}
+    return {{
+      isValid: response && response.success !== false,
+      invalidMessage: (response && response.message) ||
+        "网关未返回用量（请升级 AI Work 助手（v4.1.0+）并重新注册，或确认网关已启动）"
+    }};
+  }}
+}})"#
+    );
+    serde_json::json!({
+        "enabled": true,
+        "language": "javascript",
+        "code": code,
+        "timeout": 10,
+        "baseUrl": base,
+        "autoQueryInterval": 10,
+    })
+}
 
 /// 取「CC Switch 专用」Key：已有同名 Key → 复用（若被禁用则恢复启用）；
 /// 无 → 新建（ck_ + 128-bit 随机 hex，不限每日配额）。
@@ -521,5 +576,22 @@ mod tests {
     fn empty_key_allowed_for_claude() {
         let cfg = claude_settings_config(8899, "m", "");
         assert_eq!(cfg["env"]["ANTHROPIC_AUTH_TOKEN"], serde_json::json!(""));
+    }
+
+    /// 用量查询：meta.usage_script 必须指向本机网关的 /v1/usage，占位符保留给
+    /// CC Switch 替换，且 JS 源码语法合法（引号成对——否则 CC Switch 报 Format Failed）
+    #[test]
+    fn usage_script_targets_gateway_and_keeps_placeholders() {
+        let s = usage_script(7864);
+        assert_eq!(s["enabled"], serde_json::json!(true));
+        assert_eq!(s["language"], serde_json::json!("javascript"));
+        assert_eq!(s["baseUrl"], serde_json::json!("http://127.0.0.1:7864"));
+        assert_eq!(s["autoQueryInterval"], serde_json::json!(10));
+        let code = s["code"].as_str().unwrap();
+        assert!(code.contains("\"http://127.0.0.1:7864\" + \"/v1/usage\""), "{code}");
+        assert!(code.contains("{{apiKey}}"), "占位符须原样保留供 CC Switch 替换");
+        assert!(!code.contains("{{baseUrl}}"), "{{baseUrl}} 指向上游，不可用于查网关用量");
+        assert_eq!(code.matches('"').count() % 2, 0, "引号须成对");
+        assert!(code.trim_start().starts_with("({") && code.trim_end().ends_with("})"));
     }
 }

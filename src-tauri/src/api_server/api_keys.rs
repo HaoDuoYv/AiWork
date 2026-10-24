@@ -241,6 +241,10 @@ pub fn parse_bind_pool(s: &str) -> Option<&'static str> {
 ///
 /// 用途：Key 的 `bind_pool` 支持"只打某区"（`qoder_intl` 硬约束），
 /// 以及 uid 前缀 `qoder_intl:` 的解析；两处共用同一口径。
+///
+/// **当前未接线**：现网定区只认模型前缀，`bind_pool="qoder_intl"` 实际不生效；
+/// 接线设计见 `tasks::qoder_realm::resolve_pool_tag` 与 `docs/backlog.md`。
+#[allow(dead_code)]
 pub fn pool_realm_of(tag: &str) -> Option<&'static str> {
     match tag.trim().trim_end_matches(':').to_lowercase().as_str() {
         "qoder_intl" => Some(crate::tasks::qoder_realm::INTL),
@@ -313,6 +317,7 @@ fn default_true() -> bool {
 
 /// 数据文件根结构
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Default)]
 pub struct ApiKeysFile {
     #[serde(default)]
     pub keys: Vec<ApiKeyEntry>,
@@ -321,11 +326,6 @@ pub struct ApiKeysFile {
     pub auth_disabled: bool,
 }
 
-impl Default for ApiKeysFile {
-    fn default() -> Self {
-        Self { keys: Vec::new(), auth_disabled: false }
-    }
-}
 
 impl ApiKeyEntry {
     pub fn schedule_mode(&self) -> &str {
@@ -521,6 +521,68 @@ fn entry_or_load<'a>(
 pub fn load(data_dir: &Path) -> ApiKeysFile {
     let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
     entry_or_load(&mut reg, data_dir).file.clone()
+}
+
+/// 按 id 读单条 Key 的用量快照（`GET /v1/usage` 用）：直接取内存权威副本，
+/// 不经鉴权中间件已耗尽的磁盘副本；匿名（鉴权关闭时）/ 不存在 → None。
+/// 当日已用按 `today` 归一——跨零点后若鉴权尚未记账，展示 0 而非昨日计数。
+pub fn usage_view(data_dir: &Path, key_id: &str, today: &str) -> Option<ApiKeyEntry> {
+    let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut e = entry_or_load(&mut reg, data_dir)
+        .file
+        .keys
+        .iter()
+        .find(|k| k.id == key_id)?
+        .clone();
+    if e.used_date != today {
+        e.used_date = today.to_string();
+        e.used_today = 0;
+    }
+    Some(e)
+}
+
+#[cfg(test)]
+mod usage_view_tests {
+    use super::*;
+    use crate::store;
+
+    /// 用量查询视图（GET /v1/usage）：鉴权记账后再读，应看到内存权威副本的当日计数；
+    /// 跨天未记账时归一为 0；未知 id → None。独立临时目录，避开 KEYS_STATE 里其他测试的状态
+    #[test]
+    fn usage_view_reads_live_counter_and_normalizes_day() {
+        let dir = std::env::temp_dir().join(format!(
+            "twa_usage_view_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        store::db(&dir);
+        let f = ApiKeysFile {
+            keys: vec![serde_json::from_value(serde_json::json!({
+                "id": "kv", "name": "CC Switch 专用", "key": "ck-uv", "enabled": true, "daily_limit": 100,
+            }))
+            .unwrap()],
+            auth_disabled: false,
+        };
+        save(&dir, &f);
+        assert!(matches!(
+            verify_and_consume_locked(&dir, "ck-uv", "2026-10-24"),
+            KeyCheck::Ok(_)
+        ));
+        let v = usage_view(&dir, "kv", "2026-10-24").expect("应能按 id 读到 Key");
+        assert_eq!(v.used_today, 1);
+        assert_eq!(v.daily_limit, 100);
+        assert_eq!(v.name, "CC Switch 专用");
+        // 次日尚未记账：展示 0，而非昨日 1
+        let next = usage_view(&dir, "kv", "2026-10-25").unwrap();
+        assert_eq!(next.used_today, 0);
+        assert_eq!(next.used_date, "2026-10-25");
+        assert!(usage_view(&dir, "nope", "2026-10-24").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// 持久化并同步刷新内存权威副本（UI 编辑路径：改动即时生效）。

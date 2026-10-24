@@ -684,6 +684,63 @@ pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
     }
 }
 
+/// `GET /v1/usage`：当前调用方 API Key 的当日用量（CC Switch「用量查询」自定义脚本用）。
+///
+/// 鉴权已由 bearer_auth 完成（未带 Key 时根据配置记为 anonymous 或 401），这里
+/// 只取鉴权结果里命中的 Key 记账：返回 `{success, data:[{planName, used, total,
+/// remaining, unit}]}`——CC Switch 的 extractor 可把 `data` 数组原样返回当作
+/// 多套餐展示（参照其 New API 模板）。`used` / `total` 为「请求次数」，`total`
+/// 在 daily_limit=0（不限）时为 null，表示无上限。本端点不消耗请求配额：
+/// 用量查询是观测行为，不应反过来推高被观测的计数。
+pub async fn usage(
+    State(state): State<Arc<ApiSharedState>>,
+    Extension(key): Extension<KeyId>,
+) -> Response {
+    if key.0 == "anonymous" {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "success": false,
+                "message": "API 鉴权已关闭，无法按 Key 统计用量（请在 API 服务页启用 API Key 后用其查询）",
+            })),
+        )
+            .into_response();
+    }
+    let data_dir = state.data_dir.clone();
+    let key_id = key.0.clone();
+    let view = tokio::task::spawn_blocking(move || {
+        crate::api_server::api_keys::usage_view(&data_dir, &key_id, &super::usage::today_key())
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(e) = view else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "API Key 已不存在（可能已被删除）" })),
+        )
+            .into_response();
+    };
+    let unlimited = e.daily_limit == 0;
+    Json(json!({
+        "success": true,
+        "data": [{
+            "planName": e.name,
+            "used": e.used_today,
+            "total": if unlimited { Value::Null } else { json!(e.daily_limit) },
+            "remaining": if unlimited { Value::Null } else { json!(e.daily_limit.saturating_sub(e.used_today)) },
+            "unit": "times",
+            "extra": if unlimited {
+                "不限每日请求数".to_string()
+            } else {
+                format!("每日上限 {} 次", e.daily_limit)
+            },
+            "date": e.used_date,
+        }]
+    }))
+    .into_response()
+}
+
 pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
     let pool = state.pool.status_list();
     let now: i64 = now_ts() as i64;
